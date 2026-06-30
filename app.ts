@@ -47,7 +47,7 @@ app.use(
     origin: [
       "https://ctransit.me",
       "http://localhost:5173",
-      "https://c-transit-new.vercel.app",
+      "https://ctransit-fe-repo.vercel.app",
       "https://c-transit-pink.vercel.app",
     ],
     credentials: true,
@@ -121,7 +121,7 @@ app.use(
   transactionRoutes
 );
 
-// ── Agents ────────────────────────────────────────────────────────────────
+// ── Agents 
 // authenticateToken not applied here — agent.routes.ts owns the full
 // middleware chain: authenticateToken → requireAgent → checkAgentActive
 app.use("/api/agents", agentRoutes);
