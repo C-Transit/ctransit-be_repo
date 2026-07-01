@@ -135,5 +135,19 @@ process.on("uncaughtException", (err: Error) => {
   shutdown("uncaughtException");
 });
 
-// ── Boot ─────────────────────────────────────────────────
-boot();
+// ── Boot Execution Strategy ─────────────────────────────────────────────
+
+if (process.env.VERCEL) {
+  logger.info(
+    { version: process.version, env: env.NODE_ENV },
+    "server.boot_serverless — bypassing persistent infrastructure listeners for Vercel."
+  );
+  // Note: Prisma naturally opens connection pools on its first query,
+  // so your REST API routes will still connect to PostgreSQL automatically.
+} else {
+  // Execute full infrastructure boot for persistent instances (VPS, Local, Docker)
+  boot();
+}
+
+// Ensure the Express application instance is exported for Vercel's engine
+export default app;
