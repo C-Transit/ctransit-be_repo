@@ -1,0 +1,10 @@
+cat << 'EOF' > vercel.json
+{
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/server.ts"
+    }
+  ]
+}
+EOF
