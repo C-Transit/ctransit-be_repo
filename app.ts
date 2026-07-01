@@ -45,7 +45,7 @@ app.use(express.urlencoded({ extended: false }));
 app.use(
   cors({
     origin: [
-      "https://ctransit.me",
+      "https://www.ctransit.me",
       "http://localhost:5173",
       "https://ctransit-fe-repo.vercel.app",
       "https://c-transit-pink.vercel.app",
