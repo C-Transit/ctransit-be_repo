@@ -8,8 +8,7 @@ import {
 } from "../config/redis.js";
 import { activateWallet, prisma } from "./ledger.service.js";
 import { buildDeltaCommand, type PendingLinkData } from "../utils/parser.js";
-import { routeDeltaToTerminal } from "./sync.service.js";
-import { publishToTerminal } from "../mqtt/downlinkQueue.js";
+import { enqueueRoute } from "../utils/bridge.js";
 import logger from "../config/logger.js";
 
 export interface ConfirmRegistrationResult {
@@ -42,7 +41,7 @@ async function handlePendingLink(
   );
 
   try {
-    await publishToTerminal(terminalId, `REG:OTP,${linkData.otp}`);
+    await enqueueRoute(terminalId, `REG:OTP,${linkData.otp}`);
     log.info({ otp: linkData.otp }, "registration.otp_sent_to_terminal_screen");
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : "Unknown error";
@@ -148,7 +147,7 @@ async function confirmRegistration(
   const addWlCmd = buildDeltaCommand("ADD", "WL", cardUid);
 
   try {
-    await routeDeltaToTerminal(originTerminalId, addWlCmd);
+    await enqueueRoute(originTerminalId, addWlCmd);
     log.info(
       { originTerminalId, addWlCmd },
       "registration.origin_terminal_synced"
@@ -164,7 +163,9 @@ async function confirmRegistration(
       select: { terminal_id: true },
     });
     await Promise.allSettled(
-      allTerminals.map((t) => routeDeltaToTerminal(t.terminal_id, addWlCmd))
+      allTerminals.map((t: { terminal_id: string }) =>
+        enqueueRoute(t.terminal_id, addWlCmd)
+      )
     );
     log.info(
       { terminalCount: allTerminals.length },

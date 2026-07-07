@@ -57,7 +57,7 @@ app.use(
 
 connectDB();
 
-// ── Request logger ────────────────────────────────────────────────────────
+// ── Request logger ──────
 app.use((req: Request, res: Response, next: NextFunction) => {
   const start = Date.now();
   res.on("finish", () => {
@@ -87,7 +87,7 @@ app.get("/", (req: Request, res: Response) => {
 app.use("/health", healthRouter);
 app.use("/admin", adminRouter);
 
-// ── Auth ──────────────────────────────────────────────────────────────────
+// ── Auth ────────────────
 // Specific limiters registered before the router so they fire first.
 // express-rate-limit matches on path prefix at the app level.
 app.use("/api/auth/register", registerLimiter);
@@ -99,12 +99,12 @@ app.use("/api/auth", authRoutes);
 
 app.use("/api/users", userRoutes);
 
-// ── KYC ───────────────────────────────────────────────────────────────────
+// ── KYC 
 app.use("/api/kyc/submit", kycSubmitLimiter);
 app.use("/api/kyc/status", kycStatusLimiter);
 app.use("/api/kyc", kycRoutes);
 
-// ── Wallets ───────────────────────────────────────────────────────────────
+// ── Wallets 
 app.use(
   "/api/wallets",
   walletLimiter,
@@ -113,7 +113,7 @@ app.use(
   walletsRouter
 );
 
-// ── Transactions ──────────────────────────────────────────────────────────
+// ── Transactions 
 app.use(
   "/api/transactions",
   transactionLimiter,
@@ -126,18 +126,18 @@ app.use(
 // middleware chain: authenticateToken → requireAgent → checkAgentActive
 app.use("/api/agents", agentRoutes);
 
-// ── Disputes ──────────────────────────────────────────────────────────────
+// ── Disputes 
 app.use("/api/disputes", disputeLimiter, disputeRoutes);
 
-// ── Notifications ─────────────────────────────────────────────────────────
+// ── Notifications 
 app.use("/api/notifications", notificationLimiter, notificationRoutes);
 
-// ── 404 ───────────────────────────────────────────────────────────────────
+// ── 404
 app.use((req: Request, res: Response) => {
   res.status(404).json({ error: "Not found" });
 });
 
-// ── Global error handler ──────────────────────────────────────────────────
+// ── Global error handler 
 // Must have exactly 4 params for Express to treat it as an error handler
 // rather than regular middleware — next is required even if unused.
 app.use((err: Error, req: Request, res: Response) => {

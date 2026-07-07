@@ -4,8 +4,7 @@
 import "./src/config/env.js";
 
 import http from "http";
-import app from "./app.js"; // Update to .ts if standardizing entry points
-import { connectMqtt, disconnectMqtt } from "./src/mqtt/client.js";
+import app from "./app.js";
 import { getRedisClient } from "./src/config/redis.js";
 import { prisma } from "./src/services/ledger.service.js";
 import logger from "./src/config/logger.js";
@@ -45,15 +44,6 @@ async function boot(): Promise<void> {
     process.exit(1);
   }
 
-  try {
-    await connectMqtt();
-    logger.info("server.mqtt_ready");
-  } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    logger.fatal({ err: errMsg }, "server.mqtt_connection_failed — aborting");
-    process.exit(1);
-  }
-
   server.listen(env.PORT, () => {
     logger.info({ port: env.PORT }, "server.http_listening");
     console.log(`✓ Server successfully started on port ${env.PORT}`);
@@ -77,14 +67,6 @@ async function shutdown(signal: string): Promise<void> {
   server.close(async () => {
     logger.info("server.http_closed");
   });
-
-  try {
-    await disconnectMqtt();
-    logger.info("server.mqtt_disconnected");
-  } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    logger.error({ err: errMsg }, "server.mqtt_disconnect_error");
-  }
 
   try {
     const redis = getRedisClient();

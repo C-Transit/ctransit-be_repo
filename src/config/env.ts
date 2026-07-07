@@ -2,15 +2,12 @@
 import "dotenv/config";
 
 const REQUIRED_VARS = [
-  "HIVEMQ_HOST",
-  "HIVEMQ_PORT",
-  "HIVEMQ_CLIENT_ID",
   "DATABASE_URL",
   "DATABASE_URL_POOLED",
   "REDIS_URL",
   "ADMIN_API_SECRET",
   "JWT_SECRET",
-  "JWT_REFRESH_SECRET", // ← added
+  "JWT_REFRESH_SECRET",
   "OTP_SECRET",
   "MAIL_USER",
   "MAIL_PASSWORD",
@@ -54,11 +51,6 @@ interface Config {
   db: {
     url: string;
     pooledUrl: string;
-  };
-  mqtt: {
-    host: string;
-    port: number;
-    clientId: string;
   };
   redis: {
     url: string;
@@ -109,11 +101,6 @@ const env: Config = {
   db: {
     url: process.env.DATABASE_URL as string,
     pooledUrl: process.env.DATABASE_URL_POOLED as string,
-  },
-  mqtt: {
-    host: process.env.HIVEMQ_HOST as string,
-    port: parseIntSafe(process.env.HIVEMQ_PORT, 1883),
-    clientId: process.env.HIVEMQ_CLIENT_ID as string,
   },
   redis: {
     url: process.env.REDIS_URL as string,

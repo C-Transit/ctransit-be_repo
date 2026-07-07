@@ -4,9 +4,9 @@ import logger from "../config/logger.js";
 import env from "../config/env.js";
 import { invalidateTerminalSecretCache } from "../services/hmac.service.js";
 import {
-  routeDeltaToTerminal,
-  broadcastDeltaToFleet,
-} from "../services/sync.service.js";
+  enqueueRoute,
+  enqueueBroadcast,
+} from "../utils/bridge.js";
 import { confirmRegistration } from "../services/registration.service.js";
 import {
   creditWallet,
@@ -72,7 +72,7 @@ router.post(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const redis = getRedisClient() as any;
       await redis.lpush(redisKeys.terminalQueue(terminalId), poisonCmd);
-      await routeDeltaToTerminal(terminalId, poisonCmd);
+      await enqueueRoute(terminalId, poisonCmd);
 
       log.warn({ poisonCmd }, "admin.poison_pill_queued");
       res.json({
@@ -106,7 +106,7 @@ router.post(
     logger.info({ firmwareUrl }, "admin.ota_broadcast_initiated");
 
     try {
-      await broadcastDeltaToFleet(otaCmd);
+      await enqueueBroadcast(otaCmd);
       res.json({ success: true, message: "OTA command broadcast to fleet" });
     } catch (error) {
       const errMessage =
@@ -194,7 +194,7 @@ router.post(
           { removeBlCmd, previousBalance, newBalance },
           "admin.monnify_threshold_crossed"
         );
-        await broadcastDeltaToFleet(removeBlCmd);
+        await enqueueBroadcast(removeBlCmd);
       }
     } catch (error) {
       const errMessage =

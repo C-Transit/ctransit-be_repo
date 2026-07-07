@@ -8,8 +8,8 @@ import {
   buildDeltaCommand,
   type ParsedTransaction,
 } from "../utils/parser.js";
-import { broadcastDeltaToFleet } from "./sync.service.js";
-import { publishToTerminal } from "../mqtt/downlinkQueue.js";
+import { enqueueBroadcast } from "../utils/bridge.js";
+import { enqueueRoute } from "../utils/bridge.js";
 import {
   getRedisClient,
   cacheKeys,
@@ -194,7 +194,7 @@ async function processTransaction(
       txLog.warn("ingestion.card_uid_not_registered");
       // ✅ Bug fix: was `cardMapping.card_uid` which crashes when cardMapping is null.
       // tx.student_uid is the raw card UID — always available here.
-      await publishToTerminal(
+      await enqueueRoute(
         terminalId,
         `ACK:FAIL,${tx.student_uid},CARD_NOT_REGISTERED`
       );
@@ -210,7 +210,7 @@ async function processTransaction(
 
     if (!wallet || !wallet.is_linked) {
       txLog.warn({ matricNumber }, "ingestion.student_not_whitelisted");
-      await publishToTerminal(
+      await enqueueRoute(
         terminalId,
         `ACK:FAIL,${tx.student_uid},NOT_WHITELISTED`
       );
@@ -224,10 +224,7 @@ async function processTransaction(
 
     if (isBlacklisted) {
       txLog.warn({ matricNumber }, "ingestion.student_is_blacklisted");
-      await publishToTerminal(
-        terminalId,
-        `ACK:FAIL,${tx.student_uid},BLACKLISTED`
-      );
+      await enqueueRoute(terminalId, `ACK:FAIL,${tx.student_uid},BLACKLISTED`);
       return;
     }
 
@@ -314,7 +311,7 @@ async function processTransaction(
     await invalidateWalletCache(matricNumber);
 
     // ACK to terminal — use raw card UID, terminal identifies cards by hardware UID
-    await publishToTerminal(
+    await enqueueRoute(
       terminalId,
       `ACK:OK,${tx.student_uid},${newBalance.toFixed(2)}`
     );
@@ -343,7 +340,7 @@ async function processTransaction(
           await invalidateBlacklistCache(matricNumber);
 
           // Broadcast ADD:BL to all terminals
-          await broadcastDeltaToFleet(blacklistCmd);
+          await enqueueBroadcast(blacklistCmd);
 
           txLog.info({ blacklistCmd }, "ingestion.blacklist_broadcast_sent");
         } catch (err) {
@@ -359,10 +356,7 @@ async function processTransaction(
     const errMsg = err instanceof Error ? err.message : "Unknown error";
     txLog.error({ err: errMsg }, "ingestion.transaction_processing_error");
     try {
-      await publishToTerminal(
-        terminalId,
-        `ACK:FAIL,${tx.student_uid},SERVER_ERROR`
-      );
+      await enqueueRoute(terminalId, `ACK:FAIL,${tx.student_uid},SERVER_ERROR`);
     } catch (ackErr) {
       const ackErrMsg =
         ackErr instanceof Error ? ackErr.message : "Unknown error";
