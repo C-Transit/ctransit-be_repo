@@ -4,13 +4,10 @@
 import prisma from "../lib/prisma.js";
 import cloudinary from "../config/cloudinary.js";
 import { getRedisClient, cacheKeys } from "../config/redis.js";
+import { sendNotification } from "./notification.service.js";
 import logger from "../config/logger.js";
 
-// ─────────────────────────────────────────────
-// uploadIdCardToCloudinary (internal)
-// Streams buffer to Cloudinary. public_id is keyed
-// by userId so re-uploads overwrite cleanly.
-// ─────────────────────────────────────────────
+// uploadIdCardToCloudinary uploads the ID card image to Cloudinary and returns the secure URL.
 const uploadIdCardToCloudinary = (
   fileBuffer: Buffer,
   userId: string
@@ -32,12 +29,7 @@ const uploadIdCardToCloudinary = (
   });
 };
 
-// ─────────────────────────────────────────────
-// submitKyc
-// Single-step: upload image to Cloudinary, write
-// KYC row with the resolved URL. If Cloudinary
-// fails, nothing is written to DB.
-// ─────────────────────────────────────────────
+// submit Kyc handles the submission of a student's KYC information. It uploads the ID card image to Cloudinary, updates or creates the KYC record in the database, and sends a notification to the student.
 const submitKyc = async (userId: string, fileBuffer: Buffer) => {
   logger.info({ userId }, "kyc.upload_starting");
 
@@ -51,10 +43,10 @@ const submitKyc = async (userId: string, fileBuffer: Buffer) => {
     where: { userId },
     update: {
       idCardImageUrl,
-      status: "PENDING", // Reset to PENDING on resubmission
+      status: "PENDING", 
       rejectionReason: null,
       reviewedAt: null,
-      submittedAt: new Date(), // Refresh submission timestamp
+      submittedAt: new Date(),
     },
     create: {
       userId,
@@ -63,6 +55,19 @@ const submitKyc = async (userId: string, fileBuffer: Buffer) => {
   });
 
   logger.info({ userId, kycId: kyc.id }, "kyc.submitted");
+
+  // Notify student — fire and forget
+  const submittingUser = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { matricNumber: true },
+  });
+  if (submittingUser) {
+    sendNotification(
+      submittingUser.matricNumber,
+      "KYC Submitted 📋",
+      "Your ID card has been submitted for review. You will be notified once it has been reviewed."
+    ).catch(() => {});
+  }
   return kyc;
 };
 
@@ -70,13 +75,7 @@ const getKycByUserId = async (userId: string) => {
   return prisma.kyc.findUnique({ where: { userId } });
 };
 
-// ─────────────────────────────────────────────
-// approveKyc
-// Atomically: update KYC status + set user.isVerified
-// + upsert wallet. Redis invalidation runs after
-// commit — no false invalidation on rollback.
-// Wallet starts at 0 — Monnify handles all top-ups.
-// ─────────────────────────────────────────────
+// approveKyc approves a student's KYC submission, updates the KYC status, activates the wallet, and sends a notification to the student.
 const approveKyc = async (userId: string) => {
   const redis = getRedisClient();
 
@@ -121,13 +120,24 @@ const approveKyc = async (userId: string) => {
   });
 
   await redis.del(cacheKeys.wallet(matricNumber));
+  sendNotification(
+    matricNumber,
+    "KYC Approved ✅",
+    "Your identity has been verified. Your wallet is now active — request your virtual account to start topping up."
+  ).catch(() => {});
   logger.debug({ matricNumber }, "kyc.wallet_cache_invalidated_after_approval");
 
   return kyc;
 };
 
 const rejectKyc = async (userId: string, reason: string) => {
-  return prisma.kyc.update({
+  // Fetch matricNumber for notification
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { matricNumber: true },
+  });
+
+  const kyc = await prisma.kyc.update({
     where: { userId },
     data: {
       status: "REJECTED",
@@ -135,6 +145,16 @@ const rejectKyc = async (userId: string, reason: string) => {
       rejectionReason: reason,
     },
   });
+
+  if (user) {
+    sendNotification(
+      user.matricNumber,
+      "KYC Rejected ❌",
+      `Your ID card verification was unsuccessful. Reason: ${reason}. Please resubmit with a clearer image.`
+    ).catch(() => {});
+  }
+
+  return kyc;
 };
 
 // ─────────────────────────────────────────────

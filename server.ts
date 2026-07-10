@@ -21,6 +21,7 @@ async function boot(): Promise<void> {
   );
 
   try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const redis = getRedisClient() as any;
     await redis.ping();
     logger.info("server.redis_ready");
@@ -70,7 +71,8 @@ async function shutdown(signal: string): Promise<void> {
 
   try {
     const redis = getRedisClient();
-    await (redis as any).quit();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await(redis as any).quit();
     logger.info("server.redis_disconnected");
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);

@@ -19,6 +19,7 @@ import notificationRoutes from "./src/routes/notification.routes.js";
 import walletsRouter, {
   requireStudentAuth,
 } from "./src/controller/wallets.controller.js";
+import paymentRoutes from "./src/routes/payment.routes.js";
 import { authenticateToken } from "./src/middleware/auth.middleware.js";
 import {
   globalLimiter,
@@ -112,6 +113,8 @@ app.use(
   requireStudentAuth,
   walletsRouter
 );
+
+app.use("/api/payments", paymentRoutes);
 
 // ── Transactions 
 app.use(

@@ -3,6 +3,7 @@ import { type AgentStatus, type DisputeStatus } from "@prisma/client";
 import prisma from "../lib/prisma.js";
 import { getRedisClient, cacheKeys } from "../config/redis.js";
 import logger from "../config/logger.js";
+import { sendNotification } from "./notification.service.js";
 
 // ─────────────────────────────────────────────
 // TYPES
@@ -614,19 +615,18 @@ async function updateDisputeStatus(
 ) {
   const { newStatus, resolution, adminId } = input;
 
+  // ← Add student_uid to the existing select
   const existing = await prisma.dispute.findUnique({
     where: { id: disputeId },
-    select: { id: true, status: true },
+    select: { id: true, status: true, student_uid: true },
   });
 
   if (!existing) throw new Error("DISPUTE_NOT_FOUND");
 
-  // Terminal states — cannot be re-opened or changed once closed
   if (existing.status === "RESOLVED" || existing.status === "REJECTED") {
     throw new Error("DISPUTE_ALREADY_CLOSED");
   }
 
-  // Resolution text is required when closing a dispute
   if (
     (newStatus === "RESOLVED" || newStatus === "REJECTED") &&
     !resolution?.trim()
@@ -641,7 +641,6 @@ async function updateDisputeStatus(
     data: {
       status: newStatus,
       ...(resolution && { resolution: resolution.trim() }),
-      // Only set resolver and timestamp when actually closing the dispute
       ...(isFinalState && {
         resolvedByAdmin: adminId,
         resolvedAt: new Date(),
@@ -656,6 +655,32 @@ async function updateDisputeStatus(
       updatedAt: true,
     },
   });
+
+  // ── Notify student of dispute status change ───────────────────────
+  const studentMatric = existing.student_uid;
+
+  if (newStatus === "UNDER_REVIEW") {
+    sendNotification(
+      studentMatric,
+      "Dispute Under Review 🔍",
+      `Your dispute (ID: ${disputeId.slice(
+        0,
+        8
+      )}...) has been picked up and is currently being reviewed by our team.`
+    ).catch(() => {});
+  } else if (newStatus === "RESOLVED") {
+    sendNotification(
+      studentMatric,
+      "Dispute Resolved ✅",
+      `Your dispute has been resolved. Resolution: ${resolution}. Thank you for your patience.`
+    ).catch(() => {});
+  } else if (newStatus === "REJECTED") {
+    sendNotification(
+      studentMatric,
+      "Dispute Update ❌",
+      `Your dispute could not be upheld. Reason: ${resolution}. Contact support if you have further concerns.`
+    ).catch(() => {});
+  }
 
   return updated;
 }

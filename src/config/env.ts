@@ -15,6 +15,8 @@ const REQUIRED_VARS = [
   "CLOUDINARY_CLOUD_NAME",
   "CLOUDINARY_API_KEY",
   "CLOUDINARY_API_SECRET",
+  "PAYMENT_PROVIDER",
+  "PAYMENT_SECRET_KEY",
 ] as const;
 
 const missing = REQUIRED_VARS.filter((key) => !process.env[key]);
@@ -80,6 +82,10 @@ interface Config {
     apiKey: string;
     apiSecret: string;
   };
+  payment: {
+    provider: string;
+    secretKey: string;
+  };
   rateLimit: {
     global: { windowMs: number; max: number };
     login: { windowMs: number; max: number };
@@ -144,6 +150,10 @@ const env: Config = {
     disputes: { windowMs: 60 * 60 * 1000, max: 5 },
     notifications: { windowMs: 15 * 60 * 1000, max: 30 },
   },
+  payment: {
+    provider: process.env.PAYMENT_PROVIDER as string,
+    secretKey: process.env.PAYMENT_SECRET_KEY as string,
+  }
 };
 
 export default env;

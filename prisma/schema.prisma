@@ -89,20 +89,18 @@ model User {
 }
 
 model Wallet {
-  id          String   @id @default(uuid())
-  balance     Decimal  @default(0) @db.Decimal(10, 2)
-  is_linked   Boolean  @default(false)
-  created_at  DateTime @default(now()) @db.Timestamptz(6)
-  updated_at  DateTime @updatedAt @db.Timestamptz(6)
+  id               String   @id @default(uuid())
+  balance          Decimal  @default(0) @db.Decimal(10, 2)
+  is_linked        Boolean  @default(false)
+  v_account_number String?  @unique @db.VarChar(20)  // ← nullable, unique stays
+  v_bank_name      String?  @db.VarChar(50)           // ← nullable, unique removed
+  created_at       DateTime @default(now()) @db.Timestamptz(6)
+  updated_at       DateTime @updatedAt @db.Timestamptz(6)
 
-  // Linked via matricNumber for hardware terminal speed
-  student_uid String   @unique @db.VarChar(20)
-  user        User     @relation(fields: [student_uid], references: [matricNumber])
+  student_uid String @unique @db.VarChar(20)
+  user        User   @relation(fields: [student_uid], references: [matricNumber])
 
-  // ✅ Index on is_linked — full sync queries findMany({ where: { is_linked: true } })
-  // Without this, every SYS:REQ_FULL_SYNC scans the entire wallets table
   @@index([is_linked])
-
   @@map("wallets")
 }
 

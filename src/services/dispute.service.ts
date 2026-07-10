@@ -1,5 +1,6 @@
 import prisma from "../lib/prisma.js";
 import logger from "../config/logger.js";
+import { sendNotification } from "./notification.service.js";
 
 // ─────────────────────────────────────────────
 // resolveMatricNumber
@@ -86,6 +87,12 @@ async function raiseDispute(
       transaction_id: true,
     },
   });
+
+  sendNotification(
+    matricNumber,
+    "Dispute Submitted 📋",
+    `Your dispute for transaction ${transactionId} has been received and is under review. We will notify you of any updates.`
+  ).catch(() => {});
 
   logger.info(
     { disputeId: dispute.id, matricNumber, transactionId },

@@ -3,11 +3,12 @@
 import {
   getRedisClient,
   redisKeys,
-  cacheKeys, // ✅ Added — needed for cache invalidation
+  cacheKeys,
   OTP_TTL_SECONDS,
 } from "../config/redis.js";
 import { activateWallet, prisma } from "./ledger.service.js";
 import { buildDeltaCommand, type PendingLinkData } from "../utils/parser.js";
+import { sendNotification } from "./notification.service.js"; 
 import { enqueueRoute } from "../utils/bridge.js";
 import logger from "../config/logger.js";
 
@@ -102,7 +103,6 @@ async function confirmRegistration(
       "registration.wallet_activated"
     );
 
-    // ✅ Invalidate wallet cache — wallet was just created/activated.
     // Next tap reads fresh wallet state from DB instead of stale null.
     await redis.del(cacheKeys.wallet(user.matricNumber));
     log.debug(
@@ -127,12 +127,17 @@ async function confirmRegistration(
     },
   });
 
+  sendNotification(
+    user.matricNumber,
+    "Card Linked Successfully",
+    "Your NFC card has been linked to your wallet. You can now tap to pay for rides."
+  ).catch(() => {});
+
   log.info(
     { cardUid, matricNumber: user.matricNumber },
     "registration.card_uid_mapped_to_student"
   );
 
-  // ✅ Invalidate card mapping cache — card_uid now points to a new matricNumber.
   // Without this, ingestion.service.ts would serve the old (stale) mapping from
   // cache if this card was previously linked to a different student.
   await redis.del(cacheKeys.cardMap(cardUid));
