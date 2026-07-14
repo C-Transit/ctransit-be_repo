@@ -766,4 +766,102 @@ agentManagementRouter.post(
   }
 );
 
+// admin.controller.ts — add inside the secret-protected router
+
+router.post(
+  "/sync/whitelist",
+  async (req: Request, res: Response) => {
+    const log = logger.child({});
+
+    try {
+      const cardMappings = await prisma.cardMapping.findMany({
+        select: { card_uid: true },
+      });
+
+      const terminals = await prisma.terminal.findMany({
+        select: { terminal_id: true },
+      });
+
+      const whitelistUids = cardMappings.map(
+        (c: { card_uid: string }) => c.card_uid
+      );
+
+      const MAX_CHUNK_BYTES = 500;
+      const SLEEP_MS = 2000;
+      const sleep = (ms: number) =>
+        new Promise((resolve) => setTimeout(resolve, ms));
+
+      // Build WL chunks using same logic as MQTT service
+      const buildChunks = (
+        prefix: string,
+        uids: string[],
+        maxBytes: number
+      ): string[] => {
+        const chunks: string[] = [];
+        let currentChunk: string[] = [];
+        let currentSize = prefix.length;
+
+        for (const uid of uids) {
+          const segment =
+            currentChunk.length === 0 ? uid : `|${uid}`;
+          if (currentSize + segment.length > maxBytes) {
+            chunks.push(`${prefix}${currentChunk.join("|")}`);
+            currentChunk = [uid];
+            currentSize = prefix.length + uid.length;
+          } else {
+            currentChunk.push(uid);
+            currentSize += segment.length;
+          }
+        }
+
+        if (currentChunk.length > 0) {
+          chunks.push(`${prefix}${currentChunk.join("|")}`);
+        }
+
+        return chunks;
+      };
+
+      const wlChunks =
+        whitelistUids.length === 0
+          ? ["SYS:WL,EMPTY"]
+          : buildChunks("SYS:WL,", whitelistUids, MAX_CHUNK_BYTES);
+
+      log.info(
+        {
+          terminalCount: terminals.length,
+          cardCount: whitelistUids.length,
+          chunkCount: wlChunks.length,
+        },
+        "admin.sync_whitelist_started"
+      );
+
+      // Respond immediately — don't make the client wait for all chunks
+      res.json({
+        success: true,
+        message: `Whitelist sync queued for ${terminals.length} terminal(s). ${whitelistUids.length} card(s), ${wlChunks.length} chunk(s).`,
+      });
+
+      // Queue chunks to each terminal after responding
+      for (const terminal of terminals) {
+        const terminalId = terminal.terminal_id;
+
+        for (let i = 0; i < wlChunks.length; i++) {
+          await enqueueRoute(terminalId, wlChunks[i]);
+          if (i < wlChunks.length - 1) await sleep(SLEEP_MS);
+        }
+
+        await sleep(SLEEP_MS);
+        await enqueueRoute(terminalId, "SYS:SYNC_COMPLETE");
+
+        log.info({ terminalId }, "admin.sync_whitelist_queued");
+      }
+    } catch (error) {
+      const errMessage =
+        error instanceof Error ? error.message : "Unknown error";
+      logger.error({ err: errMessage }, "admin.sync_whitelist_error");
+      // Response already sent — just log
+    }
+  }
+);
+
 export { agentManagementRouter };
