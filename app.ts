@@ -16,9 +16,7 @@ import transactionRoutes from "./src/routes/transaction.routes.js";
 import agentRoutes from "./src/routes/agent.routes.js";
 import disputeRoutes from "./src/routes/dispute.routes.js";
 import notificationRoutes from "./src/routes/notification.routes.js";
-import walletsRouter, {
-  requireStudentAuth,
-} from "./src/controller/wallets.controller.js";
+import walletsRouter from "./src/routes/wallet.routes.js";
 import paymentRoutes from "./src/routes/payment.routes.js";
 import { authenticateToken } from "./src/middleware/auth.middleware.js";
 import {
@@ -106,13 +104,7 @@ app.use("/api/kyc/status", kycStatusLimiter);
 app.use("/api/kyc", kycRoutes);
 
 // ── Wallets 
-app.use(
-  "/api/wallets",
-  walletLimiter,
-  authenticateToken,
-  requireStudentAuth,
-  walletsRouter
-);
+app.use("/api/wallets", walletLimiter, authenticateToken, walletsRouter);
 
 app.use("/api/payments", paymentRoutes);
 

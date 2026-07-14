@@ -1,11 +1,8 @@
-import { Router, type Response, type NextFunction } from "express";
+import type { Response, NextFunction } from "express";
 import { confirmRegistration } from "../services/registration.service.js";
+import { getVirtualAccount } from "../services/payment.service.js";
 import logger from "../config/logger.js";
-
-// Replicating the CustomAuthRequest structure from your auth middleware
 import { type CustomAuthRequest } from "../middleware/auth.middleware.js";
-
-const router = Router();
 
 export const requireStudentAuth = (req: CustomAuthRequest, res: Response, next: NextFunction) => {
   if (!req.user || req.user.role !== "STUDENT") {
@@ -19,7 +16,7 @@ interface LinkBody {
   otp?: string;
 }
 
-router.post("/link", async (req: CustomAuthRequest, res: Response) => {
+export const linkWallet = async (req: CustomAuthRequest, res: Response) => {
   const { otp } = req.body as LinkBody;
   const studentId = req.user?.userId;
 
@@ -44,6 +41,36 @@ router.post("/link", async (req: CustomAuthRequest, res: Response) => {
     logger.error({ err: errMessage, studentId }, "wallets.link_error");
     return res.status(500).json({ success: false, message: "Internal server error" });
   }
-});
+};
 
-export default router;
+export const getWalletDetails = async (req: CustomAuthRequest, res: Response) => {
+  const userId = req.user?.userId;
+
+  if (!userId) {
+    logger.warn({ ip: req.ip }, "wallets.details_failed_missing_auth");
+    return res.status(401).json({ success: false, message: "Unauthorized: Student ID missing from token" });
+  }
+
+  try {
+    const details = await getVirtualAccount(userId);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        balance: details.balance,
+        accountNumber: details.accountNumber,
+        bank: details.bankName,
+        bankName: details.bankName,
+      },
+    });
+  } catch (error) {
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
+    logger.error({ err: errMessage, userId }, "wallets.details_error");
+
+    if (error instanceof Error && error.message === "WALLET_NOT_FOUND") {
+      return res.status(404).json({ success: false, message: "Wallet not found" });
+    }
+
+    return res.status(500).json({ success: false, message: "Failed to fetch wallet details" });
+  }
+};
