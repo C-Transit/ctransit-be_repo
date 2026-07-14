@@ -2,6 +2,7 @@ import { Router } from "express";
 import {
   requestVirtualAccount,
   getVirtualAccountDetails,
+  mockTopup,
 } from "../controller/payment.controller.js";
 import { handlePaymentWebhook } from "../controller/webhook.controller.js";
 import {
@@ -25,5 +26,7 @@ router.get(
   requireStudent,
   getVirtualAccountDetails
 );
+
+router.post("/topup", authenticateToken, requireStudent, mockTopup);
 
 export default router;

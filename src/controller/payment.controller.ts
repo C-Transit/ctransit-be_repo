@@ -1,5 +1,8 @@
 import type { Response } from "express";
 import type { AuthenticatedRequest } from "./auth.controller.js";
+import prisma from "../lib/prisma.js";
+import { sendNotification } from "../services/notification.service.js";
+import { creditWallet } from "../services/ledger.service.js";
 import {
   createVirtualAccountForStudent,
   getVirtualAccount,
@@ -79,5 +82,102 @@ export const getVirtualAccountDetails = async (
     const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "payment.get_virtual_account_error");
     return res.status(500).json({ message: "Failed to fetch virtual account" });
+  }
+};
+
+// Mock Payment for Beta Testing
+export const mockTopup = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    const { amount } = req.body;
+    if (typeof amount !== "number" || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid amount. Must be a positive number.",
+      });
+    }
+
+    // Fetch user with wallet and email
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        email: true,
+        matricNumber: true,
+        firstname: true,
+        wallet: {
+          select: {
+            balance: true,
+            is_linked: true,
+          },
+        },
+      },
+    });
+
+    if (!user || !user.wallet) {
+      return res.status(404).json({ success: false, message: "Wallet not found" });
+    }
+
+    if (!user.wallet.is_linked) {
+      return res.status(403).json({
+        success: false,
+        message: "Wallet not linked. Please complete KYC first.",
+      });
+    }
+
+    // Generate mock reference
+    const reference = `MOCK-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 8)
+      .toUpperCase()}`;
+
+    // Credit wallet and create transaction
+    const { newBalance } = await creditWallet(
+      user.matricNumber,
+      amount,
+      reference
+    );
+
+    // Send email notification
+    const message =
+      `Dear ${user.firstname},\n\n` +
+      `Your wallet has been topped up with ₦${amount.toFixed(2)}.\n` +
+      `Reference: ${reference}\n` +
+      `New balance: ₦${newBalance.toFixed(2)}.\n\n` +
+      `Thank you for using C-Transit.`;
+
+    sendNotification(
+      user.matricNumber,
+      "Wallet Top-Up Confirmation",
+      message
+    ).catch(() => {});
+
+    logger.info(
+      { userId, amount, reference, newBalance },
+      "payment.mock_topup_success"
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Top-up successful",
+      data: {
+        reference,
+        amount,
+        newBalance: newBalance.toFixed(2),
+      },
+    });
+  } catch (error) {
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
+    logger.error({ err: errMessage }, "payment.mock_topup_error");
+    return res.status(500).json({
+      success: false,
+      message: "Failed to process top-up",
+    });
   }
 };

@@ -75,7 +75,8 @@ async function activateWallet(studentUid: string): Promise<void> {
 async function creditWallet(
   studentUid: string,
   amount: number,
-  dbClient: DbClient = prisma
+  reference?: string, // <-- new: optional transaction reference
+  dbClient = prisma
 ): Promise<CreditResult | null> {
   const wallet = await dbClient.wallet.findUnique({
     where: { student_uid: studentUid },
@@ -87,18 +88,42 @@ async function creditWallet(
     return null;
   }
 
-  const updatedWallet = await dbClient.wallet.update({
-    where: { student_uid: studentUid },
-    data: { balance: { increment: amount } },
-    select: { balance: true },
-  });
+  // Generate a reference if not provided
+  const txRef =
+    reference ??
+    `TOPUP-${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 8)
+      .toUpperCase()}`;
+
+  // Perform the credit and create transaction in a single Prisma transaction
+  const [updatedWallet] = await dbClient.$transaction([
+    dbClient.wallet.update({
+      where: { student_uid: studentUid },
+      data: { balance: { increment: amount } },
+      select: { balance: true },
+    }),
+    dbClient.transaction.create({
+      data: {
+        transaction_id: txRef,
+        type: "TOPUP",
+        terminal_id: "SYSTEM_TERMINAL", // <-- use a dedicated system terminal
+        student_uid: studentUid,
+        amount: amount,
+        driver_uid: null, // not applicable for top-ups
+        synced_at: new Date(),
+      },
+    }),
+  ]);
 
   const previousBalance = parseFloat(wallet.balance.toString());
   const newBalance = parseFloat(updatedWallet.balance.toString());
+
   logger.info(
-    { studentUid, previousBalance, newBalance, amount },
+    { studentUid, previousBalance, newBalance, amount, reference: txRef },
     "ledger.wallet_credited"
   );
+
   return { previousBalance, newBalance };
 }
 
