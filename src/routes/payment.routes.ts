@@ -11,16 +11,16 @@ import {
 
 const router = Router();
 
-router.post("/webhook", handlePaymentWebhook);
+router.post("/fund", handlePaymentWebhook);
 
 router.post(
-  "/virtual-account",
+  "/create",
   authenticateToken,
   requireStudent,
   requestVirtualAccount
 );
 router.get(
-  "/virtual-account",
+  "/fetch",
   authenticateToken,
   requireStudent,
   getVirtualAccountDetails
