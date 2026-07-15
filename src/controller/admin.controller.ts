@@ -64,6 +64,18 @@ const approveKycHandler = async (
     const errMessage =
       error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.kyc_approve_error");
+
+    if (error instanceof Error) {
+      if (error.message === "USER_NOT_FOUND") {
+        return res.status(404).json({ error: "User not found" });
+      }
+      if (error.message === "KYC_NOT_FOUND") {
+        return res.status(404).json({
+          error: "No KYC record found for this user. Submit KYC first.",
+        });
+      }
+    }
+
     res.status(500).json({ error: "Failed to approve KYC" });
   }
 };
@@ -86,6 +98,18 @@ const rejectKycHandler = async (
     const errMessage =
       error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.kyc_reject_error");
+
+    if (error instanceof Error) {
+      if (error.message === "USER_NOT_FOUND") {
+        return res.status(404).json({ error: "User not found" });
+      }
+      if (error.message === "KYC_NOT_FOUND") {
+        return res.status(404).json({
+          error: "No KYC record found for this user. Submit KYC first.",
+        });
+      }
+    }
+
     res.status(500).json({ error: "Failed to reject KYC" });
   }
 };

@@ -82,7 +82,14 @@ const approveKyc = async (userId: string) => {
       select: { matricNumber: true },
     });
 
-    if (!user) throw new Error("User not found");
+    if (!user) throw new Error("USER_NOT_FOUND");
+
+    const existingKyc = await tx.kyc.findUnique({
+      where: { userId },
+      select: { id: true },
+    });
+
+    if (!existingKyc) throw new Error("KYC_NOT_FOUND");
 
     const kyc = await tx.kyc.update({
       where: { userId },
@@ -127,11 +134,19 @@ const approveKyc = async (userId: string) => {
 };
 
 const rejectKyc = async (userId: string, reason: string) => {
-  // Fetch matricNumber for notification
   const user = await prisma.user.findUnique({
     where: { id: userId },
     select: { matricNumber: true },
   });
+
+  if (!user) throw new Error("USER_NOT_FOUND");
+
+  const existingKyc = await prisma.kyc.findUnique({
+    where: { userId },
+    select: { id: true },
+  });
+
+  if (!existingKyc) throw new Error("KYC_NOT_FOUND");
 
   const kyc = await prisma.kyc.update({
     where: { userId },
