@@ -84,7 +84,7 @@ app.get("/", (req: Request, res: Response) => {
 });
 
 app.use("/health", healthRouter);
-app.use("/admin", adminRouter);
+app.use(["/admin", "/api/admin"], adminRouter);
 
 // ── Auth ────────────────
 // Specific limiters registered before the router so they fire first.
