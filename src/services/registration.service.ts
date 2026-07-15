@@ -1,13 +1,8 @@
 "use strict";
 
-import {
-  getRedisClient,
-  redisKeys,
-  cacheKeys,
-  OTP_TTL_SECONDS,
-} from "../config/redis.js";
-import { activateWallet, prisma } from "./ledger.service.js";
-import { buildDeltaCommand, type PendingLinkData } from "../utils/parser.js";
+import prisma from "../lib/prisma.js";
+import { activateWallet } from "./ledger.service.js";
+import { buildDeltaCommand} from "../utils/parser.js";
 import { sendNotification } from "./notification.service.js"; 
 import { enqueueRoute } from "../utils/bridge.js";
 import logger from "../config/logger.js";
@@ -19,48 +14,18 @@ export interface ConfirmRegistrationResult {
   cardUid?: string;
 }
 
-async function handlePendingLink(
-  terminalId: string,
-  linkData: PendingLinkData
-): Promise<void> {
-  const redis = getRedisClient();
-  const log = logger.child({
-    terminalId,
-    cardUid: linkData.uid,
-    otp: linkData.otp,
-  });
-
-  const key = redisKeys.linkOtp(linkData.otp);
-
-  // Store: otp -> cardUid|terminalId
-  const value = `${linkData.uid}|${terminalId}`;
-  await redis.setex(key, OTP_TTL_SECONDS, value);
-
-  log.info(
-    { ttlSeconds: OTP_TTL_SECONDS, cacheKey: key },
-    "registration.otp_cached"
-  );
-
-  try {
-    await enqueueRoute(terminalId, `REG:OTP,${linkData.otp}`);
-    log.info({ otp: linkData.otp }, "registration.otp_sent_to_terminal_screen");
-  } catch (err) {
-    const errMsg = err instanceof Error ? err.message : "Unknown error";
-    log.error({ err: errMsg }, "registration.failed_to_send_otp_to_terminal");
-  }
-}
-
 async function confirmRegistration(
   otp: string,
   userId: string
 ): Promise<ConfirmRegistrationResult> {
-  const redis = getRedisClient();
   const log = logger.child({ otp, userId });
 
-  const key = redisKeys.linkOtp(otp);
-  const cached = await redis.get(key);
+  // Look up OTP in DB instead of Redis
+  const otpRecord = await prisma.registrationOtp.findUnique({
+    where: { otp },
+  });
 
-  if (!cached) {
+  if (!otpRecord || otpRecord.used || otpRecord.expires_at < new Date()) {
     log.warn("registration.otp_not_found_or_expired");
     return {
       success: false,
@@ -68,15 +33,7 @@ async function confirmRegistration(
     };
   }
 
-  const [cardUid, originTerminalId] = cached.split("|");
-
-  if (!cardUid || !originTerminalId) {
-    log.error({ cached }, "registration.malformed_cache_value");
-    return {
-      success: false,
-      message: "Internal registration state corrupted.",
-    };
-  }
+  const { card_uid: cardUid, terminal_id: originTerminalId } = otpRecord;
 
   const user = await prisma.user.findUnique({
     where: { id: userId },
@@ -102,13 +59,6 @@ async function confirmRegistration(
       { matricNumber: user.matricNumber },
       "registration.wallet_activated"
     );
-
-    // Next tap reads fresh wallet state from DB instead of stale null.
-    await redis.del(cacheKeys.wallet(user.matricNumber));
-    log.debug(
-      { matricNumber: user.matricNumber },
-      "registration.wallet_cache_invalidated"
-    );
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : "Unknown error";
     log.error({ err: errMsg }, "registration.wallet_activation_failed");
@@ -127,28 +77,26 @@ async function confirmRegistration(
     },
   });
 
-  sendNotification(
-    user.matricNumber,
-    "Card Linked Successfully",
-    "Your NFC card has been linked to your wallet. You can now tap to pay for rides."
-  ).catch(() => {});
-
   log.info(
     { cardUid, matricNumber: user.matricNumber },
     "registration.card_uid_mapped_to_student"
   );
 
-  // Without this, ingestion.service.ts would serve the old (stale) mapping from
-  // cache if this card was previously linked to a different student.
-  await redis.del(cacheKeys.cardMap(cardUid));
-  log.debug({ cardUid }, "registration.card_map_cache_invalidated");
+  // Mark OTP as used — cannot be reused
+  await prisma.registrationOtp.update({
+    where: { otp },
+    data: { used: true },
+  });
 
-  // Consume OTP — cannot be reused
-  await redis.del(key);
-  log.debug({ key }, "registration.otp_consumed_from_redis");
+  log.debug({ otp }, "registration.otp_consumed");
 
-  // Broadcast ADD:WL,cardUid to all terminals
-  // Uses cardUid (not matricNumber) — terminals identify cards by hardware UID
+  // Notify student
+  sendNotification(
+    user.matricNumber,
+    "Card Linked Successfully 💳",
+    "Your NFC card has been linked to your CTransit wallet. You can now tap your card on any terminal to pay for rides."
+  ).catch(() => {});
+
   const addWlCmd = buildDeltaCommand("ADD", "WL", cardUid);
 
   try {
@@ -189,4 +137,4 @@ async function confirmRegistration(
   };
 }
 
-export { handlePendingLink, confirmRegistration };
+export { confirmRegistration };

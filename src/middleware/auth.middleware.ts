@@ -3,11 +3,6 @@ import jwt, { type JwtPayload } from "jsonwebtoken";
 import logger from "../config/logger.js";
 import env from "../config/env.js";
 import prisma from "../lib/prisma.js";
-import {
-  getRedisClient,
-  cacheKeys,
-  AGENT_STATUS_TTL,
-} from "../config/redis.js";
 
 // ─────────────────────────────────────────────
 // JWT PAYLOAD SHAPE
@@ -164,64 +159,37 @@ function requireStudent(
 // request re-fetches from DB and caches the new
 // status — no 60s grace window for bad actors.
 // ─────────────────────────────────────────────
+// Replace the entire checkAgentActive function
+
 async function checkAgentActive(
   req: CustomAuthRequest,
   res: Response,
   next: NextFunction
 ): Promise<void> {
-  // Admins are never blocked by this check
   if (!req.user || req.user.role !== "AGENT") {
     next();
     return;
   }
 
   const agentId = req.user.userId;
-  const cacheKey = cacheKeys.agentStatus(agentId);
-  const redis = getRedisClient();
 
   try {
-    const cached = await redis.get(cacheKey);
-
-    if (cached !== null) {
-      // Cache hit — fast path, no DB call
-      if (cached !== "ACTIVE") {
-        logger.warn(
-          { agentId, status: cached },
-          "auth.agent_blocked_by_status_cache"
-        );
-        res.status(403).json({
-          error:
-            cached === "SUSPENDED"
-              ? "Agent account is temporarily suspended"
-              : "Agent account has been deactivated",
-        });
-        return;
-      }
-      next();
-      return;
-    }
-
-    // Cache miss — hit DB and populate cache
+    // Direct DB lookup — no Redis cache
     const agent = await prisma.agent.findUnique({
       where: { id: agentId },
       select: { status: true },
     });
 
     if (!agent) {
-      // Token was valid but agent row is gone — treat as deactivated
       logger.warn({ agentId }, "auth.agent_not_found_in_db");
       res.status(403).json({ error: "Agent account not found" });
       return;
     }
 
-    // Cache the real status — short TTL so status changes propagate quickly.
-    // The agent service MUST DEL this key on every status change for immediate effect.
-    await redis.setex(cacheKey, AGENT_STATUS_TTL, agent.status);
-
     if (agent.status !== "ACTIVE") {
       logger.warn(
         { agentId, status: agent.status },
-        "auth.agent_blocked_by_status_db"
+        "auth.agent_blocked_by_status"
       );
       res.status(403).json({
         error:
@@ -236,7 +204,6 @@ async function checkAgentActive(
   } catch (error) {
     const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ agentId, err: errMessage }, "auth.check_agent_active_error");
-    // Fail closed — a Redis/DB error must not let an unknown agent through
     res.status(500).json({ error: "Unable to verify agent status" });
   }
 }

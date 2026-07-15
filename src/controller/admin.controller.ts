@@ -2,7 +2,6 @@ import express from "express";
 import { type Request, type Response, type NextFunction } from "express";
 import logger from "../config/logger.js";
 import env from "../config/env.js";
-import { invalidateTerminalSecretCache } from "../services/hmac.service.js";
 import {
   enqueueRoute,
   enqueueBroadcast,
@@ -228,9 +227,6 @@ router.post(
           secret_key: secretKey,
         },
       });
-
-      await invalidateTerminalSecretCache(terminalId);
-      logger.info({ terminalId }, "admin.terminal_secret_cache_invalidated");
 
       logger.info({ terminalId }, "admin.terminal_registered");
       res.json({ success: true, terminal });

@@ -135,22 +135,14 @@ export const handlePaymentWebhook = async (req: Request, res: Response) => {
     if (hasCrossedAboveThreshold(previousBalance, newBalance)) {
       const removeBlCmd = buildDeltaCommand("REM", "BL", user.matricNumber);
 
-      // Remove from blacklist DB
       await prisma.blacklist.deleteMany({
         where: { student_uid: user.matricNumber },
       });
 
-      // Invalidate blacklist cache
-      const { getRedisClient, cacheKeys } = await import("../config/redis.js");
-      const redis = getRedisClient();
-      await redis.del(cacheKeys.blacklist(user.matricNumber));
-
-      // Broadcast REM:BL to all terminals via Redis bridge
       await enqueueBroadcast(removeBlCmd);
 
       log.info({ removeBlCmd }, "webhook.blacklist_removed_broadcast_queued");
 
-      // Notify student they've been removed from blacklist too
       sendNotification(
         user.matricNumber,
         "Ride Access Restored",
@@ -159,10 +151,7 @@ export const handlePaymentWebhook = async (req: Request, res: Response) => {
         )}. You can tap your card to ride again.`
       ).catch((err: unknown) => {
         const errMsg = err instanceof Error ? err.message : String(err);
-        log.warn(
-          { err: errMsg },
-          "webhook.blacklist_notification_failed — non-fatal"
-        );
+        log.warn({ err: errMsg }, "webhook.blacklist_notification_failed");
       });
     }
 

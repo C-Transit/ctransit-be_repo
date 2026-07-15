@@ -15,11 +15,6 @@
 // by measuring response time differences.
 
 import crypto from "crypto";
-import {
-  getRedisClient,
-  cacheKeys,
-  TERMINAL_SECRET_TTL,
-} from "../config/redis.js";
 import { prisma } from "./ledger.service.js";
 import logger from "../config/logger.js";
 
@@ -38,24 +33,12 @@ export interface HmacVerifyResult {
 // Returns null if terminal is not found or unprovisioned.
 // ─────────────────────────────────────────────
 async function getTerminalSecret(terminalId: string): Promise<string | null> {
-  const redis = getRedisClient();
-  const key = cacheKeys.terminalSecret(terminalId);
-
-  const cached = await redis.get(key);
-  if (cached !== null) {
-    // "UNPROVISIONED" stored as-is — caller handles it
-    return cached;
-  }
-
   const terminal = await prisma.terminal.findUnique({
     where: { terminal_id: terminalId },
     select: { secret_key: true },
   });
 
   if (!terminal) return null;
-
-  // Cache even UNPROVISIONED — avoids DB hit on every status message
-  await redis.setex(key, TERMINAL_SECRET_TTL, terminal.secret_key);
   return terminal.secret_key;
 }
 
@@ -169,12 +152,4 @@ async function verifyAndUnwrap(
 // via the terminal registration route so the new key
 // takes effect immediately rather than after TTL expiry.
 // ─────────────────────────────────────────────
-async function invalidateTerminalSecretCache(
-  terminalId: string
-): Promise<void> {
-  const redis = getRedisClient();
-  await redis.del(cacheKeys.terminalSecret(terminalId));
-  logger.debug({ terminalId }, "hmac.terminal_secret_cache_invalidated");
-}
-
-export { verifyAndUnwrap, invalidateTerminalSecretCache, computeHmac };
+export { verifyAndUnwrap, computeHmac };

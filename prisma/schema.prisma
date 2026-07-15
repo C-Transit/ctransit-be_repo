@@ -296,3 +296,32 @@ model Dispute {
 
   @@map("disputes")
 }
+
+model RegistrationOtp {
+  id          String   @id @default(uuid())
+  otp         String   @unique
+  card_uid    String   @db.VarChar(20)
+  terminal_id String   @db.VarChar(20)
+  expires_at  DateTime
+  used        Boolean  @default(false)
+  created_at  DateTime @default(now())
+
+  @@index([otp])
+  @@index([expires_at])
+  @@map("registration_otps")
+}
+
+model RefreshToken {
+  id         String   @id @default(uuid())
+  token_id   String   @unique
+  user_id    String
+  role       String
+  email      String
+  expires_at DateTime
+  revoked    Boolean  @default(false)
+  created_at DateTime @default(now())
+
+  @@index([token_id])
+  @@index([expires_at])
+  @@map("refresh_tokens")
+}

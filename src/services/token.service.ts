@@ -1,16 +1,10 @@
 // src/services/token.service.ts
-//
-// Handles refresh token lifecycle: issue, verify, revoke.
-// Access token signing stays in auth.controller.ts —
-// this service only owns the refresh side.
+// Refresh tokens now stored in PostgreSQL (refresh_tokens table)
+// instead of Redis. Revocation is instant via the revoked flag.
 
 import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
-import {
-  getRedisClient,
-  cacheKeys,
-  REFRESH_TOKEN_TTL,
-} from "../config/redis.js";
+import prisma from "../lib/prisma.js";
 import env from "../config/env.js";
 import logger from "../config/logger.js";
 
@@ -23,22 +17,36 @@ export interface RefreshTokenPayload {
 // ─────────────────────────────────────────────
 // issueRefreshToken
 // Generates a UUID tokenId, signs it into a JWT,
-// and stores the payload in Redis with a 7-day TTL.
-// The JWT itself contains only the tokenId — the
-// real payload lives in Redis so it can be revoked
-// instantly without waiting for JWT expiry.
+// and persists the payload to refresh_tokens table.
+// Old expired tokens for this user are cleaned up
+// on each new issue to prevent table bloat.
 // ─────────────────────────────────────────────
 export const issueRefreshToken = async (
   payload: RefreshTokenPayload
 ): Promise<string> => {
   const tokenId = uuidv4();
-  const redis = getRedisClient();
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
 
-  await redis.setex(
-    cacheKeys.refreshToken(tokenId),
-    REFRESH_TOKEN_TTL,
-    JSON.stringify(payload)
-  );
+  // Persist to DB
+  await prisma.refreshToken.create({
+    data: {
+      token_id: tokenId,
+      user_id: payload.userId,
+      role: payload.role,
+      email: payload.email,
+      expires_at: expiresAt,
+    },
+  });
+
+  // Clean up expired tokens for this user — runs async, doesn't block
+  prisma.refreshToken
+    .deleteMany({
+      where: {
+        user_id: payload.userId,
+        expires_at: { lt: new Date() },
+      },
+    })
+    .catch(() => {});
 
   const refreshToken = jwt.sign({ tokenId }, env.jwt.refreshSecret, {
     expiresIn: "7d",
@@ -51,7 +59,7 @@ export const issueRefreshToken = async (
 // ─────────────────────────────────────────────
 // verifyRefreshToken
 // Verifies JWT signature, extracts tokenId,
-// looks up payload in Redis.
+// looks up the token in DB.
 // Returns null if invalid, expired, or revoked.
 // ─────────────────────────────────────────────
 export const verifyRefreshToken = async (
@@ -61,30 +69,47 @@ export const verifyRefreshToken = async (
     const decoded = jwt.verify(token, env.jwt.refreshSecret) as {
       tokenId: string;
     };
-    const redis = getRedisClient();
 
-    const raw = await redis.get(cacheKeys.refreshToken(decoded.tokenId));
-    if (!raw) {
-      // Not in Redis — either revoked on logout or naturally expired
-      logger.warn({ tokenId: decoded.tokenId }, "token.refresh_not_in_redis");
+    const stored = await prisma.refreshToken.findUnique({
+      where: { token_id: decoded.tokenId },
+    });
+
+    if (!stored) {
+      logger.warn({ tokenId: decoded.tokenId }, "token.refresh_not_in_db");
       return null;
     }
 
-    const payload = JSON.parse(raw) as RefreshTokenPayload;
-    return { ...payload, tokenId: decoded.tokenId };
+    if (stored.revoked) {
+      logger.warn({ tokenId: decoded.tokenId }, "token.refresh_revoked");
+      return null;
+    }
+
+    if (stored.expires_at < new Date()) {
+      logger.warn({ tokenId: decoded.tokenId }, "token.refresh_expired");
+      return null;
+    }
+
+    return {
+      userId: stored.user_id,
+      role: stored.role as RefreshTokenPayload["role"],
+      email: stored.email,
+      tokenId: decoded.tokenId,
+    };
   } catch {
-    // JWT signature invalid or expired
     return null;
   }
 };
 
 // ─────────────────────────────────────────────
 // revokeRefreshToken
-// Deletes the Redis key — token is dead instantly.
-// Called on logout and account deactivation.
-// ─────────────────────────────────────────────
+// Marks the token as revoked in DB — instant
+// invalidation. Called on logout.
+//
+// token.service.ts — update the exports at the bottom
 export const revokeRefreshToken = async (tokenId: string): Promise<void> => {
-  const redis = getRedisClient();
-  await redis.del(cacheKeys.refreshToken(tokenId));
+  await prisma.refreshToken.updateMany({
+    where: { token_id: tokenId },
+    data: { revoked: true },
+  });
   logger.debug({ tokenId }, "token.refresh_revoked");
 };

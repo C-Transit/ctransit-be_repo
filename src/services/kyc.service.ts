@@ -3,7 +3,6 @@
 
 import prisma from "../lib/prisma.js";
 import cloudinary from "../config/cloudinary.js";
-import { getRedisClient, cacheKeys } from "../config/redis.js";
 import { sendNotification } from "./notification.service.js";
 import logger from "../config/logger.js";
 
@@ -77,8 +76,6 @@ const getKycByUserId = async (userId: string) => {
 
 // approveKyc approves a student's KYC submission, updates the KYC status, activates the wallet, and sends a notification to the student.
 const approveKyc = async (userId: string) => {
-  const redis = getRedisClient();
-
   const { kyc, matricNumber } = await prisma.$transaction(async (tx) => {
     const user = await tx.user.findUnique({
       where: { id: userId },
@@ -119,13 +116,12 @@ const approveKyc = async (userId: string) => {
     return { kyc, matricNumber: user.matricNumber };
   });
 
-  await redis.del(cacheKeys.wallet(matricNumber));
+  // Notify student
   sendNotification(
     matricNumber,
-    "KYC Approved ✅",
-    "Your identity has been verified. Your wallet is now active — request your virtual account to start topping up."
+    "KYC Approved",
+    "Your identity has been verified successfully. Your wallet is now active — request your virtual account to start topping up."
   ).catch(() => {});
-  logger.debug({ matricNumber }, "kyc.wallet_cache_invalidated_after_approval");
 
   return kyc;
 };
