@@ -1,18 +1,17 @@
 import { Router } from "express";
-import adminRouter, {
-  agentManagementRouter,
-} from "../controller/admin.controller.js";
 import adminKycRouter from "./admin.kyc.routes.js";
+import adminOpsRouter from "./admin.ops.routes.js";
+import adminSystemRouter from "./admin.system.routes.js";
 
 const router = Router();
 
 // Secret-based system ops (poison pill, OTA, terminal register, Monnify webhook)
-router.use("/", adminRouter);
+router.use("/", adminSystemRouter);
 
 // KYC admin review routes
 router.use("/kyc", adminKycRouter);
 
-// JWT-protected agent CRUD (create, list, detail, status update)
-router.use("/", agentManagementRouter);
+// JWT-protected admin operations
+router.use("/", adminOpsRouter);
 
 export default router;

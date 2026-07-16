@@ -4,9 +4,13 @@ import {
   requireAgent,
   checkAgentActive,
 } from "../middleware/auth.middleware.js";
-import { agentOpsRouter } from "../controller/agent.controller.js";
+import agentOpsRouter from "./agent.ops.routes.js";
+import { loginAgentHandler } from "../controller/agent.controller.js";
 
 const router = Router();
+
+// Public login route
+router.post("/login", loginAgentHandler);
 
 // All agent-authenticated routes share this chain:
 // 1. authenticateToken  — validates JWT, attaches req.user

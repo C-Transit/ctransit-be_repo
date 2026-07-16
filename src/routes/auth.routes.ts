@@ -10,7 +10,7 @@ import {
   confirmCard,
   refreshAccessToken,
 } from "../controller/auth.controller.js";
-import agentRouter from "../controller/agent.controller.js";
+import agentRouter from "./agent.routes.js";
 import { authenticateToken } from "../middleware/auth.middleware.js";
 
 const router = Router();
