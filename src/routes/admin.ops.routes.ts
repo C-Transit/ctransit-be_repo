@@ -1,5 +1,9 @@
 import { Router } from "express";
 import {
+  authenticateToken,
+  requireAdmin,
+} from "../middleware/auth.middleware.js";
+import {
   createAgentHandler,
   listAgentsHandler,
   getAgentByIdHandler,
@@ -15,6 +19,8 @@ import {
 } from "../controller/admin.controller.js";
 
 const router = Router();
+
+router.use(authenticateToken, requireAdmin);
 
 router.post("/agents", createAgentHandler);
 router.get("/agents", listAgentsHandler);

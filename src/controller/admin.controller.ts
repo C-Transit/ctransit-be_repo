@@ -326,6 +326,15 @@ const VALID_DISPUTE_STATUSES = [
 ] as const;
 type ValidDisputeStatus = (typeof VALID_DISPUTE_STATUSES)[number];
 
+function getAdminUserId(req: CustomAuthRequest, res: Response): string | undefined {
+  if (!req.user || req.user.role !== "ADMIN") {
+    res.status(403).json({ error: "Admin access required" });
+    return undefined;
+  }
+
+  return req.user.userId;
+}
+
 export const createAgentHandler = async (
   req: CustomAuthRequest & {
     body: {
@@ -346,8 +355,12 @@ export const createAgentHandler = async (
     });
   }
 
+  const adminId = getAdminUserId(req, res);
+  if (!adminId) {
+    return;
+  }
+
   try {
-    const adminId = req.user!.userId;
     const agent = await createAgent(
       { firstname, lastname, email, phone, password },
       adminId
@@ -447,11 +460,16 @@ export const updateAgentStatusHandler = async (
     });
   }
 
+  const adminId = getAdminUserId(req, res);
+  if (!adminId) {
+    return;
+  }
+
   try {
     const agent = await updateAgentStatus(id, status as AgentStatus);
 
     logger.info(
-      { agentId: id, newStatus: status, adminId: req.user!.userId },
+      { agentId: id, newStatus: status, adminId },
       "admin.route_agent_status_updated"
     );
     return res.status(200).json({ success: true, agent });
@@ -617,15 +635,20 @@ export const updateDisputeStatusHandler = async (
     });
   }
 
+  const adminId = getAdminUserId(req, res);
+  if (!adminId) {
+    return;
+  }
+
   try {
     const dispute = await updateDisputeStatus(id, {
       newStatus: status as ValidDisputeStatus,
       resolution,
-      adminId: req.user!.userId,
+      adminId,
     });
 
     logger.info(
-      { disputeId: id, newStatus: status, adminId: req.user!.userId },
+      { disputeId: id, newStatus: status, adminId },
       "admin.route_dispute_status_updated"
     );
     return res.status(200).json({ success: true, dispute });
@@ -663,10 +686,15 @@ export const sendNotificationHandler = async (
       .json({ error: "studentMatric, title, and body are required" });
   }
 
+  const adminId = getAdminUserId(req, res);
+  if (!adminId) {
+    return;
+  }
+
   try {
     const notification = await sendNotification(studentMatric, title, body);
     logger.info(
-      { studentMatric, adminId: req.user!.userId },
+      { studentMatric, adminId },
       "admin.route_notification_sent"
     );
     return res.status(201).json({ success: true, notification });
