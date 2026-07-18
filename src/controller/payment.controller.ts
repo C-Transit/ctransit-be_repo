@@ -147,10 +147,17 @@ export const mockTopup = async (
       amount,
       reference
     );
-
+    
     logger.info(
-      { previousBalance, newBalance, threshold: env.ledger.baseFare },
-      "payment.mock_topup_balance_check"
+      {
+        previousBalance,
+        newBalance,
+        baseFare: env.ledger.baseFare,
+        crossed:
+          previousBalance < env.ledger.baseFare &&
+          newBalance >= env.ledger.baseFare,
+      },
+      "payment.mock_topup_threshold_check"
     );
 
     if (hasCrossedAboveThreshold(previousBalance, newBalance)) {
