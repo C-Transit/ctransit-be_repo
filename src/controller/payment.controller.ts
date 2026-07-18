@@ -7,6 +7,9 @@ import {
   createVirtualAccountForStudent,
   getVirtualAccount,
 } from "../services/payment.service.js";
+import { buildDeltaCommand } from "../utils/parser.js";
+import { enqueueBroadcast } from "../utils/bridge.js";
+import { hasCrossedAboveThreshold } from "../services/ledger.service.js";
 import logger from "../config/logger.js";
 
 // ─────────────────────────────────────────────
@@ -138,11 +141,28 @@ export const mockTopup = async (
       .toUpperCase()}`;
 
     // Credit wallet and create transaction
-    const { newBalance } = await creditWallet(
+    const { previousBalance, newBalance } = await creditWallet(
       user.matricNumber,
       amount,
       reference
     );
+
+    if (hasCrossedAboveThreshold(previousBalance, newBalance)) {
+      const cardMap = await prisma.cardMapping.findUnique({
+        where: { student_uid: user.matricNumber },
+        select: { card_uid: true },
+      });
+
+      if (cardMap) {
+        const removeBlCmd = buildDeltaCommand("REM", "BL", cardMap.card_uid);
+        await enqueueBroadcast(removeBlCmd);
+        logger.info({ removeBlCmd }, "payment.mock_topup_blacklist_removed");
+      }
+
+      await prisma.blacklist.deleteMany({
+        where: { student_uid: user.matricNumber },
+      });
+    }
 
     // Send email notification
     const message =

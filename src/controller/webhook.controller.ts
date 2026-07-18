@@ -133,16 +133,29 @@ export const handlePaymentWebhook = async (req: Request, res: Response) => {
     // If the student's balance crossed above the threshold after this
     // top-up, remove them from the blacklist and broadcast to terminals.
     if (hasCrossedAboveThreshold(previousBalance, newBalance)) {
-      const removeBlCmd = buildDeltaCommand("REM", "BL", user.matricNumber);
+      // 1. Get the student's card UID
+      const cardMap = await prisma.cardMapping.findUnique({
+        where: { student_uid: user.matricNumber },
+        select: { card_uid: true },
+      });
 
+      if (cardMap) {
+        const removeBlCmd = buildDeltaCommand("REM", "BL", cardMap.card_uid);
+        await enqueueBroadcast(removeBlCmd);
+        log.info({ removeBlCmd }, "webhook.blacklist_removal_broadcast_queued");
+      } else {
+        log.warn(
+          { matricNumber: user.matricNumber },
+          "webhook.no_card_found_for_removal"
+        );
+      }
+
+      // 2. Remove from blacklist DB
       await prisma.blacklist.deleteMany({
         where: { student_uid: user.matricNumber },
       });
 
-      await enqueueBroadcast(removeBlCmd);
-
-      log.info({ removeBlCmd }, "webhook.blacklist_removed_broadcast_queued");
-
+      // 3. Notify student
       sendNotification(
         user.matricNumber,
         "Ride Access Restored",
@@ -153,6 +166,11 @@ export const handlePaymentWebhook = async (req: Request, res: Response) => {
         const errMsg = err instanceof Error ? err.message : String(err);
         log.warn({ err: errMsg }, "webhook.blacklist_notification_failed");
       });
+
+      log.info(
+        { matricNumber: user.matricNumber },
+        "webhook.blacklist_removed"
+      );
     }
 
     return res.status(200).json({
