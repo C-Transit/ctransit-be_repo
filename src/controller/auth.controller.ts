@@ -432,10 +432,16 @@ export const confirmCard = async (req: AuthenticatedRequest, res: Response) => {
     }
 
     const result = await confirmRegistration(otp, userId);
+    logger.info({ userId, otp, result }, "auth.confirm_card_result");
 
     if (!result.success) {
       return res.status(400).json(result);
     }
+
+    if (!result.success) {
+      return res.status(400).json(result);
+    }
+
 
     return res.status(200).json(result);
   } catch (error) {
