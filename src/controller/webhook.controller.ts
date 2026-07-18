@@ -9,6 +9,7 @@ import { buildDeltaCommand } from "../utils/parser.js";
 import { sendNotification } from "../services/notification.service.js";
 import prisma from "../lib/prisma.js";
 import logger from "../config/logger.js";
+import env from "../config/env.js";
 
 const processedTransactions = new Set<string>();
 
@@ -128,6 +129,11 @@ export const handlePaymentWebhook = async (req: Request, res: Response) => {
       const errMsg = err instanceof Error ? err.message : String(err);
       log.warn({ err: errMsg }, "webhook.notification_failed — non-fatal");
     });
+
+    logger.info(
+      { previousBalance, newBalance, threshold: env.ledger.baseFare },
+      "payment.mock_topup_balance_check"
+    );
 
     //  Step 9: Remove from blacklist if threshold crossed 
     // If the student's balance crossed above the threshold after this

@@ -11,6 +11,7 @@ import { buildDeltaCommand } from "../utils/parser.js";
 import { enqueueBroadcast } from "../utils/bridge.js";
 import { hasCrossedAboveThreshold } from "../services/ledger.service.js";
 import logger from "../config/logger.js";
+import env from "../config/env.js";
 
 // ─────────────────────────────────────────────
 // Student requests their dedicated top-up account.
@@ -145,6 +146,11 @@ export const mockTopup = async (
       user.matricNumber,
       amount,
       reference
+    );
+
+    logger.info(
+      { previousBalance, newBalance, threshold: env.ledger.baseFare },
+      "payment.mock_topup_balance_check"
     );
 
     if (hasCrossedAboveThreshold(previousBalance, newBalance)) {
