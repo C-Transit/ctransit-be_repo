@@ -12,6 +12,7 @@ export interface ConfirmRegistrationResult {
   message: string;
   matricNumber?: string;
   cardUid?: string;
+  alreadyLinked?: boolean;
 }
 
 async function confirmRegistration(
@@ -25,11 +26,46 @@ async function confirmRegistration(
     where: { otp },
   });
 
-  if (!otpRecord || otpRecord.used || otpRecord.expires_at < new Date()) {
-    log.warn("registration.otp_not_found_or_expired");
+  if (!otpRecord) {
     return {
       success: false,
-      message: "OTP has expired or is invalid. Please tap your card again.",
+      message: "Invalid OTP. Please tap your card again.",
+    };
+  }
+
+  // ✅ NEW: Check if OTP is already used
+  if (otpRecord.used) {
+    // Check if this student is already linked
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { matricNumber: true },
+    });
+    if (user) {
+      const existingCard = await prisma.cardMapping.findUnique({
+        where: { student_uid: user.matricNumber },
+        select: { card_uid: true },
+      });
+      if (existingCard) {
+        return {
+          success: true,
+          message: "Card already linked",
+          matricNumber: user.matricNumber,
+          cardUid: existingCard.card_uid,
+          alreadyLinked: true,
+        };
+      }
+    }
+    return {
+      success: false,
+      message:
+        "This OTP has already been used. Please tap your card again for a new OTP.",
+    };
+  }
+
+  if (otpRecord.expires_at < new Date()) {
+    return {
+      success: false,
+      message: "OTP has expired. Please tap your card again.",
     };
   }
 

@@ -446,3 +446,74 @@ export const confirmCard = async (req: AuthenticatedRequest, res: Response) => {
       .json({ success: false, message: "Internal server error" });
   }
 };
+
+// src/controller/auth.controller.ts – add this function
+
+export const getCardLinkStatus = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: 'Unauthorized' });
+    }
+
+    // Get student's matric number
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { matricNumber: true },
+    });
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    // Check if card is already linked
+    const cardMap = await prisma.cardMapping.findUnique({
+      where: { student_uid: user.matricNumber },
+      select: { card_uid: true },
+    });
+
+    if (cardMap) {
+      return res.status(200).json({
+        success: true,
+        status: 'LINKED',
+        cardUid: cardMap.card_uid,
+        expiresAt: null,
+      });
+    }
+
+    // Check if there's a pending OTP for this student
+    // Note: OTP is associated with card_uid, not student, but we can check
+    // if there's any OTP that is not used and not expired in the system
+    const pendingOtp = await prisma.registrationOtp.findFirst({
+      where: {
+        used: false,
+        expires_at: { gt: new Date() },
+      },
+      orderBy: { created_at: 'desc' },
+      select: { otp: true, expires_at: true, card_uid: true },
+    });
+
+    if (pendingOtp) {
+      return res.status(200).json({
+        success: true,
+        status: 'PENDING',
+        cardUid: pendingOtp.card_uid,
+        expiresAt: pendingOtp.expires_at,
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      status: 'NO_ACTIVE_OTP',
+      cardUid: null,
+      expiresAt: null,
+    });
+  } catch (error) {
+    const errMessage = error instanceof Error ? error.message : 'Unknown error';
+    logger.error({ err: errMessage }, 'auth.card_link_status_error');
+    return res.status(500).json({ success: false, message: 'Failed to fetch card link status' });
+  }
+};

@@ -9,6 +9,7 @@ import {
   logoutStudent,
   confirmCard,
   refreshAccessToken,
+  getCardLinkStatus,
 } from "../controller/auth.controller.js";
 import agentRouter from "./agent.routes.js";
 import { authenticateToken } from "../middleware/auth.middleware.js";
@@ -23,6 +24,7 @@ router.post("/login", loginStudent);
 router.post("/logout", logoutStudent);
 router.post("/refresh", refreshAccessToken); // No auth required — token is self-validating
 router.post("/confirm-card", authenticateToken, confirmCard);
+router.get("/card-link-status", authenticateToken, getCardLinkStatus);
 
 // ── Admin auth ─────────────────────────────────────────────────────────────
 // Separate route — bypasses institution email check, role-guards at DB level
