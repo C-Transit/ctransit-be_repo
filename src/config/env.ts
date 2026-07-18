@@ -17,6 +17,8 @@ const REQUIRED_VARS = [
   "CLOUDINARY_API_SECRET",
   "PAYMENT_PROVIDER",
   "PAYMENT_SECRET_KEY",
+  "MQTT_INTERNAL_URL",
+  "MQTT_INTERNAL_SECRET",
 ] as const;
 
 const missing = REQUIRED_VARS.filter((key) => !process.env[key]);
@@ -86,6 +88,10 @@ interface Config {
     provider: string;
     secretKey: string;
   };
+  mqtt: {
+    internalUrl: string;
+    internalSecret: string;
+  };
   rateLimit: {
     global: { windowMs: number; max: number };
     login: { windowMs: number; max: number };
@@ -153,7 +159,11 @@ const env: Config = {
   payment: {
     provider: process.env.PAYMENT_PROVIDER as string,
     secretKey: process.env.PAYMENT_SECRET_KEY as string,
-  }
+  },
+  mqtt: {
+    internalUrl: process.env.MQTT_INTERNAL_URL as string,
+    internalSecret: process.env.MQTT_INTERNAL_SECRET as string,
+  },
 };
 
 export default env;

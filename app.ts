@@ -6,6 +6,7 @@ import cors from "cors";
 import "dotenv/config";
 import logger from "./src/config/logger.js";
 import connectDB from "./src/config/db.js";
+import { enqueueBroadcast, enqueueRoute } from "./src/utils/bridge.js";
 
 import healthRouter from "./src/routes/health.routes.js";
 import adminRouter from "./src/routes/admin.routes.js";
@@ -126,6 +127,21 @@ app.use("/api/disputes", disputeLimiter, disputeRoutes);
 
 // ── Notifications 
 app.use("/api/notifications", notificationLimiter, notificationRoutes);
+
+// e.g. in server.ts before the 404 handler
+app.post('/test-bridge', async (req, res) => {
+  try {
+    const { command, terminalId } = req.body;
+    if (terminalId) {
+      await enqueueRoute(terminalId, command);
+    } else {
+      await enqueueBroadcast(command);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
 
 // ── 404
 app.use((req: Request, res: Response) => {

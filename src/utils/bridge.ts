@@ -1,51 +1,83 @@
 // src/utils/bridge.ts
 //
-// Redis-based bridge from the main HTTP API to the MQTT microservice.
-// Instead of calling broadcastDeltaToFleet() or routeDeltaToTerminal()
-// directly (which requires an MQTT connection), the main API pushes
-// commands to Redis queues that the MQTT service consumes.
+// HTTP bridge from the main API to the MQTT microservice.
+// All fleet/terminal commands are sent as HTTP requests to
+// the MQTT service's internal endpoints.
 //
-// Queue keys:
-//   mqtt:broadcast          → broadcastDeltaToFleet(command)
-//   mqtt:route:{terminalId} → routeDeltaToTerminal(terminalId, command)
+// Endpoints:
+//   POST /internal/broadcast  → broadcastDeltaToFleet(command)
+//   POST /internal/route/:id  → routeDeltaToTerminal(id, command)
 //
-// The MQTT service's broadcast.consumer.ts drains these queues
-// every 500ms and executes the actual MQTT publish.
+// Authentication: X-API-Key header with MQTT_INTERNAL_SECRET.
 
-import { getRedisClient } from "../config/redis.js";
+import fetch from "node-fetch";
+import env from "../config/env.js";
 import logger from "../config/logger.js";
 
-const BROADCAST_QUEUE = "mqtt:broadcast";
-const ROUTE_QUEUE_PREFIX = "mqtt:route:";
+const MQTT_URL = env.mqtt.internalUrl;
+const API_KEY = env.mqtt.internalSecret;
+
+// ─────────────────────────────────────────────
+// _post – internal helper with retries
+// ─────────────────────────────────────────────
+async function _post(
+  endpoint: string,
+  body: Record<string, unknown>,
+  retries = 3
+): Promise<void> {
+  const url = `${MQTT_URL}${endpoint}`;
+  const log = logger.child({ url, body });
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": API_KEY,
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`MQTT service returned ${res.status}: ${text}`);
+      }
+
+      log.debug({ attempt }, "mqtt_bridge.http_success");
+      return;
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log.warn({ attempt, err: errMsg }, "mqtt_bridge.http_failed");
+      if (attempt === retries) {
+        log.error({ err: errMsg }, "mqtt_bridge.http_failed_all_retries");
+        throw err;
+      }
+      // Exponential backoff: 200ms, 400ms, 800ms
+      await new Promise((resolve) =>
+        setTimeout(resolve, 200 * 2 ** (attempt - 1))
+      );
+    }
+  }
+}
 
 // ─────────────────────────────────────────────
 // enqueueBroadcast
-// Replaces broadcastDeltaToFleet() in the main API.
-// Pushes a command to the broadcast queue —
-// the MQTT service picks it up and fans it out
-// to all online terminals.
+// Sends a command to all online terminals.
 // ─────────────────────────────────────────────
 export async function enqueueBroadcast(command: string): Promise<void> {
-  const redis = getRedisClient();
-  await redis.rpush(BROADCAST_QUEUE, command);
-  logger.debug({ command }, "mqtt_bridge.broadcast_enqueued");
+  await _post("/internal/broadcast", { command });
+  logger.debug({ command }, "mqtt_bridge.broadcast_sent");
 }
 
 // ─────────────────────────────────────────────
 // enqueueRoute
-// Replaces routeDeltaToTerminal() in the main API.
-// Pushes a command to a per-terminal queue —
-// the MQTT service picks it up and delivers it
-// to the specific terminal (or queues it if offline).
+// Sends a command to a specific terminal.
 // ─────────────────────────────────────────────
 export async function enqueueRoute(
   terminalId: string,
   command: string
 ): Promise<void> {
-  const redis = getRedisClient();
-  await redis.rpush(
-    `${ROUTE_QUEUE_PREFIX}${terminalId.toLowerCase()}`,
-    command
-  );
-  logger.debug({ terminalId, command }, "mqtt_bridge.route_enqueued");
+  await _post(`/internal/route/${terminalId}`, { command });
+  logger.debug({ terminalId, command }, "mqtt_bridge.route_sent");
 }
