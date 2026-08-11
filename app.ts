@@ -46,7 +46,7 @@ app.use(
   cors({
     origin: [
       "https://www.ctransit.me",
-      "http://localhost:5173",
+      "http://localhost:3000",
       "https://ctransit-fe-repo.vercel.app",
       "https://c-transit-pink.vercel.app",
     ],
