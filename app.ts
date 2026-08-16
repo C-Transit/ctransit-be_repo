@@ -46,7 +46,11 @@ app.use(
   cors({
     origin: [
       "https://www.ctransit.me",
+      "https://www.admin.ctransit.me",
+      "https://www.agent.ctransit.me",
       "http://localhost:3000",
+      "http://localhost:3001",
+      "http://localhost:3002",
       "https://ctransit-fe-repo.vercel.app",
       "https://c-transit-pink.vercel.app",
     ],
