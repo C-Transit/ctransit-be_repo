@@ -293,6 +293,18 @@ export { listTerminals };
 // schema uses Decimal(10,2) so precision is safe.
 // ─────────────────────────────────────────────
 async function getAdminOverview() {
+  const cacheKey = "admin:overview:cache";
+  const redis = getRedisClient();
+
+  try {
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return JSON.parse(cached);
+    }
+  } catch (err) {
+    logger.debug({ err: String(err) }, "admin.overview_cache_read_error");
+  }
+
   const now = new Date();
   // Date boundaries for income time buckets
   const startOfToday = new Date(
@@ -382,7 +394,7 @@ async function getAdminOverview() {
     }),
   ]);
 
-  return {
+  const overview = {
     counts: {
       students: totalStudents,
       activeAgents: totalActiveAgents,
@@ -412,6 +424,14 @@ async function getAdminOverview() {
       revenue: d._sum.amount ? parseFloat(d._sum.amount.toString()) : 0,
     })),
   };
+
+  try {
+    await redis.setex(cacheKey, 30, JSON.stringify(overview));
+  } catch (err) {
+    logger.debug({ err: String(err) }, "admin.overview_cache_write_error");
+  }
+
+  return overview;
 }
 
 // ─────────────────────────────────────────────

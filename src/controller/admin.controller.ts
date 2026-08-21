@@ -5,6 +5,7 @@ import env from "../config/env.js";
 import {
   enqueueRoute,
   enqueueBroadcast,
+  enqueueSyncWhitelist,
 } from "../utils/bridge.js";
 import { confirmRegistration } from "../services/registration.service.js";
 import {
@@ -710,15 +711,9 @@ export const sendNotificationHandler = async (
 };
 
 export const syncWhitelistHandler = async (req: Request, res: Response) => {
-  const log = logger.child({});
-
   try {
     const cardMappings = await prisma.cardMapping.findMany({
       select: { card_uid: true },
-    });
-
-    const terminals = await prisma.terminal.findMany({
-      select: { terminal_id: true },
     });
 
     const whitelistUids = cardMappings.map(
@@ -726,9 +721,6 @@ export const syncWhitelistHandler = async (req: Request, res: Response) => {
     );
 
     const MAX_CHUNK_BYTES = 500;
-    const SLEEP_MS = 2000;
-    const sleep = (ms: number) =>
-      new Promise((resolve) => setTimeout(resolve, ms));
 
     const buildChunks = (
       prefix: string,
@@ -763,37 +755,25 @@ export const syncWhitelistHandler = async (req: Request, res: Response) => {
         ? ["SYS:WL,EMPTY"]
         : buildChunks("SYS:WL,", whitelistUids, MAX_CHUNK_BYTES);
 
-    log.info(
+    logger.info(
       {
-        terminalCount: terminals.length,
         cardCount: whitelistUids.length,
         chunkCount: wlChunks.length,
       },
-      "admin.sync_whitelist_started"
+      "admin.sync_whitelist_initiated"
     );
 
-    res.json({
+    await enqueueSyncWhitelist(wlChunks);
+
+    return res.json({
       success: true,
-      message: `Whitelist sync queued for ${terminals.length} terminal(s). ${whitelistUids.length} card(s), ${wlChunks.length} chunk(s).`,
+      message: `Whitelist sync queued for fleet. ${whitelistUids.length} card(s), ${wlChunks.length} chunk(s).`,
     });
-
-    for (const terminal of terminals) {
-      const terminalId = terminal.terminal_id;
-
-      for (let i = 0; i < wlChunks.length; i++) {
-        await enqueueRoute(terminalId, wlChunks[i]);
-        if (i < wlChunks.length - 1) await sleep(SLEEP_MS);
-      }
-
-      await sleep(SLEEP_MS);
-      await enqueueRoute(terminalId, "SYS:SYNC_COMPLETE");
-
-      log.info({ terminalId }, "admin.sync_whitelist_queued");
-    }
   } catch (error) {
     const errMessage =
       error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.sync_whitelist_error");
+    return res.status(500).json({ error: "Failed to queue whitelist sync" });
   }
 };
 
@@ -815,10 +795,7 @@ export const issuePoisonPillHandler = async (
     });
 
     const poisonCmd = "CMD:POISON_PILL";
-    const redis = getRedisClient() as unknown as {
-      lpush: (key: string, value: string) => Promise<unknown>;
-    };
-    await redis.lpush(redisKeys.terminalQueue(terminalId), poisonCmd);
+    // Delegate queuing & offline delivery exclusively to MQTT service bridge
     await enqueueRoute(terminalId, poisonCmd);
 
     log.warn({ poisonCmd }, "admin.poison_pill_queued");

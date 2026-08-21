@@ -4,7 +4,7 @@ import prisma from "../lib/prisma.js";
 import { activateWallet } from "./ledger.service.js";
 import { buildDeltaCommand} from "../utils/parser.js";
 import { sendNotification } from "./notification.service.js"; 
-import { enqueueRoute } from "../utils/bridge.js";
+import { enqueueRoute, enqueueBroadcast } from "../utils/bridge.js";
 import logger from "../config/logger.js";
 
 export interface ConfirmRegistrationResult {
@@ -147,18 +147,10 @@ async function confirmRegistration(
   }
 
   try {
-    const allTerminals = await prisma.terminal.findMany({
-      where: { terminal_id: { not: originTerminalId } },
-      select: { terminal_id: true },
-    });
-    await Promise.allSettled(
-      allTerminals.map((t: { terminal_id: string }) =>
-        enqueueRoute(t.terminal_id, addWlCmd)
-      )
-    );
+    await enqueueBroadcast(addWlCmd);
     log.info(
-      { terminalCount: allTerminals.length },
-      "registration.fleet_sync_queued"
+      { addWlCmd },
+      "registration.fleet_sync_broadcast_queued"
     );
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : "Unknown error";

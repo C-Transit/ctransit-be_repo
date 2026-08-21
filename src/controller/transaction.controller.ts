@@ -25,25 +25,50 @@ export const getTransactionHistory = async (
       return res.status(404).json({ message: "User not found" });
     }
 
-    const transactions = await prisma.transaction.findMany({
-      where: { student_uid: user.matricNumber }, // ← scope to this student only
+    const limitParam = req.query.limit ? parseInt(req.query.limit as string, 10) : 20;
+    const limit = Math.min(Math.max(isNaN(limitParam) ? 20 : limitParam, 1), 100);
+    const cursor = req.query.cursor as string | undefined;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const findArgs: any = {
+      where: { student_uid: user.matricNumber },
       select: {
+        transaction_id: true,
         amount: true,
         type: true,
         synced_at: true,
         terminal_id: true,
       },
       orderBy: { synced_at: "desc" },
-    });
+      take: limit + 1,
+    };
+
+    if (cursor) {
+      findArgs.cursor = { transaction_id: cursor };
+      findArgs.skip = 1;
+    }
+
+    const rows = await prisma.transaction.findMany(findArgs);
+    const hasMore = rows.length > limit;
+    const transactions = hasMore ? rows.slice(0, limit) : rows;
+    const nextCursor =
+      hasMore && transactions.length > 0
+        ? transactions[transactions.length - 1].transaction_id
+        : null;
 
     logger.info(
-      { studentUid: user.matricNumber, count: transactions.length },
+      { studentUid: user.matricNumber, count: transactions.length, hasMore },
       "transaction.history_fetched"
     );
 
     return res.status(200).json({
       success: true,
-      data: { transactions },
+      data: {
+        transactions,
+        nextCursor,
+        hasMore,
+        count: transactions.length,
+      },
     });
   } catch (error) {
     const errMessage = error instanceof Error ? error.message : "Unknown error";

@@ -38,7 +38,9 @@ const app = express();
 
 app.set("trust proxy", 1);
 
-app.use(morgan("dev"));
+if (process.env.NODE_ENV === "development") {
+  app.use(morgan("dev"));
+}
 app.use(express.json({ limit: "10kb" }));
 app.use(express.urlencoded({ extended: false }));
 
@@ -132,20 +134,22 @@ app.use("/api/disputes", disputeLimiter, disputeRoutes);
 // ── Notifications 
 app.use("/api/notifications", notificationLimiter, notificationRoutes);
 
-// e.g. in server.ts before the 404 handler
-app.post('/test-bridge', async (req, res) => {
-  try {
-    const { command, terminalId } = req.body;
-    if (terminalId) {
-      await enqueueRoute(terminalId, command);
-    } else {
-      await enqueueBroadcast(command);
+// Development-only test bridge endpoint
+if (process.env.NODE_ENV === "development") {
+  app.post("/test-bridge", async (req: Request, res: Response) => {
+    try {
+      const { command, terminalId } = req.body;
+      if (terminalId) {
+        await enqueueRoute(terminalId, command);
+      } else {
+        await enqueueBroadcast(command);
+      }
+      res.json({ success: true });
+    } catch (err) {
+      res.status(500).json({ error: String(err) });
     }
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: String(err) });
-  }
-});
+  });
+}
 
 // ── 404
 app.use((req: Request, res: Response) => {

@@ -10,8 +10,7 @@ const connectDB = async (): Promise<void> => {
       error instanceof Error
         ? error.message
         : "Unknown database connection error";
-    logger.error({ err: errorMessage }, "db.connection_error");
-    process.exit(1);
+    logger.warn({ err: errorMessage }, "db.connection_warning — database offline or unconfigured");
   }
 };
 

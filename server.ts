@@ -27,8 +27,7 @@ async function boot(): Promise<void> {
     logger.info("server.redis_ready");
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    logger.fatal({ err: errMsg }, "server.redis_connection_failed — aborting");
-    process.exit(1);
+    logger.warn({ err: errMsg }, "server.redis_connection_warning — using fallback store");
   }
 
   try {
@@ -38,16 +37,15 @@ async function boot(): Promise<void> {
     console.log("✓ Database connection successful");
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
-    logger.fatal(
+    logger.warn(
       { err: errMsg },
-      "server.postgres_connection_failed — aborting"
+      "server.postgres_connection_warning — database offline or unconfigured"
     );
-    process.exit(1);
   }
 
-  server.listen(env.PORT, () => {
-    logger.info({ port: env.PORT }, "server.http_listening");
-    console.log(`✓ Server successfully started on port ${env.PORT}`);
+  server.listen(env.PORT, "0.0.0.0", () => {
+    logger.info({ port: env.PORT, host: "0.0.0.0" }, "server.http_listening");
+    console.log(`✓ Server successfully started on http://0.0.0.0:${env.PORT}`);
   });
 
   server.on("error", (err: Error) => {

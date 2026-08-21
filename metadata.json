@@ -1,0 +1,6 @@
+{
+  "name": "C-Transit Backend",
+  "description": "Backend API for C-Transit campus transit payment and ledger system",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -3,6 +3,7 @@ import jwt, { type JwtPayload } from "jsonwebtoken";
 import logger from "../config/logger.js";
 import env from "../config/env.js";
 import prisma from "../lib/prisma.js";
+import { getRedisClient, cacheKeys, AGENT_STATUS_TTL } from "../config/redis.js";
 
 // ─────────────────────────────────────────────
 // JWT PAYLOAD SHAPE
@@ -174,26 +175,44 @@ async function checkAgentActive(
   const agentId = req.user.userId;
 
   try {
-    // Direct DB lookup — no Redis cache
-    const agent = await prisma.agent.findUnique({
-      where: { id: agentId },
-      select: { status: true },
-    });
+    const redis = getRedisClient();
+    const cacheKey = cacheKeys.agentStatus(agentId);
+    let status: string | null = null;
 
-    if (!agent) {
-      logger.warn({ agentId }, "auth.agent_not_found_in_db");
-      res.status(403).json({ error: "Agent account not found" });
-      return;
+    try {
+      status = await redis.get(cacheKey);
+    } catch {
+      // Redis offline/failure fallback to DB
     }
 
-    if (agent.status !== "ACTIVE") {
+    if (!status) {
+      const agent = await prisma.agent.findUnique({
+        where: { id: agentId },
+        select: { status: true },
+      });
+
+      if (!agent) {
+        logger.warn({ agentId }, "auth.agent_not_found_in_db");
+        res.status(403).json({ error: "Agent account not found" });
+        return;
+      }
+
+      status = agent.status;
+      try {
+        await redis.setex(cacheKey, AGENT_STATUS_TTL, status);
+      } catch {
+        // ignore redis write error
+      }
+    }
+
+    if (status !== "ACTIVE") {
       logger.warn(
-        { agentId, status: agent.status },
+        { agentId, status },
         "auth.agent_blocked_by_status"
       );
       res.status(403).json({
         error:
-          agent.status === "SUSPENDED"
+          status === "SUSPENDED"
             ? "Agent account is temporarily suspended"
             : "Agent account has been deactivated",
       });

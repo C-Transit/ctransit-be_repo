@@ -10,6 +10,7 @@
 //
 // Authentication: X-API-Key header with MQTT_INTERNAL_SECRET.
 
+import { randomUUID } from "crypto";
 import fetch from "node-fetch";
 import env from "../config/env.js";
 import logger from "../config/logger.js";
@@ -18,15 +19,18 @@ const MQTT_URL = env.mqtt.internalUrl;
 const API_KEY = env.mqtt.internalSecret;
 
 // ─────────────────────────────────────────────
-// _post – internal helper with retries
+// _post – internal helper with retries & idempotency
 // ─────────────────────────────────────────────
 async function _post(
   endpoint: string,
   body: Record<string, unknown>,
+  commandId?: string,
   retries = 3
 ): Promise<void> {
   const url = `${MQTT_URL}${endpoint}`;
-  const log = logger.child({ url, body });
+  const id = commandId || (body.commandId as string) || randomUUID();
+  const payload = { ...body, commandId: id };
+  const log = logger.child({ url, commandId: id, body: payload });
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
@@ -35,8 +39,9 @@ async function _post(
         headers: {
           "Content-Type": "application/json",
           "X-API-Key": API_KEY,
+          "X-Command-Id": id,
         },
-        body: JSON.stringify(body),
+        body: JSON.stringify(payload),
       });
 
       if (!res.ok) {
@@ -65,9 +70,13 @@ async function _post(
 // enqueueBroadcast
 // Sends a command to all online terminals.
 // ─────────────────────────────────────────────
-export async function enqueueBroadcast(command: string): Promise<void> {
-  await _post("/internal/broadcast", { command });
-  logger.debug({ command }, "mqtt_bridge.broadcast_sent");
+export async function enqueueBroadcast(
+  command: string,
+  commandId?: string
+): Promise<void> {
+  const id = commandId || randomUUID();
+  await _post("/internal/broadcast", { command, commandId: id }, id);
+  logger.debug({ commandId: id, command }, "mqtt_bridge.broadcast_sent");
 }
 
 // ─────────────────────────────────────────────
@@ -76,8 +85,36 @@ export async function enqueueBroadcast(command: string): Promise<void> {
 // ─────────────────────────────────────────────
 export async function enqueueRoute(
   terminalId: string,
-  command: string
+  command: string,
+  commandId?: string
 ): Promise<void> {
-  await _post(`/internal/route/${terminalId}`, { command });
-  logger.debug({ terminalId, command }, "mqtt_bridge.route_sent");
+  const id = commandId || randomUUID();
+  await _post(`/internal/route/${terminalId}`, { command, commandId: id }, id);
+  logger.debug({ terminalId, commandId: id, command }, "mqtt_bridge.route_sent");
+}
+
+// ─────────────────────────────────────────────
+// enqueueSyncWhitelist
+// Sends full whitelist sync chunks to fleet in batch
+// ─────────────────────────────────────────────
+export async function enqueueSyncWhitelist(
+  chunks: string[],
+  syncId?: string
+): Promise<void> {
+  const id = syncId || randomUUID();
+  try {
+    // Attempt single fleet-sync job endpoint on MQTT service
+    await _post("/internal/sync/whitelist", { chunks, syncId: id }, id);
+    logger.info({ syncId: id, chunkCount: chunks.length }, "mqtt_bridge.sync_whitelist_job_sent");
+  } catch (err) {
+    logger.warn(
+      { err: String(err), syncId: id },
+      "mqtt_bridge.sync_whitelist_fallback_to_broadcast"
+    );
+    // Resilient fallback: broadcast each chunk to the fleet
+    for (let i = 0; i < chunks.length; i++) {
+      await enqueueBroadcast(chunks[i], `${id}-chunk-${i}`);
+    }
+    await enqueueBroadcast("SYS:SYNC_COMPLETE", `${id}-complete`);
+  }
 }
