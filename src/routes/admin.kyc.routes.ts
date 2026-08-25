@@ -7,8 +7,7 @@ import {
 
 const router = Router();
 
-router.use(requireAdminSecret);
-router.post("/approve", approveKycHandler);
-router.post("/reject", rejectKycHandler);
+router.post("/approve", requireAdminSecret, approveKycHandler);
+router.post("/reject", requireAdminSecret, rejectKycHandler);
 
 export default router;

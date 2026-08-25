@@ -66,7 +66,7 @@ interface Config {
   };
   jwt: {
     secret: string;
-    refreshSecret: string;
+    refreshSecret: string; // ← added
   };
   otp: {
     secret: string;
@@ -110,39 +110,39 @@ const env: Config = {
   NODE_ENV: process.env.NODE_ENV || "development",
   PORT: parseIntSafe(process.env.PORT, 3000),
   db: {
-    url: process.env.DATABASE_URL,
-    pooledUrl: process.env.DATABASE_URL_POOLED,
+    url: process.env.DATABASE_URL || "postgresql://mock:mock@localhost:5432/ctransit?sslmode=disable",
+    pooledUrl: process.env.DATABASE_URL_POOLED || process.env.DATABASE_URL || "postgresql://mock:mock@localhost:5432/ctransit?sslmode=disable",
   },
   redis: {
-    url: process.env.REDIS_URL,
+    url: process.env.REDIS_URL || "redis://localhost:6379",
   },
   ledger: {
     baseFare: parseFloatSafe(process.env.BASE_FARE, 150),
   },
   admin: {
-    secret: process.env.ADMIN_API_SECRET,
+    secret: process.env.ADMIN_API_SECRET || "dev_admin_api_secret_default_key",
   },
   jwt: {
-    secret: process.env.JWT_SECRET,
-    refreshSecret: process.env.JWT_REFRESH_SECRET,
+    secret: process.env.JWT_SECRET || "dev_jwt_secret_default_key_ctransit",
+    refreshSecret: process.env.JWT_REFRESH_SECRET || "dev_jwt_refresh_secret_default_key_ctransit",
   },
   otp: {
-    secret: process.env.OTP_SECRET,
+    secret: process.env.OTP_SECRET || "dev_otp_secret_key_1234567890",
   },
   mail: {
-    user: process.env.MAIL_USER,
-    password: process.env.MAIL_PASSWORD,
+    user: process.env.MAIL_USER || "notifications@ctransit.me",
+    password: process.env.MAIL_PASSWORD || "dev_mail_password",
   },
   auth: {
-    allowedEmailDomain: process.env.ALLOWED_EMAIL_DOMAIN,
+    allowedEmailDomain: process.env.ALLOWED_EMAIL_DOMAIN || "@covenantuniversity.edu.ng",
   },
   cloudinary: {
-    cloudName: process.env.CLOUDINARY_CLOUD_NAME,
-    apiKey: process.env.CLOUDINARY_API_KEY,
-    apiSecret: process.env.CLOUDINARY_API_SECRET,
+    cloudName: process.env.CLOUDINARY_CLOUD_NAME || "demo",
+    apiKey: process.env.CLOUDINARY_API_KEY || "demo_key",
+    apiSecret: process.env.CLOUDINARY_API_SECRET || "demo_secret",
   },
   rateLimit: {
-    // Edit these values to tune limits without touching middleware
+    // ── Edit these values to tune limits without touching middleware ──
     global: { windowMs: 15 * 60 * 1000, max: 100 },
     login: { windowMs: 15 * 60 * 1000, max: 5 },
     adminLogin: { windowMs: 15 * 60 * 1000, max: 3 },
@@ -156,12 +156,12 @@ const env: Config = {
     notifications: { windowMs: 15 * 60 * 1000, max: 30 },
   },
   payment: {
-    provider: process.env.PAYMENT_PROVIDER,
-    secretKey: process.env.PAYMENT_SECRET_KEY,
+    provider: process.env.PAYMENT_PROVIDER || "mock",
+    secretKey: process.env.PAYMENT_SECRET_KEY || "mock_secret_key",
   },
   mqtt: {
-    internalUrl: process.env.MQTT_INTERNAL_URL,
-    internalSecret: process.env.MQTT_INTERNAL_SECRET,
+    internalUrl: process.env.MQTT_INTERNAL_URL || "http://localhost:4000",
+    internalSecret: process.env.MQTT_INTERNAL_SECRET || "mock_mqtt_secret",
   },
 };
 
