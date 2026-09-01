@@ -50,6 +50,7 @@ app.use(
       "https://www.ctransit.me",
       "https://admin.ctransit.me",
       "https://agent.ctransit.me",
+      "https://driver.ctransit.me",
       "http://localhost:3000",
       "http://localhost:3001",
       "http://localhost:3002",
