@@ -1,12 +1,11 @@
 "use strict";
 
+import { randomUUID } from "node:crypto";
 import express, { Request, Response, NextFunction } from "express";
 import morgan from "morgan";
 import cors from "cors";
 import "dotenv/config";
 import logger from "./src/config/logger.js";
-import connectDB from "./src/config/db.js";
-import { enqueueBroadcast, enqueueRoute } from "./src/utils/bridge.js";
 
 import healthRouter from "./src/routes/health.routes.js";
 import adminRouter from "./src/routes/admin.routes.js";
@@ -17,6 +16,7 @@ import transactionRoutes from "./src/routes/transaction.routes.js";
 import agentRoutes from "./src/routes/agent.routes.js";
 import disputeRoutes from "./src/routes/dispute.routes.js";
 import notificationRoutes from "./src/routes/notification.routes.js";
+import driverRoutes from "./src/routes/driver.routes.js";
 import walletsRouter from "./src/routes/wallet.routes.js";
 import paymentRoutes from "./src/routes/payment.routes.js";
 import { authenticateToken } from "./src/middleware/auth.middleware.js";
@@ -34,9 +34,48 @@ import {
   notificationLimiter,
 } from "./src/middleware/rate-limit.middleware.js";
 
+type RequestWithId = Request & { id?: string };
+
 const app = express();
 
 app.set("trust proxy", 1);
+
+app.use((req: RequestWithId, _res: Response, next: NextFunction) => {
+  const requestId =
+    (req.headers["x-request-id"] as string | undefined) || randomUUID();
+  req.headers["x-request-id"] = requestId;
+  req.id = requestId;
+  next();
+});
+
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const isHttps =
+    req.secure || req.headers["x-forwarded-proto"] === "https";
+
+  res.setHeader("x-content-type-options", "nosniff");
+  res.setHeader("x-frame-options", "DENY");
+  res.setHeader("x-dns-prefetch-control", "off");
+  res.setHeader("referrer-policy", "no-referrer");
+  res.setHeader("cross-origin-opener-policy", "same-origin");
+  res.setHeader("cross-origin-resource-policy", "same-origin");
+  res.setHeader("permissions-policy", "geolocation=(), microphone=(), camera=()");
+
+  if (isHttps && process.env.NODE_ENV === "production") {
+    res.setHeader(
+      "strict-transport-security",
+      "max-age=31536000; includeSubDomains"
+    );
+  }
+
+  if (req.method === "OPTIONS") {
+    res.setHeader("access-control-allow-methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+    res.setHeader("access-control-allow-headers", "Content-Type, Authorization, X-Request-Id, X-Internal-Secret, X-Admin-Secret, X-Critical-Approval-Token");
+    res.status(204).end();
+    return;
+  }
+
+  next();
+});
 
 if (process.env.NODE_ENV === "development") {
   app.use(morgan("dev"));
@@ -55,49 +94,54 @@ app.use(
       "http://localhost:3001",
       "http://localhost:3002",
       "http://localhost:3003",
-      "https://ctransit-fe-repo.vercel.app",
       "https://c-transit-pink.vercel.app",
+      "https://ctransit-driver.vercel.app",
     ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   })
 );
 
-connectDB();
-
-// ── Request logger ──────
 app.use((req: Request, res: Response, next: NextFunction) => {
   const start = Date.now();
+  const requestId =
+    (req.headers["x-request-id"] as string | undefined) || randomUUID();
+
   res.on("finish", () => {
-    logger.info(
-      {
-        method: req.method,
-        path: req.path,
-        statusCode: res.statusCode,
-        durationMs: Date.now() - start,
-        ip: req.ip,
-      },
-      "http.request"
-    );
+    const durationMs = Date.now() - start;
+    const logData = {
+      requestId,
+      method: req.method,
+      path: req.path,
+      statusCode: res.statusCode,
+      durationMs,
+      ip: req.ip,
+    };
+
+    if (res.statusCode >= 500) {
+      logger.error(logData, "http.server_error");
+    } else if (res.statusCode >= 400) {
+      logger.warn(logData, "http.client_error");
+    } else {
+      logger.info(logData, "http.request");
+    }
   });
+
+  res.setHeader("x-request-id", requestId);
   next();
 });
 
-// ── Global rate limit ceiling ─────────────────────────────────────────────
-// Applies to every route. Specific limiters below override this for
-// sensitive endpoints — express matches middleware in registration order.
+// Global rate limiter
 app.use(globalLimiter);
 
 app.get("/", (req: Request, res: Response) => {
   res.send("C-transit server is running");
 });
 
-app.use("/health", healthRouter);
+app.use(["/health", "/api/health"], healthRouter);
 app.use(["/admin", "/api/admin"], adminRouter);
 
-// ── Auth ────────────────
-// Specific limiters registered before the router so they fire first.
-// express-rate-limit matches on path prefix at the app level.
+// Authentication & user management
 app.use("/api/auth/register", registerLimiter);
 app.use("/api/auth/login", loginLimiter);
 app.use("/api/auth/admin/login", adminLoginLimiter);
@@ -107,17 +151,17 @@ app.use("/api/auth", authRoutes);
 
 app.use("/api/users", userRoutes);
 
-// ── KYC 
+// KYC 
 app.use("/api/kyc/submit", kycSubmitLimiter);
 app.use("/api/kyc/status", kycStatusLimiter);
 app.use("/api/kyc", kycRoutes);
 
-// ── Wallets 
+// Wallets 
 app.use("/api/wallets", walletLimiter, authenticateToken, walletsRouter);
 
 app.use("/api/payments", paymentRoutes);
 
-// ── Transactions 
+// Transactions 
 app.use(
   "/api/transactions",
   transactionLimiter,
@@ -125,43 +169,26 @@ app.use(
   transactionRoutes
 );
 
-// ── Agents 
-// authenticateToken not applied here — agent.routes.ts owns the full
-// middleware chain: authenticateToken → requireAgent → checkAgentActive
+// Agents 
 app.use("/api/agents", agentRoutes);
 
-// ── Disputes 
+// Disputes 
 app.use("/api/disputes", disputeLimiter, disputeRoutes);
 
-// ── Notifications 
+// Notifications 
 app.use("/api/notifications", notificationLimiter, notificationRoutes);
 
-// Development-only test bridge endpoint
-if (process.env.NODE_ENV === "development") {
-  app.post("/test-bridge", async (req: Request, res: Response) => {
-    try {
-      const { command, terminalId } = req.body;
-      if (terminalId) {
-        await enqueueRoute(terminalId, command);
-      } else {
-        await enqueueBroadcast(command);
-      }
-      res.json({ success: true });
-    } catch (err) {
-      res.status(500).json({ error: String(err) });
-    }
-  });
-}
+// Drivers
+app.use("/api/drivers", driverRoutes);
 
-// ── 404
+// 404
 app.use((req: Request, res: Response) => {
   res.status(404).json({ error: "Not found" });
 });
 
-// ── Global error handler 
-// Must have exactly 4 params for Express to treat it as an error handler
-// rather than regular middleware — next is required even if unused.
-app.use((err: Error, req: Request, res: Response) => {
+// Global error handler
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
   logger.error({ err: err.message, path: req.path }, "http.unhandled_error");
   res.status(500).json({ error: "Internal server error" });
 });

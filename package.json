@@ -7,9 +7,9 @@
     "postinstall": "prisma generate",
     "build": "tsc",
     "lint": "eslint src --ext .ts,.tsx",
+    "test": "tsx --test tests/**/*.test.ts",
     "start": "node dist/server.js",
-    "dev": "tsx watch server.ts",
-    "seed": "cross-env ADMIN_SEED_PASSWORD=ctransit@dev2 tsx prisma/seed.ts"
+    "dev": "tsx watch server.ts"
   },
   "keywords": [],
   "author": "",
@@ -52,7 +52,8 @@
     "cross-env": "^10.1.0",
     "eslint": "^10.4.1",
     "globals": "^17.6.0",
-    "prisma": "^6.19.2",
+    "jiti": "^2.7.0",
+    "prisma": "^6.12.0",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.61.0"

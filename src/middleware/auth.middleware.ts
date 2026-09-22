@@ -5,29 +5,19 @@ import env from "../config/env.js";
 import prisma from "../lib/prisma.js";
 import { getRedisClient, cacheKeys, AGENT_STATUS_TTL } from "../config/redis.js";
 
-// ─────────────────────────────────────────────
-// JWT PAYLOAD SHAPE
-// userId holds User.id for ADMIN/STUDENT/DRIVER
-// and Agent.id for AGENT — both are UUIDs.
-// ─────────────────────────────────────────────
+// payload interface
 export interface UserJwtPayload extends JwtPayload {
   userId: string;
   role: "ADMIN" | "AGENT" | "STUDENT" | "DRIVER";
   email: string;
 }
 
-// Augmented Express Request — set by authenticateToken
+// Augmented Express Request
 export interface CustomAuthRequest extends Request {
   user?: UserJwtPayload;
 }
 
-// ─────────────────────────────────────────────
-// authenticateToken
-// Gate 1 — must be first in every protected route.
-// Verifies the Bearer token and attaches decoded
-// payload to req.user. All guards below depend on
-// this running first.
-// ─────────────────────────────────────────────
+// authenticateToken middleware
 function authenticateToken(
   req: CustomAuthRequest,
   res: Response,
@@ -56,12 +46,7 @@ function authenticateToken(
   }
 }
 
-// ─────────────────────────────────────────────
-// requireAdmin
-// Strict ADMIN-only gate. Agents are NOT allowed
-// through here — use requireAdminOrAgent for
-// shared routes.
-// ─────────────────────────────────────────────
+// requireAdmin middleware
 function requireAdmin(
   req: CustomAuthRequest,
   res: Response,
@@ -78,13 +63,7 @@ function requireAdmin(
   next();
 }
 
-// ─────────────────────────────────────────────
 // requireAgent
-// AGENT-only gate. Must always be followed by
-// checkAgentActive to enforce SUSPENDED/DEACTIVATED
-// status — never use requireAgent alone.
-// Chain: authenticateToken → requireAgent → checkAgentActive
-// ─────────────────────────────────────────────
 function requireAgent(
   req: CustomAuthRequest,
   res: Response,
@@ -101,14 +80,7 @@ function requireAgent(
   next();
 }
 
-// ─────────────────────────────────────────────
 // requireAdminOrAgent
-// Gate for routes accessible by both roles
-// (KYC review, driver ops, terminals, disputes,
-// card linking, transaction logs).
-// Admins bypass checkAgentActive automatically.
-// Chain: authenticateToken → requireAdminOrAgent → checkAgentActive
-// ─────────────────────────────────────────────
 function requireAdminOrAgent(
   req: CustomAuthRequest,
   res: Response,
@@ -125,10 +97,7 @@ function requireAdminOrAgent(
   next();
 }
 
-// ─────────────────────────────────────────────
 // requireStudent
-// STUDENT-only gate. Unchanged from original.
-// ─────────────────────────────────────────────
 function requireStudent(
   req: CustomAuthRequest,
   res: Response,
@@ -145,23 +114,24 @@ function requireStudent(
   next();
 }
 
-// ─────────────────────────────────────────────
-// checkAgentActive
-// Redis-first status check for AGENT requests.
-// Silently skips for ADMIN — safe to always
-// include after requireAdminOrAgent.
-//
-// Redis key: cacheKeys.agentStatus(agentId) → "agent:status:{id}"
-// Value:     "ACTIVE" | "SUSPENDED" | "DEACTIVATED"
-// TTL:       AGENT_STATUS_TTL (60s)
-//
-// When admin suspends/deactivates an agent, the
-// agent service MUST delete this key so the next
-// request re-fetches from DB and caches the new
-// status — no 60s grace window for bad actors.
-// ─────────────────────────────────────────────
-// Replace the entire checkAgentActive function
+// requireDriver
+function requireDriver(
+  req: CustomAuthRequest,
+  res: Response,
+  next: NextFunction
+): void {
+  if (!req.user || req.user.role !== "DRIVER") {
+    logger.warn(
+      { userId: req.user?.userId, role: req.user?.role, path: req.path },
+      "auth.driver_required"
+    );
+    res.status(403).json({ error: "Driver access required" });
+    return;
+  }
+  next();
+}
 
+// checkAgentActive
 async function checkAgentActive(
   req: CustomAuthRequest,
   res: Response,
@@ -233,5 +203,6 @@ export {
   requireAgent,
   requireAdminOrAgent,
   requireStudent,
+  requireDriver,
   checkAgentActive,
 };

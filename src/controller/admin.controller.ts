@@ -1,4 +1,5 @@
 import express from "express";
+import crypto from "node:crypto";
 import { type Request, type Response, type NextFunction } from "express";
 import logger from "../config/logger.js";
 import env from "../config/env.js";
@@ -6,6 +7,7 @@ import {
   enqueueRoute,
   enqueueBroadcast,
   enqueueSyncWhitelist,
+  detectPartialBroadcastFailure,
 } from "../utils/bridge.js";
 import { confirmRegistration } from "../services/registration.service.js";
 import {
@@ -36,13 +38,101 @@ import {
 
 const router = express.Router();
 
-function requireAdminSecret(req: Request, res: Response, next: NextFunction) {
-  const secret = req.headers["x-admin-secret"];
-  if (!secret || secret !== env.admin.secret) {
-    logger.warn({ ip: req.ip, path: req.path }, "admin.unauthorized_request");
-    return res.status(401).json({ error: "Unauthorized" });
+const firmwareAllowedHosts = new Set(
+  (process.env.FIRMWARE_ALLOWED_HOSTS || "")
+    .split(",")
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean)
+);
+
+function isAllowedFirmwareUrl(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 2048) return false;
+
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      url.username === "" &&
+      url.password === "" &&
+      url.port === "" &&
+      firmwareAllowedHosts.has(url.hostname.toLowerCase())
+    );
+  } catch {
+    return false;
   }
+}
+
+function requireCriticalApproval(req: Request, res: Response, next: NextFunction) {
+  const suppliedToken = req.headers["x-critical-approval-token"];
+  const expectedToken = env.admin.criticalApprovalToken;
+
+  if (
+    !expectedToken ||
+    typeof suppliedToken !== "string" ||
+    suppliedToken.length !== expectedToken.length ||
+    !crypto.timingSafeEqual(Buffer.from(suppliedToken), Buffer.from(expectedToken))
+  ) {
+    logger.warn({ ip: req.ip, path: req.path }, "admin.critical_approval_rejected");
+    return res.status(403).json({ error: "Critical-operation approval required" });
+  }
+
   next();
+}
+
+function getAuditAdminId(req: Pick<Request, "headers">): string {
+  const adminId = req.headers["x-admin-id"];
+  return typeof adminId === "string" && adminId.trim() ? adminId.trim() : "unknown";
+}
+
+function auditCriticalOperation(
+  operation: string,
+  adminId: string,
+  terminalId: string
+): void {
+  logger.warn(
+    { operation, adminId, terminalId, timestamp: new Date().toISOString() },
+    "admin.critical_operation_audit"
+  );
+}
+
+function requireAdminSecret(req: Request, res: Response, next: NextFunction) {
+  const isDevelopment = env.NODE_ENV === "development";
+  const secret = req.headers["x-admin-secret"];
+  const backendSecret = req.headers["x-backend-secret"];
+  const expectedSecret = env.admin.secret;
+
+  if (isDevelopment) {
+    if (!secret || typeof secret !== "string" || !expectedSecret) {
+      logger.warn({ ip: req.ip, path: req.path }, "admin.unauthorized_request");
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const secretBuf = Buffer.from(secret);
+    const expectedBuf = Buffer.from(expectedSecret);
+
+    if (
+      secretBuf.length !== expectedBuf.length ||
+      !crypto.timingSafeEqual(secretBuf, expectedBuf)
+    ) {
+      logger.warn({ ip: req.ip, path: req.path }, "admin.unauthorized_request");
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    return next();
+  }
+
+  if (
+    backendSecret &&
+    typeof backendSecret === "string" &&
+    expectedSecret &&
+    backendSecret.length === expectedSecret.length &&
+    crypto.timingSafeEqual(Buffer.from(backendSecret), Buffer.from(expectedSecret))
+  ) {
+    return next();
+  }
+
+  logger.warn({ ip: req.ip, path: req.path }, "admin.session_required_for_production");
+  return res.status(403).json({ error: "Admin session required" });
 }
 
 const approveKycHandler = async (
@@ -117,6 +207,7 @@ router.use(requireAdminSecret);
 
 router.post(
   "/poison-pill",
+  requireCriticalApproval,
   async (
     req: Request<object, object, { terminalId: string }>,
     res: Response
@@ -135,6 +226,7 @@ router.post(
       });
 
       const poisonCmd = "CMD:POISON_PILL";
+      auditCriticalOperation("POISON_PILL", getAuditAdminId(req), terminalId);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const redis = getRedisClient() as any;
       await redis.lpush(redisKeys.terminalQueue(terminalId), poisonCmd);
@@ -162,18 +254,39 @@ router.post(
   ) => {
     const { firmwareUrl } = req.body;
 
-    if (!firmwareUrl || !firmwareUrl.startsWith("https://")) {
+    if (!isAllowedFirmwareUrl(firmwareUrl)) {
       return res
-        .status(400)
-        .json({ error: "firmwareUrl must be a valid HTTPS URL" });
+        .status(403)
+        .json({ error: "firmwareUrl is not an approved firmware host" });
     }
 
     const otaCmd = `CMD:OTA,${firmwareUrl}`;
     logger.info({ firmwareUrl }, "admin.ota_broadcast_initiated");
 
     try {
-      await enqueueBroadcast(otaCmd);
-      res.json({ success: true, message: "OTA command broadcast to fleet" });
+      const broadcastResult = await enqueueBroadcast(otaCmd);
+      const partialCheck = detectPartialBroadcastFailure(broadcastResult);
+
+      if (partialCheck.isPartial) {
+        logger.warn(
+          { firmwareUrl, ...partialCheck },
+          "admin.ota_broadcast_partial_terminal_failures"
+        );
+        return res.status(207).json({
+          success: false,
+          partial: true,
+          message: `OTA broadcast partially delivered; ${partialCheck.failedCount} terminal(s) failed`,
+          failedCount: partialCheck.failedCount,
+          deliveredCount: partialCheck.deliveredCount,
+          failedTerminals: partialCheck.failedTerminals,
+        });
+      }
+
+      res.json({
+        success: true,
+        message: "OTA command broadcast to fleet",
+        ...broadcastResult,
+      });
     } catch (error) {
       const errMessage =
         error instanceof Error ? error.message : "Unknown error";
@@ -273,10 +386,10 @@ router.post(
 router.post(
   "/terminal/register",
   async (
-    req: Request<object, object, { terminalId: string; secretKey: string }>,
+    req: Request<object, object, { terminalId: string; secretKey: string; location?: string }>,
     res: Response
   ) => {
-    const { terminalId, secretKey } = req.body;
+    const { terminalId, secretKey, location } = req.body;
 
     if (!terminalId || !secretKey) {
       return res
@@ -287,15 +400,16 @@ router.post(
     try {
       const terminal = await prisma.terminal.upsert({
         where: { terminal_id: terminalId },
-        update: { secret_key: secretKey },
+        update: { secret_key: secretKey, ...(location ? { location } : {}) },
         create: {
           terminal_id: terminalId,
           status: "OFFLINE",
           secret_key: secretKey,
+          ...(location ? { location } : {}),
         },
       });
 
-      logger.info({ terminalId }, "admin.terminal_registered");
+      logger.info({ terminalId, location }, "admin.terminal_registered");
       res.json({ success: true, terminal });
     } catch (error) {
       const errMessage =
@@ -795,6 +909,7 @@ export const issuePoisonPillHandler = async (
     });
 
     const poisonCmd = "CMD:POISON_PILL";
+  auditCriticalOperation("POISON_PILL", getAuditAdminId(req), terminalId);
     // Delegate queuing & offline delivery exclusively to MQTT service bridge
     await enqueueRoute(terminalId, poisonCmd);
 
@@ -817,18 +932,39 @@ export const broadcastOtaHandler = async (
 ) => {
   const { firmwareUrl } = req.body;
 
-  if (!firmwareUrl || !firmwareUrl.startsWith("https://")) {
+  if (!isAllowedFirmwareUrl(firmwareUrl)) {
     return res
-      .status(400)
-      .json({ error: "firmwareUrl must be a valid HTTPS URL" });
+      .status(403)
+      .json({ error: "firmwareUrl is not an approved firmware host" });
   }
 
   const otaCmd = `CMD:OTA,${firmwareUrl}`;
   logger.info({ firmwareUrl }, "admin.ota_broadcast_initiated");
 
   try {
-    await enqueueBroadcast(otaCmd);
-    res.json({ success: true, message: "OTA command broadcast to fleet" });
+    const broadcastResult = await enqueueBroadcast(otaCmd);
+    const partialCheck = detectPartialBroadcastFailure(broadcastResult);
+
+    if (partialCheck.isPartial) {
+      logger.warn(
+        { firmwareUrl, ...partialCheck },
+        "admin.ota_broadcast_partial_terminal_failures"
+      );
+      return res.status(207).json({
+        success: false,
+        partial: true,
+        message: `OTA broadcast partially delivered; ${partialCheck.failedCount} terminal(s) failed`,
+        failedCount: partialCheck.failedCount,
+        deliveredCount: partialCheck.deliveredCount,
+        failedTerminals: partialCheck.failedTerminals,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "OTA command broadcast to fleet",
+      ...broadcastResult,
+    });
   } catch (error) {
     const errMessage =
       error instanceof Error ? error.message : "Unknown error";
@@ -872,13 +1008,18 @@ export const confirmRegistrationHandler = async (
 };
 
 export const monnifyWebhookHandler = async (
-  req: Request<object, object, { studentUid: string; amount: string | number }>,
+  req: Request<
+    object,
+    object,
+    { studentUid: string; amount: string | number; reference?: string; transactionReference?: string }
+  >,
   res: Response
 ) => {
   res.status(200).json({ received: true });
 
-  const { studentUid, amount } = req.body;
-  const log = logger.child({ studentUid, amount });
+  const { studentUid, amount, reference, transactionReference } = req.body;
+  const txRef = reference || transactionReference;
+  const log = logger.child({ studentUid, amount, txRef });
   const parsedAmount =
     typeof amount === "string" ? parseFloat(amount) : amount;
 
@@ -888,7 +1029,7 @@ export const monnifyWebhookHandler = async (
   }
 
   try {
-    const result = await creditWallet(studentUid, parsedAmount);
+    const result = await creditWallet(studentUid, parsedAmount, txRef);
 
     if (!result) {
       log.warn("admin.monnify_webhook_wallet_not_found");
@@ -913,10 +1054,10 @@ export const monnifyWebhookHandler = async (
 };
 
 export const registerTerminalHandler = async (
-  req: Request<object, object, { terminalId: string; secretKey: string }>,
+  req: Request<object, object, { terminalId: string; secretKey: string; location?: string }>,
   res: Response
 ) => {
-  const { terminalId, secretKey } = req.body;
+  const { terminalId, secretKey, location } = req.body;
 
   if (!terminalId || !secretKey) {
     return res.status(400).json({ error: "terminalId and secretKey are required" });
@@ -925,15 +1066,16 @@ export const registerTerminalHandler = async (
   try {
     const terminal = await prisma.terminal.upsert({
       where: { terminal_id: terminalId },
-      update: { secret_key: secretKey },
+      update: { secret_key: secretKey, ...(location ? { location } : {}) },
       create: {
         terminal_id: terminalId,
         status: "OFFLINE",
         secret_key: secretKey,
+        ...(location ? { location } : {}),
       },
     });
 
-    logger.info({ terminalId }, "admin.terminal_registered");
+    logger.info({ terminalId, location }, "admin.terminal_registered");
     res.json({ success: true, terminal });
   } catch (error) {
     const errMessage =
@@ -943,5 +1085,10 @@ export const registerTerminalHandler = async (
   }
 };
 
-export { approveKycHandler, rejectKycHandler, requireAdminSecret };
+export {
+  approveKycHandler,
+  rejectKycHandler,
+  requireAdminSecret,
+  requireCriticalApproval,
+};
 export default null;

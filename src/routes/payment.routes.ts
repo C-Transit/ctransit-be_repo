@@ -13,6 +13,8 @@ import {
 const router = Router();
 
 router.post("/fund", handlePaymentWebhook);
+router.post("/webhook", handlePaymentWebhook);
+router.post("/payout-webhook", handlePaymentWebhook);
 
 router.post(
   "/create",

@@ -19,7 +19,7 @@ async function confirmRegistration(
   otp: string,
   userId: string
 ): Promise<ConfirmRegistrationResult> {
-  const log = logger.child({ otp, userId });
+  const log = logger.child({ userId });
 
   // Look up OTP in DB instead of Redis
   const otpRecord = await prisma.registrationOtp.findUnique({
@@ -33,7 +33,7 @@ async function confirmRegistration(
     };
   }
 
-  // ✅ NEW: Check if OTP is already used
+  // Check if OTP is already used
   if (otpRecord.used) {
     // Check if this student is already linked
     const user = await prisma.user.findUnique({
@@ -104,26 +104,60 @@ async function confirmRegistration(
     };
   }
 
-  await prisma.cardMapping.upsert({
-    where: { card_uid: cardUid },
-    update: { student_uid: user.matricNumber },
-    create: {
-      card_uid: cardUid,
-      student_uid: user.matricNumber,
-    },
-  });
+  // Atomically claim OTP and link card mapping in a single database transaction
+  try {
+    await prisma.$transaction(async (tx) => {
+      const consumed = await tx.registrationOtp.updateMany({
+        where: { otp, used: false },
+        data: { used: true },
+      });
+
+      if (consumed.count === 0) {
+        throw new Error("OTP_ALREADY_USED");
+      }
+
+      await tx.cardMapping.upsert({
+        where: { card_uid: cardUid },
+        update: { student_uid: user.matricNumber },
+        create: {
+          card_uid: cardUid,
+          student_uid: user.matricNumber,
+        },
+      });
+    });
+  } catch (err) {
+    if (err instanceof Error && err.message === "OTP_ALREADY_USED") {
+      const existingCard = await prisma.cardMapping.findUnique({
+        where: { student_uid: user.matricNumber },
+        select: { card_uid: true },
+      });
+      if (existingCard && existingCard.card_uid === cardUid) {
+        return {
+          success: true,
+          message: "Card already linked",
+          matricNumber: user.matricNumber,
+          cardUid: existingCard.card_uid,
+          alreadyLinked: true,
+        };
+      }
+      return {
+        success: false,
+        message:
+          "This OTP has already been used. Please tap your card again for a new OTP.",
+      };
+    }
+    const errMsg = err instanceof Error ? err.message : "Unknown error";
+    log.error({ err: errMsg }, "registration.transaction_failed");
+    return {
+      success: false,
+      message: "Database error during card registration.",
+    };
+  }
 
   log.info(
     { cardUid, matricNumber: user.matricNumber },
     "registration.card_uid_mapped_to_student"
   );
-
-  // Mark OTP as used — cannot be reused
-  await prisma.registrationOtp.update({
-    where: { otp },
-    data: { used: true },
-  });
-
   log.debug({ otp }, "registration.otp_consumed");
 
   // Notify student
@@ -163,6 +197,30 @@ async function confirmRegistration(
     matricNumber: user.matricNumber,
     cardUid,
   };
+}
+
+export interface CreateRegistrationOtpParams {
+  otp: string;
+  cardUid: string;
+  terminalId: string;
+  agentUid?: string | null;
+  expiresInMinutes?: number;
+}
+
+export async function createRegistrationOtp(params: CreateRegistrationOtpParams) {
+  const { otp, cardUid, terminalId, agentUid, expiresInMinutes = 10 } = params;
+  const expiresAt = new Date(Date.now() + expiresInMinutes * 60 * 1000);
+
+  return prisma.registrationOtp.create({
+    data: {
+      otp,
+      card_uid: cardUid,
+      terminal_id: terminalId,
+      agent_uid: agentUid || null,
+      expires_at: expiresAt,
+      used: false,
+    },
+  });
 }
 
 export { confirmRegistration };

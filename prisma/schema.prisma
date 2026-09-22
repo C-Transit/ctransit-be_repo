@@ -56,6 +56,13 @@ enum DisputeStatus {
   REJECTED
 }
 
+enum WithdrawalStatus {
+  PENDING
+  PROCESSING
+  SUCCESS
+  FAILED
+}
+
 model User {
   id           String   @id @default(uuid())
   firstname    String
@@ -65,26 +72,27 @@ model User {
   password     String
   role         Role     @default(STUDENT)
   isVerified   Boolean  @default(false)
+  phone        String?  @db.VarChar(20)
+  vehicleType  String?  @db.VarChar(50)
+  vehiclePlate String?  @db.VarChar(50)
+  bankName     String?  @db.VarChar(100)
+  accountNumber String? @db.VarChar(50)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  wallet       Wallet?
-  transactions Transaction[]
-  kyc          Kyc?
+  wallet            Wallet?
+  driverWallet      DriverWallet?
+  transactions      Transaction[]      @relation("StudentTransactions")
+  driverTransactions Transaction[]     @relation("DriverTransactions")
+  driverWithdrawals DriverWithdrawal[] @relation("DriverWithdrawals")
+  kyc               Kyc?
 
-  // ✅ Agents created by this admin (empty for non-admins)
   createdAgents     Agent[]        @relation("AdminCreatedAgents")
-  // ✅ Notifications sent to this student (via matricNumber)
   notifications     Notification[]
-  // ✅ Disputes raised by this student
   studentDisputes   Dispute[]      @relation("StudentDisputes")
-  // ✅ Disputes resolved by this admin
   resolvedDisputes  Dispute[]      @relation("AdminResolvedDisputes")
 
-  // ✅ Composite index — driver login does findFirst({ where: { matricNumber, role: DRIVER } })
-  // ✅ Admin queries filter by role + isVerified frequently
   @@index([role, isVerified])
-
   @@map("users")
 }
 
@@ -92,8 +100,8 @@ model Wallet {
   id               String   @id @default(uuid())
   balance          Decimal  @default(0) @db.Decimal(10, 2)
   is_linked        Boolean  @default(false)
-  v_account_number String?  @unique @db.VarChar(20)  // ← nullable, unique stays
-  v_bank_name      String?  @db.VarChar(50)           // ← nullable, unique removed
+  v_account_number String?  @unique @db.VarChar(20)
+  v_bank_name      String?  @db.VarChar(50)     
   created_at       DateTime @default(now()) @db.Timestamptz(6)
   updated_at       DateTime @updatedAt @db.Timestamptz(6)
 
@@ -110,12 +118,12 @@ model Terminal {
   last_seen         DateTime?      @db.Timestamptz(6)
   active_driver_uid String?        @db.VarChar(20)
   secret_key        String         @db.VarChar(64)
+  location          String?        @db.VarChar(10)
 
   transactions Transaction[]
 
-  // ✅ Index on status — broadcastDeltaToFleet does findMany({ where: { status: ONLINE } })
-  // Runs on every blacklist/whitelist update — must be fast
   @@index([status])
+  @@index([location])
 
   @@map("terminals")
 }
@@ -125,27 +133,86 @@ model Transaction {
   type             TransactionType @default(RIDE)
   terminal_id      String          @db.VarChar(20)
   student_uid      String          @db.VarChar(20)
+  card_uid         String?         @db.VarChar(20)
+  location         String?         @db.VarChar(10)
   amount           Decimal         @db.Decimal(10, 2)
+  fare             Decimal?        @db.Decimal(10, 2)
+  driver_share     Decimal?        @db.Decimal(10, 2)
+  ctransit_share   Decimal?        @db.Decimal(10, 2)
   driver_uid       String?         @db.VarChar(20)
+  tapped_at        DateTime?       @db.Timestamptz(6)
   synced_at        DateTime        @default(now()) @db.Timestamptz(6)
+  idempotency_key  String?         @unique @db.VarChar(64)
 
-  user             User     @relation(fields: [student_uid], references: [matricNumber])
+  user             User     @relation("StudentTransactions", fields: [student_uid], references: [matricNumber])
+  driver           User?    @relation("DriverTransactions", fields: [driver_uid], references: [matricNumber])
   terminal         Terminal @relation(fields: [terminal_id], references: [terminal_id])
-  // ✅ A transaction can have disputes raised against it
   disputes         Dispute[]
 
   @@index([student_uid, synced_at(sort: Desc)])
   @@index([terminal_id, synced_at(sort: Desc)])
   @@index([type])
-  // ✅ New — income stats by driver: findMany({ where: { driver_uid, type: RIDE }, orderBy: { synced_at: 'desc' } })
   @@index([driver_uid, synced_at(sort: Desc)])
+  @@index([location])
+  @@index([card_uid])
+  @@index([tapped_at])
+  @@index([idempotency_key])
 
   @@map("transactions")
 }
 
-// kyc_records
-// Stripped to essentials — student uploads ID card image only.
-// All manual field entry and OCR removed. Admin reviews the image directly.
+model DriverWallet {
+  id             String   @id @default(uuid())
+  driver_uid     String   @unique @db.VarChar(20)
+  balance        Decimal  @default(0) @db.Decimal(10, 2)
+  total_earnings Decimal  @default(0) @db.Decimal(10, 2)
+  created_at     DateTime @default(now()) @db.Timestamptz(6)
+  updated_at     DateTime @updatedAt @db.Timestamptz(6)
+
+  driver         User     @relation(fields: [driver_uid], references: [matricNumber], onDelete: Cascade)
+
+  @@index([driver_uid])
+  @@map("driver_wallets")
+}
+
+model DriverWithdrawal {
+  id             String           @id @default(uuid())
+  driver_uid     String           @db.VarChar(20)
+  amount         Decimal          @db.Decimal(10, 2)
+  fee            Decimal?         @db.Decimal(10, 2)
+  net_amount     Decimal?         @db.Decimal(10, 2)
+  bank_name      String           @db.VarChar(100)
+  account_number String           @db.VarChar(50)
+  account_name   String           @db.VarChar(100)
+  remarks        String?          @db.VarChar(255)
+  reference      String           @unique @db.VarChar(64)
+  kora_reference String?          @db.VarChar(100)
+  kora_fee       Decimal?         @db.Decimal(10, 2)
+  failure_reason String?          @db.VarChar(255)
+  status         WithdrawalStatus @default(PENDING)
+  created_at     DateTime         @default(now()) @db.Timestamptz(6)
+  updated_at     DateTime         @updatedAt @db.Timestamptz(6)
+
+  driver         User             @relation("DriverWithdrawals", fields: [driver_uid], references: [matricNumber], onDelete: Cascade)
+
+  @@index([driver_uid, created_at(sort: Desc)])
+  @@index([status])
+  @@index([reference])
+  @@index([kora_reference])
+  @@map("driver_withdrawals")
+}
+
+model SystemWallet {
+  id            String   @id @default("CTRANSIT_SYSTEM")
+  name          String   @default("C-Transit Platform")
+  balance       Decimal  @default(0) @db.Decimal(10, 2)
+  total_revenue Decimal  @default(0) @db.Decimal(10, 2)
+  created_at    DateTime @default(now()) @db.Timestamptz(6)
+  updated_at    DateTime @updatedAt @db.Timestamptz(6)
+
+  @@map("system_wallets")
+}
+
 model Kyc {
   id             String    @id @default(uuid())
   idCardImageUrl String
@@ -165,11 +232,10 @@ model Kyc {
 
 model Blacklist {
   id            String   @id @default(uuid())
-  student_uid   String   @unique @db.VarChar(20)  // matricNumber
+  student_uid   String   @unique @db.VarChar(20) 
   reason        String   @default("LOW_BALANCE")
   blacklistedAt DateTime @default(now())
 
-  // ✅ Index on blacklistedAt — admin views recently blacklisted students
   @@index([blacklistedAt(sort: Desc)])
 
   @@map("blacklist")
@@ -177,58 +243,37 @@ model Blacklist {
 
 model CardMapping {
   id          String   @id @default(uuid())
-  card_uid    String   @unique @db.VarChar(20)  // Hardware UID e.g. 238DB4E8
-  student_uid String   @unique @db.VarChar(20)  // matricNumber e.g. 2022/1/87453LH
+  card_uid    String   @unique @db.VarChar(20)
+  student_uid String   @unique @db.VarChar(20)
   linked_at   DateTime @default(now())
 
-  // ✅ Index on linked_at — admin can view recently registered cards
   @@index([linked_at(sort: Desc)])
 
   @@map("card_mappings")
 }
 
-// ─────────────────────────────────────────────
-// AGENT
-// Separate table — agents have no matricNumber
-// and are not students, drivers, or admins.
-// ─────────────────────────────────────────────
 model Agent {
   id        String      @id @default(uuid())
   firstname String
   lastname  String
   email     String      @unique
   phone     String      @db.VarChar(15)
-  password  String      // bcrypt hashed
-
-  // SUSPENDED = temporary block, DEACTIVATED = permanent removal
-  // Both states are checked by checkAgentActive middleware
+  password  String     
   status    AgentStatus @default(ACTIVE)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  // FK → User.id — the ADMIN User who registered this agent
-  // Restricted delete: admin cannot be deleted while agents exist under them
   createdBy String
   creator   User    @relation("AdminCreatedAgents", fields: [createdBy], references: [id])
-
-  // Disputes this agent has resolved
   resolvedDisputes Dispute[] @relation("AgentResolvedDisputes")
 
-  // ✅ status index — checkAgentActive middleware + admin agent list filter
   @@index([status])
-
-  // ✅ Composite — admin fetches agents they created, filtered by status
-  // findMany({ where: { createdBy, status: ACTIVE } })
   @@index([createdBy, status])
 
   @@map("agents")
 }
 
-// ─────────────────────────────────────────────
-// NOTIFICATION
-// Sent by admin/agents to individual students
-// ─────────────────────────────────────────────
 model Notification {
   id        String   @id @default(uuid())
   title     String
@@ -236,62 +281,40 @@ model Notification {
   isRead    Boolean  @default(false)
   createdAt DateTime @default(now())
 
-  // FK → User.matricNumber — consistent with Wallet + Blacklist pattern
   student_uid String @db.VarChar(20)
   user        User   @relation(fields: [student_uid], references: [matricNumber], onDelete: Cascade)
 
-  // ✅ Primary feed query: findMany({ where: { student_uid }, orderBy: { createdAt: 'desc' } })
+ 
   @@index([student_uid, createdAt(sort: Desc)])
-
-  // ✅ Unread badge count: count({ where: { student_uid, isRead: false } })
   @@index([student_uid, isRead])
 
   @@map("notifications")
 }
 
-// ─────────────────────────────────────────────
-// DISPUTE
-// Raised against a Transaction by a student.
-// Resolved by either an Agent or an Admin.
-// Polymorphic resolution handled via two
-// nullable FKs (not a plain string) to keep
-// referential integrity enforced at DB level.
-// ─────────────────────────────────────────────
 model Dispute {
   id          String        @id @default(uuid())
-  description String        // Student's account of what went wrong
+  description String        
   status      DisputeStatus @default(OPEN)
-  resolution  String?       // Agent/admin notes on how it was closed
+  resolution  String?      
   resolvedAt  DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  // The student who raised this dispute (FK → User.matricNumber)
   student_uid String @db.VarChar(20)
   user        User   @relation("StudentDisputes", fields: [student_uid], references: [matricNumber], onDelete: Cascade)
 
-  // The transaction being disputed (FK → Transaction.transaction_id)
-  // One transaction can have multiple disputes (e.g. re-raised after rejection)
   transaction_id String      @db.VarChar(64)
   transaction    Transaction @relation(fields: [transaction_id], references: [transaction_id])
 
-  // Resolver: exactly one of these will be set when status moves to RESOLVED/REJECTED
-  // Enforced at service layer — Prisma does not support check constraints natively
   resolvedByAgent String?
   agent           Agent? @relation("AgentResolvedDisputes", fields: [resolvedByAgent], references: [id])
 
   resolvedByAdmin String?
   admin           User?  @relation("AdminResolvedDisputes", fields: [resolvedByAdmin], references: [id])
 
-  // ✅ Dispute queue: admin/agent sees oldest open disputes first
-  // findMany({ where: { status: OPEN }, orderBy: { createdAt: 'asc' } })
   @@index([status, createdAt(sort: Asc)])
-
-  // ✅ Student dispute history lookup
   @@index([student_uid, createdAt(sort: Desc)])
-
-  // ✅ Link back from a specific transaction — check if a transaction has disputes
   @@index([transaction_id])
 
   @@map("disputes")
@@ -302,13 +325,27 @@ model RegistrationOtp {
   otp         String   @unique
   card_uid    String   @db.VarChar(20)
   terminal_id String   @db.VarChar(20)
+  agent_uid   String?  @db.VarChar(36)
   expires_at  DateTime
   used        Boolean  @default(false)
   created_at  DateTime @default(now())
 
   @@index([otp])
   @@index([expires_at])
+  @@index([agent_uid])
   @@map("registration_otps")
+}
+
+model FareConfig {
+  id            String   @id @default(uuid())
+  code          String   @unique @db.VarChar(10)
+  location_name String   @db.VarChar(50)
+  amount        Decimal  @db.Decimal(10, 2)
+  updated_by    String?  @db.VarChar(50)
+  created_at    DateTime @default(now()) @db.Timestamptz(6)
+  updated_at    DateTime @updatedAt @db.Timestamptz(6)
+
+  @@map("fare_configs")
 }
 
 model RefreshToken {

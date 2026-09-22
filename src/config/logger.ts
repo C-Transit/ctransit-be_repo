@@ -16,26 +16,63 @@ const loggerOptions: LoggerOptions = {
     },
   },
   redact: {
-    paths: ["mqtt.password", "redis.password", "*.secret_key"],
+    paths: [
+      "mqtt.password",
+      "redis.password",
+      "*.secret_key",
+      "*.secretKey",
+      "*.apiKey",
+      "*.api_key",
+      "*.password",
+      "password",
+      "newPassword",
+      "currentPassword",
+      "adminPassword",
+      "*.authorization",
+      "authorization",
+      "Authorization",
+      "headers.authorization",
+      "headers.Authorization",
+      "headers['authorization']",
+      "headers['Authorization']",
+      "headers['x-admin-secret']",
+      "headers['x-korapay-signature']",
+      "headers['fincra-signature']",
+      "*.kora_secret",
+      "*.koraSecret",
+      "kora_secret",
+      "koraSecret",
+      "*.secret",
+      "secret",
+      "token",
+      "*.token",
+      "accessToken",
+      "*.accessToken",
+      "refreshToken",
+      "*.refreshToken",
+      "jwt",
+      "*.jwt",
+      "signature",
+      "*.signature",
+      "otp",
+      "*.otp",
+    ],
     censor: "[REDACTED]",
   },
-  // The modern TS-friendly way to configure Pino transports
+  
   ...(isDev && {
     transport: {
       target: "pino-pretty",
       options: {
         colorize: true,
         translateTime: "SYS:standard",
-        // Added 'env' to ignore list to clean up the console
         ignore: "pid,hostname,service,env",
-        // Forces object payloads (like { terminalId: '...' }) to stay on one line
         singleLine: true,
       },
     },
   }),
 };
 
-// If not in dev, Pino defaults to standard JSON stdout (perfect for production)
 const logger = pino(loggerOptions);
 
 export default logger;

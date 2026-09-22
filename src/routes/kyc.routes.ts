@@ -4,15 +4,18 @@ import {
   submitKycHandler,
   getKycStatus,
 } from "../controller/kyc.controller.js";
-import { authenticateToken } from "../middleware/auth.middleware.js";
+import {
+  authenticateToken,
+  requireStudent,
+} from "../middleware/auth.middleware.js";
 import upload from "../middleware/upload.middleware.js";
 
 const router = Router();
 
-// All KYC routes require a valid JWT
-router.use(authenticateToken);
+// All KYC routes require a valid student JWT
+router.use(authenticateToken, requireStudent);
 
-router.post("/submit", upload.single("idCard"), submitKycHandler); // Upload image + write KYC row in one step
-router.get("/status", getKycStatus); // Student checks their KYC status
+router.post("/submit", upload.single("idCard"), submitKycHandler); 
+router.get("/status", getKycStatus);
 
 export default router;

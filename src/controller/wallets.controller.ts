@@ -5,9 +5,13 @@ import logger from "../config/logger.js";
 import { type CustomAuthRequest } from "../middleware/auth.middleware.js";
 
 export const requireStudentAuth = (req: CustomAuthRequest, res: Response, next: NextFunction) => {
-  if (!req.user || req.user.role !== "STUDENT") {
-    logger.warn({ userId: req.user?.userId, ip: req.ip }, "wallets.unauthorized_access");
-    return res.status(401).json({ success: false, message: "Student authentication required" });
+  if (!req.user) {
+    logger.warn({ ip: req.ip }, "wallets.unauthenticated_access");
+    return res.status(401).json({ success: false, message: "Authentication required" });
+  }
+  if (req.user.role !== "STUDENT") {
+    logger.warn({ userId: req.user.userId, role: req.user.role, ip: req.ip }, "wallets.unauthorized_role_access");
+    return res.status(403).json({ success: false, message: "Student access required" });
   }
   next();
 };

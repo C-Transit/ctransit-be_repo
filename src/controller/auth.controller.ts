@@ -34,9 +34,7 @@ const isValidPassword = (password: string): boolean => {
   return passwordRegex.test(password);
 };
 
-// ─────────────────────────────────────────────
 // registerStudent
-// ─────────────────────────────────────────────
 export const registerStudent = async (req: Request, res: Response) => {
   try {
     const { firstname, lastname, email, matricNumber, password } = req.body;
@@ -96,9 +94,7 @@ export const registerStudent = async (req: Request, res: Response) => {
   }
 };
 
-// ─────────────────────────────────────────────
 // verifyOTP
-// ─────────────────────────────────────────────
 export const verifyOTP = async (req: Request, res: Response) => {
   try {
     const { email, otp } = req.body;
@@ -151,9 +147,7 @@ export const verifyOTP = async (req: Request, res: Response) => {
   }
 };
 
-// ─────────────────────────────────────────────
 // resendOTP
-// ─────────────────────────────────────────────
 export const resendOTP = async (req: Request, res: Response) => {
   try {
     const { email } = req.body;
@@ -190,12 +184,7 @@ export const resendOTP = async (req: Request, res: Response) => {
   }
 };
 
-// ─────────────────────────────────────────────
 // loginStudent
-// Issues accessToken (1h) + refreshToken (7d).
-// email is included in payload to match UserJwtPayload
-// interface declared in auth.middleware.ts.
-// ─────────────────────────────────────────────
 export const loginStudent = async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
@@ -265,13 +254,7 @@ export const loginStudent = async (req: Request, res: Response) => {
   }
 };
 
-// ─────────────────────────────────────────────
 // loginAdmin
-// Bypasses institution email check.
-// Issues accessToken (8h) + refreshToken (7d).
-// Vague error messages — never reveal whether
-// the account exists.
-// ─────────────────────────────────────────────
 export const loginAdmin = async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
@@ -303,7 +286,7 @@ export const loginAdmin = async (req: Request, res: Response) => {
     const accessToken = jwt.sign(
       { userId: user.id, role: user.role, email: user.email },
       env.jwt.secret,
-      { expiresIn: "8h" } // Longer than student — admin sessions are supervised
+      { expiresIn: "8h" }
     );
 
     const refreshToken = await issueRefreshToken({
@@ -328,20 +311,13 @@ export const loginAdmin = async (req: Request, res: Response) => {
   }
 };
 
-// ─────────────────────────────────────────────
 // logoutStudent
-// Revokes the refresh token from Redis — instant
-// invalidation regardless of JWT expiry time.
-// Accepts refreshToken in request body.
-// ─────────────────────────────────────────────
 export const logoutStudent = async (req: Request, res: Response) => {
   try {
     const { refreshToken } = req.body;
 
     if (refreshToken) {
       // Extract tokenId from the JWT, then delete from Redis.
-      // We ignore errors here — logging out should always succeed
-      // even if the token is already expired or invalid.
       const payload = await verifyRefreshToken(refreshToken);
       if (payload) {
         await revokeRefreshToken(payload.tokenId);
@@ -362,14 +338,7 @@ export const logoutStudent = async (req: Request, res: Response) => {
   }
 };
 
-// ─────────────────────────────────────────────
 // refreshAccessToken
-// Verifies the refresh token against Redis,
-// issues a new accessToken. The refresh token
-// TTL does not reset on use — no sliding sessions.
-// This prevents indefinite extension without
-// re-authentication.
-// ─────────────────────────────────────────────
 export const refreshAccessToken = async (req: Request, res: Response) => {
   try {
     const { refreshToken } = req.body;
@@ -381,14 +350,14 @@ export const refreshAccessToken = async (req: Request, res: Response) => {
     const payload = await verifyRefreshToken(refreshToken);
 
     if (!payload) {
-      // Covers: invalid signature, expired JWT, revoked (DEL'd from Redis)
       return res
         .status(401)
         .json({ message: "Invalid or expired refresh token" });
     }
 
-    // Admin gets longer-lived access tokens than students/agents
-    const expiresIn = payload.role === "ADMIN" ? "8h" : "1h";
+    // Admin and Driver get 8h access tokens
+    const expiresIn =
+      payload.role === "ADMIN" || payload.role === "DRIVER" ? "8h" : "1h";
 
     const accessToken = jwt.sign(
       { userId: payload.userId, role: payload.role, email: payload.email },
@@ -396,8 +365,8 @@ export const refreshAccessToken = async (req: Request, res: Response) => {
       { expiresIn }
     );
 
-    logger.info({ userId: payload.userId }, "auth.token_refreshed");
-    return res.status(200).json({ accessToken });
+    logger.info({ userId: payload.userId, role: payload.role }, "auth.token_refreshed");
+    return res.status(200).json({ accessToken, token: accessToken });
   } catch (error) {
     const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "auth.refresh_error");
@@ -405,9 +374,7 @@ export const refreshAccessToken = async (req: Request, res: Response) => {
   }
 };
 
-// ─────────────────────────────────────────────
 // confirmCard
-// ─────────────────────────────────────────────
 export const confirmCard = async (req: AuthenticatedRequest, res: Response) => {
   try {
     const userId = req.user?.userId;
@@ -432,11 +399,7 @@ export const confirmCard = async (req: AuthenticatedRequest, res: Response) => {
     }
 
     const result = await confirmRegistration(otp, userId);
-    logger.info({ userId, otp, result }, "auth.confirm_card_result");
-
-    if (!result.success) {
-      return res.status(400).json(result);
-    }
+    logger.info({ userId, success: result.success }, "auth.confirm_card_result");
 
     if (!result.success) {
       return res.status(400).json(result);
@@ -452,8 +415,6 @@ export const confirmCard = async (req: AuthenticatedRequest, res: Response) => {
       .json({ success: false, message: "Internal server error" });
   }
 };
-
-// src/controller/auth.controller.ts – add this function
 
 export const getCardLinkStatus = async (
   req: AuthenticatedRequest,
@@ -491,8 +452,6 @@ export const getCardLinkStatus = async (
     }
 
     // Check if there's a pending OTP for this student
-    // Note: OTP is associated with card_uid, not student, but we can check
-    // if there's any OTP that is not used and not expired in the system
     const pendingOtp = await prisma.registrationOtp.findFirst({
       where: {
         used: false,

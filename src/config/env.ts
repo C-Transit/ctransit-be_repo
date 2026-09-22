@@ -1,6 +1,53 @@
 // src/config/env.ts
 import "dotenv/config";
 
+export const REQUIRED_PRODUCTION_SECRETS = [
+  "DATABASE_URL",
+  "REDIS_URL",
+  "ADMIN_API_SECRET",
+  "JWT_SECRET",
+  "JWT_REFRESH_SECRET",
+  "OTP_SECRET",
+  "PAYMENT_SECRET_KEY",
+  "MQTT_INTERNAL_SECRET",
+] as const;
+
+export const INSECURE_FALLBACK_SECRETS: Record<string, string> = {
+  ADMIN_API_SECRET: "dev_admin_secret",
+  JWT_SECRET: "dev_jwt_secret",
+  JWT_REFRESH_SECRET: "dev_jwt_refresh_secret",
+  OTP_SECRET: "dev_otp_secret",
+  PAYMENT_SECRET_KEY: "dev_payment_secret",
+  MQTT_INTERNAL_SECRET: "dev_mqtt_internal_secret",
+};
+
+export function validateProductionSecrets(
+  envLike: Record<string, string | undefined> = process.env
+): void {
+  const missing = REQUIRED_PRODUCTION_SECRETS.filter(
+    (key) => !envLike[key] || envLike[key]?.trim() === ""
+  );
+
+  const insecure = REQUIRED_PRODUCTION_SECRETS.filter((key) => {
+    const value = envLike[key];
+    const insecureFallback = INSECURE_FALLBACK_SECRETS[key];
+    return Boolean(value && insecureFallback && value === insecureFallback);
+  });
+
+  if (missing.length > 0 || insecure.length > 0) {
+    const details = [
+      missing.length > 0 ? `missing=${missing.join(",")}` : null,
+      insecure.length > 0 ? `insecure=${insecure.join(",")}` : null,
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    throw new Error(
+      `FATAL: Missing or insecure required production secrets. ${details}`
+    );
+  }
+}
+
 const REQUIRED_VARS = [
   "DATABASE_URL",
   "DATABASE_URL_POOLED",
@@ -12,11 +59,15 @@ const REQUIRED_VARS = [
   "MAIL_USER",
   "MAIL_PASSWORD",
   "ALLOWED_EMAIL_DOMAIN",
+  "ALLOW_MOCK_PAYMENTS",
   "CLOUDINARY_CLOUD_NAME",
   "CLOUDINARY_API_KEY",
   "CLOUDINARY_API_SECRET",
   "PAYMENT_PROVIDER",
   "PAYMENT_SECRET_KEY",
+  "KORA_PUBLIC_KEY",
+  "KORA_SECRET_KEY",
+  "KORA_ENCRYPTION_KEY",
   "MQTT_INTERNAL_URL",
   "MQTT_INTERNAL_SECRET",
 ] as const;
@@ -26,11 +77,16 @@ const missing = REQUIRED_VARS.filter((key) => !process.env[key]);
 if (missing.length > 0) {
   process.stderr.write(
     JSON.stringify({
-      level: "warn",
-      msg: "Some environment variables are not set. Using development fallbacks.",
+      level: "fatal",
+      msg: "Missing required environment variables. Halting.",
       missing,
     }) + "\n"
   );
+  process.exit(1);
+}
+
+if (process.env.NODE_ENV === "production" || process.env.NODE_ENV === "staging") {
+  validateProductionSecrets(process.env);
 }
 
 const parseIntSafe = (value: string | undefined, fallback: number): number => {
@@ -63,6 +119,7 @@ interface Config {
   };
   admin: {
     secret: string;
+    criticalApprovalToken?: string;
   };
   jwt: {
     secret: string;
@@ -85,7 +142,9 @@ interface Config {
   };
   payment: {
     provider: string;
+    publicKey: string;
     secretKey: string;
+    encryptionKey: string;
   };
   mqtt: {
     internalUrl: string;
@@ -107,39 +166,40 @@ interface Config {
 }
 
 const env: Config = {
-  NODE_ENV: process.env.NODE_ENV || "development",
+  NODE_ENV: process.env.NODE_ENV || "production",
   PORT: parseIntSafe(process.env.PORT, 3000),
   db: {
-    url: process.env.DATABASE_URL || "postgresql://mock:mock@localhost:5432/ctransit?sslmode=disable",
-    pooledUrl: process.env.DATABASE_URL_POOLED || process.env.DATABASE_URL || "postgresql://mock:mock@localhost:5432/ctransit?sslmode=disable",
+    url: process.env.DATABASE_URL as string,
+    pooledUrl: process.env.DATABASE_URL_POOLED as string,
   },
   redis: {
-    url: process.env.REDIS_URL || "redis://localhost:6379",
+    url: process.env.REDIS_URL as string,
   },
   ledger: {
     baseFare: parseFloatSafe(process.env.BASE_FARE, 150),
   },
   admin: {
-    secret: process.env.ADMIN_API_SECRET || "dev_admin_api_secret_default_key",
+    secret: process.env.ADMIN_API_SECRET as string,
+    criticalApprovalToken: process.env.CRITICAL_ADMIN_APPROVAL_TOKEN,
   },
   jwt: {
-    secret: process.env.JWT_SECRET || "dev_jwt_secret_default_key_ctransit",
-    refreshSecret: process.env.JWT_REFRESH_SECRET || "dev_jwt_refresh_secret_default_key_ctransit",
+    secret: process.env.JWT_SECRET as string,
+    refreshSecret: process.env.JWT_REFRESH_SECRET as string, // ← added
   },
   otp: {
-    secret: process.env.OTP_SECRET || "dev_otp_secret_key_1234567890",
+    secret: process.env.OTP_SECRET as string,
   },
   mail: {
-    user: process.env.MAIL_USER || "notifications@ctransit.me",
-    password: process.env.MAIL_PASSWORD || "dev_mail_password",
+    user: process.env.MAIL_USER as string,
+    password: process.env.MAIL_PASSWORD as string,
   },
   auth: {
-    allowedEmailDomain: process.env.ALLOWED_EMAIL_DOMAIN || "@covenantuniversity.edu.ng",
+    allowedEmailDomain: process.env.ALLOWED_EMAIL_DOMAIN as string,
   },
   cloudinary: {
-    cloudName: process.env.CLOUDINARY_CLOUD_NAME || "demo",
-    apiKey: process.env.CLOUDINARY_API_KEY || "demo_key",
-    apiSecret: process.env.CLOUDINARY_API_SECRET || "demo_secret",
+    cloudName: process.env.CLOUDINARY_CLOUD_NAME as string,
+    apiKey: process.env.CLOUDINARY_API_KEY as string,
+    apiSecret: process.env.CLOUDINARY_API_SECRET as string,
   },
   rateLimit: {
     // ── Edit these values to tune limits without touching middleware ──
@@ -156,12 +216,14 @@ const env: Config = {
     notifications: { windowMs: 15 * 60 * 1000, max: 30 },
   },
   payment: {
-    provider: process.env.PAYMENT_PROVIDER || "mock",
-    secretKey: process.env.PAYMENT_SECRET_KEY || "mock_secret_key",
+    provider: (process.env.PAYMENT_PROVIDER || "KORA").toUpperCase(),
+    publicKey: (process.env.KORA_PUBLIC_KEY || process.env.PAYMENT_PUBLIC_KEY || "") as string,
+    secretKey: (process.env.PAYMENT_SECRET_KEY || process.env.KORA_SECRET_KEY || "") as string,
+    encryptionKey: (process.env.KORA_ENCRYPTION_KEY || process.env.PAYMENT_ENCRYPTION_KEY || "") as string,
   },
   mqtt: {
-    internalUrl: process.env.MQTT_INTERNAL_URL || "http://localhost:4000",
-    internalSecret: process.env.MQTT_INTERNAL_SECRET || "mock_mqtt_secret",
+    internalUrl: process.env.MQTT_INTERNAL_URL as string,
+    internalSecret: process.env.MQTT_INTERNAL_SECRET as string,
   },
 };
 

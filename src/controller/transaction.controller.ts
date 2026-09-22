@@ -15,7 +15,6 @@ export const getTransactionHistory = async (
     }
 
     // Resolve matricNumber from userId — transaction table keys on
-    // student_uid (matricNumber), not User.id, to match terminal records.
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: { matricNumber: true },
@@ -37,7 +36,10 @@ export const getTransactionHistory = async (
         amount: true,
         type: true,
         synced_at: true,
+        tapped_at: true,
         terminal_id: true,
+        location: true,
+        card_uid: true,
       },
       orderBy: { synced_at: "desc" },
       take: limit + 1,

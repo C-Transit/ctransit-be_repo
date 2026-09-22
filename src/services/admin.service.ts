@@ -5,10 +5,6 @@ import { getRedisClient, cacheKeys } from "../config/redis.js";
 import logger from "../config/logger.js";
 import { sendNotification } from "./notification.service.js";
 
-// ─────────────────────────────────────────────
-// TYPES
-// ─────────────────────────────────────────────
-
 export interface CreateAgentInput {
   firstname: string;
   lastname: string;
@@ -37,8 +33,6 @@ export interface AgentSummary {
 
 export interface AgentDetail extends AgentSummary {
   updatedAt: Date;
-  // Counts derived from related tables — useful for the admin detail view
-  // without exposing the full relation arrays
   resolvedDisputeCount: number;
 }
 
@@ -49,14 +43,6 @@ export interface ListAgentsResult {
   totalPages: number;
 }
 
-// ─────────────────────────────────────────────
-// createAgent
-//
-// Called by admin to register a new agent.
-// The agent's initial password is set by the admin
-// and communicated out-of-band — no OTP flow needed
-// since agents are internal staff, not self-registering.
-// ─────────────────────────────────────────────
 async function createAgent(
   data: CreateAgentInput,
   adminId: string
@@ -64,7 +50,6 @@ async function createAgent(
   const normalisedEmail = data.email.toLowerCase().trim();
 
   // Explicit uniqueness check before hashing — gives a clean error
-  // rather than letting Prisma throw a P2002 unique constraint violation
   const existing = await prisma.agent.findUnique({
     where: { email: normalisedEmail },
     select: { id: true },
@@ -85,7 +70,6 @@ async function createAgent(
       phone: data.phone.trim(),
       password: passwordHash,
       createdBy: adminId,
-      // status defaults to ACTIVE via schema default
     },
     select: {
       id: true,
@@ -104,21 +88,16 @@ async function createAgent(
   return agent;
 }
 
-// ─────────────────────────────────────────────
-// updateAgentStatus
-//
-// Handles SUSPEND, DEACTIVATE, and REACTIVATE.
-// Redis cache key is DEL'd immediately on every
-// status change — not waiting for TTL expiry —
-// so the next request re-fetches the real status
-// from DB within milliseconds of the admin action.
-// ─────────────────────────────────────────────
 async function updateAgentStatus(
   agentId: string,
-  newStatus: AgentStatus
+  newStatus: AgentStatus,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  prismaClient: any = prisma,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  redisClient: any = getRedisClient()
 ): Promise<AgentSummary> {
   // Confirm the agent exists before updating
-  const existing = await prisma.agent.findUnique({
+  const existing = await prismaClient.agent.findUnique({
     where: { id: agentId },
     select: { id: true, status: true },
   });
@@ -127,19 +106,15 @@ async function updateAgentStatus(
     throw new Error("AGENT_NOT_FOUND");
   }
 
-  // Guard against no-op updates — DEACTIVATED is terminal in the current
-  // business logic; admin must create a new agent account instead
   if (existing.status === newStatus) {
     throw new Error("AGENT_ALREADY_IN_STATUS");
   }
 
   if (existing.status === "DEACTIVATED" && newStatus !== "ACTIVE") {
-    // A DEACTIVATED agent can only be explicitly reactivated by setting ACTIVE —
-    // going straight from DEACTIVATED to SUSPENDED makes no operational sense
     throw new Error("CANNOT_TRANSITION_FROM_DEACTIVATED");
   }
 
-  const updated = await prisma.agent.update({
+  const updated = await prismaClient.agent.update({
     where: { id: agentId },
     data: { status: newStatus },
     select: {
@@ -154,10 +129,18 @@ async function updateAgentStatus(
     },
   });
 
-  // Invalidate Redis cache immediately so checkAgentActive middleware
-  // picks up the new status on the agent's very next request
-  const redis = getRedisClient();
-  await redis.del(cacheKeys.agentStatus(agentId));
+  
+  try {
+    const redis = redisClient;
+    await redis.del(cacheKeys.agentStatus(agentId));
+  } catch (redisErr) {
+    const errMessage =
+      redisErr instanceof Error ? redisErr.message : String(redisErr);
+    logger.warn(
+      { err: errMessage, agentId },
+      "admin.agent_status_redis_invalidation_failed"
+    );
+  }
 
   logger.info(
     { agentId, previousStatus: existing.status, newStatus },
@@ -167,20 +150,13 @@ async function updateAgentStatus(
   return updated;
 }
 
-// ─────────────────────────────────────────────
-// listAgents
-//
-// Paginated agent list with optional status filter.
-// Returns total for the frontend to compute pages.
-// ─────────────────────────────────────────────
 async function listAgents(
   filters: ListAgentsFilter
 ): Promise<ListAgentsResult> {
   const { status, page, limit } = filters;
   const skip = (page - 1) * limit;
 
-  // Build where clause — omit status key entirely when not filtering
-  // so Prisma doesn't add a redundant WHERE clause
+ 
   const where = status ? { status } : {};
 
   const [agents, total] = await prisma.$transaction([
@@ -211,13 +187,6 @@ async function listAgents(
   };
 }
 
-// ─────────────────────────────────────────────
-// getAgentById
-//
-// Single agent detail view for the admin panel.
-// Includes resolvedDisputeCount for the sidebar
-// stat — avoids returning the full Dispute array.
-// ─────────────────────────────────────────────
 async function getAgentById(agentId: string): Promise<AgentDetail> {
   const agent = await prisma.agent.findUnique({
     where: { id: agentId },
@@ -233,7 +202,6 @@ async function getAgentById(agentId: string): Promise<AgentDetail> {
       createdBy: true,
       _count: {
         select: {
-          // Counts disputes this agent has resolved — a proxy for activity
           resolvedDisputes: true,
         },
       },
@@ -254,13 +222,6 @@ async function getAgentById(agentId: string): Promise<AgentDetail> {
 
 export { createAgent, updateAgentStatus, listAgents, getAgentById };
 
-// ─────────────────────────────────────────────
-// listTerminals
-// Shared between agent and admin — returns all
-// terminals with status and active driver.
-// secret_key is deliberately excluded; it must
-// never leave the server via API response.
-// ─────────────────────────────────────────────
 async function listTerminals() {
   return prisma.terminal.findMany({
     orderBy: { terminal_id: "asc" },
@@ -268,30 +229,20 @@ async function listTerminals() {
       terminal_id: true,
       status: true,
       active_driver_uid: true,
-      // secret_key intentionally omitted
+      location: true,
     },
   });
 }
 
-export { listTerminals };
+async function updateTerminalLocation(terminalId: string, location: string) {
+  return prisma.terminal.update({
+    where: { terminal_id: terminalId },
+    data: { location },
+  });
+}
 
-// ═════════════════════════════════════════════
-// OVERVIEW + INCOME STATS + DISPUTE MANAGEMENT
-// ═════════════════════════════════════════════
+export { listTerminals, updateTerminalLocation };
 
-// ─────────────────────────────────────────────
-// getAdminOverview
-//
-// Single endpoint that powers the admin dashboard
-// home screen. Uses Promise.all (not $transaction)
-// because these are independent read-only queries
-// and a consistent snapshot isn't required for a
-// dashboard — speed matters more here.
-//
-// Decimal amounts from Prisma are converted to
-// plain numbers via parseFloat(toString()) — the
-// schema uses Decimal(10,2) so precision is safe.
-// ─────────────────────────────────────────────
 async function getAdminOverview() {
   const cacheKey = "admin:overview:cache";
   const redis = getRedisClient();
@@ -306,6 +257,7 @@ async function getAdminOverview() {
   }
 
   const now = new Date();
+
   // Date boundaries for income time buckets
   const startOfToday = new Date(
     now.getFullYear(),
@@ -333,6 +285,7 @@ async function getAdminOverview() {
     topTerminals,
     topDrivers,
   ] = await Promise.all([
+
     // Headcounts
     prisma.user.count({ where: { role: "STUDENT" } }),
     prisma.agent.count({ where: { status: "ACTIVE" } }),
@@ -434,15 +387,6 @@ async function getAdminOverview() {
   return overview;
 }
 
-// ─────────────────────────────────────────────
-// getIncomeStats
-//
-// Filterable income report for the admin income
-// view. Supports arbitrary date ranges, terminal
-// filter, and driver filter — any combination.
-// Returns the aggregate total + a breakdown by
-// terminal and by driver within the filter window.
-// ─────────────────────────────────────────────
 export interface IncomeStatsFilter {
   from?: Date;
   to?: Date;
@@ -516,9 +460,6 @@ async function getIncomeStats(filters: IncomeStatsFilter) {
   };
 }
 
-// ─────────────────────────────────────────────
-// listDisputes
-// ─────────────────────────────────────────────
 
 export interface ListDisputesFilter {
   status?: DisputeStatus;
@@ -536,6 +477,7 @@ async function listDisputes(filters: ListDisputesFilter) {
       where,
       skip,
       take: limit,
+
       // Oldest open disputes first — work through queue in order
       orderBy: { createdAt: "asc" },
       select: {
@@ -563,14 +505,6 @@ async function listDisputes(filters: ListDisputesFilter) {
   };
 }
 
-// ─────────────────────────────────────────────
-// getDisputeById
-//
-// Full dispute detail including the disputed
-// transaction and student info — everything the
-// admin needs to make a resolution decision on
-// one screen.
-// ─────────────────────────────────────────────
 async function getDisputeById(disputeId: string) {
   const dispute = await prisma.dispute.findUnique({
     where: { id: disputeId },
@@ -585,6 +519,7 @@ async function getDisputeById(disputeId: string) {
       student_uid: true,
       resolvedByAdmin: true,
       resolvedByAgent: true,
+
       // The disputed transaction — amount, type, terminal, driver
       transaction: {
         select: {
@@ -596,6 +531,7 @@ async function getDisputeById(disputeId: string) {
           synced_at: true,
         },
       },
+
       // Basic student info for the dispute card
       user: {
         select: {
@@ -611,18 +547,6 @@ async function getDisputeById(disputeId: string) {
   return dispute;
 }
 
-// ─────────────────────────────────────────────
-// updateDisputeStatus
-//
-// Handles all three admin dispute actions:
-//   UNDER_REVIEW — admin has picked it up
-//   RESOLVED     — closed with a resolution note (required)
-//   REJECTED     — closed without credit (required note)
-//
-// Terminal states: RESOLVED and REJECTED cannot
-// be transitioned further.
-// resolvedByAdmin is only set on final states.
-// ─────────────────────────────────────────────
 export interface DisputeUpdateInput {
   newStatus: DisputeStatus;
   resolution?: string;
@@ -635,7 +559,7 @@ async function updateDisputeStatus(
 ) {
   const { newStatus, resolution, adminId } = input;
 
-  // ← Add student_uid to the existing select
+  // Add student_uid to the existing select
   const existing = await prisma.dispute.findUnique({
     where: { id: disputeId },
     select: { id: true, status: true, student_uid: true },
@@ -676,7 +600,7 @@ async function updateDisputeStatus(
     },
   });
 
-  // ── Notify student of dispute status change ───────────────────────
+  // Notify student of dispute status change 
   const studentMatric = existing.student_uid;
 
   if (newStatus === "UNDER_REVIEW") {
@@ -713,10 +637,4 @@ export {
   updateDisputeStatus,
 };
 
-// ─────────────────────────────────────────────
-// sendNotification
-// Re-exported from notification.service.ts so
-// admin.controller.ts has a single service import
-// path for all admin operations.
-// ─────────────────────────────────────────────
 export { sendNotification } from "../services/notification.service.js";

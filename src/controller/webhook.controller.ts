@@ -4,9 +4,11 @@ import {
   creditWallet,
   hasCrossedAboveThreshold,
 } from "../services/ledger.service.js";
+import { getRedisClient, cacheKeys, WEBHOOK_DEDUPE_TTL } from "../config/redis.js";
 import { enqueueBroadcast } from "../utils/bridge.js";
 import { buildDeltaCommand } from "../utils/parser.js";
 import { sendNotification } from "../services/notification.service.js";
+import { handleDriverPayoutWebhook } from "../services/driver.service.js";
 import prisma from "../lib/prisma.js";
 import logger from "../config/logger.js";
 import env from "../config/env.js";
@@ -14,6 +16,7 @@ import env from "../config/env.js";
 const processedTransactions = new Set<string>();
 
 export const handlePaymentWebhook = async (req: Request, res: Response) => {
+
   // Step 1: Verify webhook signature 
   const signature = (req.headers["x-korapay-signature"] ||
     req.headers["fincra-signature"] ||
@@ -34,6 +37,52 @@ export const handlePaymentWebhook = async (req: Request, res: Response) => {
   const { event, eventType, data, eventData } = req.body;
   const currentEvent = event || eventType;
   const payloadData = data || eventData;
+
+  // Check for payout / transfer events first
+  const isPayoutEvent =
+    currentEvent === "transfer.success" ||
+    currentEvent === "transfer.failed" ||
+    currentEvent === "payout.success" ||
+    currentEvent === "payout.failed" ||
+    currentEvent === "disbursement.success" ||
+    currentEvent === "disbursement.failed";
+
+  if (isPayoutEvent) {
+    const pReference =
+      payloadData?.reference ||
+      payloadData?.transaction_reference ||
+      payloadData?.transactionReference;
+    const pKoraRef =
+      payloadData?.transaction_reference || payloadData?.reference;
+    const pStatus =
+      payloadData?.status ||
+      (currentEvent.includes("success") ? "success" : "failed");
+    const pFee =
+      payloadData?.fee !== undefined
+        ? parseFloat(payloadData.fee.toString())
+        : undefined;
+    const pAmount =
+      payloadData?.amount !== undefined
+        ? parseFloat(payloadData.amount.toString())
+        : undefined;
+    const pReason =
+      payloadData?.reason || payloadData?.message || payloadData?.failure_reason;
+
+    const result = await handleDriverPayoutWebhook({
+      reference: pReference,
+      koraReference: pKoraRef,
+      event: currentEvent,
+      status: pStatus,
+      fee: pFee,
+      amount: pAmount,
+      reason: pReason,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: result.message,
+    });
+  }
 
   // Only process successful charge events
   if (
@@ -76,8 +125,24 @@ export const handlePaymentWebhook = async (req: Request, res: Response) => {
 
   const log = logger.child({ txReference, studentEmail, depositAmount });
 
-  //  Step 4: Idempotency check 
-  if (processedTransactions.has(txReference)) {
+  //  Step 4: Idempotency check (Redis hot path + persistent DB verification).
+  // Redis is the ephemeral dedupe layer; the final source of truth remains the database.
+  let redisDuplicate = false;
+  try {
+    const redis = getRedisClient();
+    const dedupeKey = cacheKeys.webhookDedup(txReference);
+    const redisResult = await redis.set(dedupeKey, "1", "EX", WEBHOOK_DEDUPE_TTL, "NX");
+    redisDuplicate = redisResult === null;
+  } catch {
+    redisDuplicate = false;
+  }
+
+  const existingTx = await prisma.transaction.findUnique({
+    where: { transaction_id: txReference },
+  });
+
+  if (existingTx || processedTransactions.has(txReference) || redisDuplicate) {
+    processedTransactions.add(txReference);
     log.info("webhook.duplicate_reference — already processed");
     return res.status(200).json({
       success: true,
@@ -99,9 +164,9 @@ export const handlePaymentWebhook = async (req: Request, res: Response) => {
     });
   }
 
-  //  Step 6: Credit wallet
+  //  Step 6: Credit wallet with explicit transaction reference for atomic idempotency
   try {
-    const result = await creditWallet(user.matricNumber, depositAmount);
+    const result = await creditWallet(user.matricNumber, depositAmount, txReference);
 
     if (!result) {
       log.warn("webhook.wallet_not_found");
@@ -136,9 +201,8 @@ export const handlePaymentWebhook = async (req: Request, res: Response) => {
     );
 
     //  Step 9: Remove from blacklist if threshold crossed 
-    // If the student's balance crossed above the threshold after this
-    // top-up, remove them from the blacklist and broadcast to terminals.
     if (hasCrossedAboveThreshold(previousBalance, newBalance)) {
+      
       // 1. Get the student's card UID
       const cardMap = await prisma.cardMapping.findUnique({
         where: { student_uid: user.matricNumber },

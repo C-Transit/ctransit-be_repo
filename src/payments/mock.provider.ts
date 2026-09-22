@@ -1,14 +1,8 @@
-// src/payments/mock.provider.ts
-//
-// Beta sandbox provider — used during the 10-day test window.
-// Generates a fake 10-digit account number instantly.
-// verifyWebhook always returns true so test payloads
-// from curl/Postman pass through without a real signature.
-//
-// Switch away from this by setting PAYMENT_PROVIDER=KORA or FINCRA.
-
 import {
   IPaymentGateway,
+  PayoutParams,
+  PayoutResponse,
+  PayoutStatusQuery,
   VirtualAccountResponse,
 } from "./payment.interface.js";
 
@@ -30,9 +24,37 @@ export class MockProvider implements IPaymentGateway {
     };
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  verifyWebhook(_rawBody: string, _signature: string): boolean {
-    // Bypass signature validation for local testing
+  verifyWebhook(_rawBody: string, signature: string): boolean {
+    if (
+      !signature ||
+      signature.trim() === "" ||
+      signature === "invalid_signature" ||
+      signature === "invalid" ||
+      signature.includes("invalid")
+    ) {
+      return false;
+    }
     return true;
+  }
+
+  async initiatePayout(params: PayoutParams): Promise<PayoutResponse> {
+    return {
+      success: true,
+      status: "processing",
+      reference: params.reference,
+      koraReference: `KORA-MOCK-${Date.now()}`,
+      fee: 10.75,
+      message: "Mock payout initiated successfully in processing state",
+    };
+  }
+
+  async verifyPayout(reference: string): Promise<PayoutStatusQuery> {
+    return {
+      status: "processing",
+      reference,
+      koraReference: `KORA-MOCK-${Date.now()}`,
+      fee: 10.75,
+      message: "Mock payout status verified",
+    };
   }
 }

@@ -8,7 +8,10 @@ import {
   requestForgotPassword,
   resetForgotPassword,
 } from "../controller/user.controller.js";
-import { authenticateToken } from "../middleware/auth.middleware.js";
+import {
+  authenticateToken,
+  requireAdminOrAgent,
+} from "../middleware/auth.middleware.js";
 
 const router = Router();
 
@@ -19,8 +22,8 @@ router.post("/reset-password", resetForgotPassword);
 // Protected routes
 router.use(authenticateToken);
 
-router.get("/count", fetchUserCount);
-router.get("/", fetchAllUsers);
+router.get("/count", requireAdminOrAgent, fetchUserCount);
+router.get("/", requireAdminOrAgent, fetchAllUsers);
 router.get("/myprofile", fetchProfile);
 router.patch("/update-profile", updateProfile);
 router.patch("/change-password", changePassword);

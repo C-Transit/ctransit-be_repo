@@ -23,6 +23,11 @@ export interface ParsedTransaction {
   amount: number;
   driver_uid: string | null;
   synced_at: Date;
+  location?: string | null;
+  card_uid?: string | null;
+  raw_amount?: string | null;
+  timestamp?: number | null;
+  tapped_at?: Date | null;
 }
 
 export interface TransactionBatchResult {
@@ -120,30 +125,42 @@ export function parseSingleTransaction(line: string, terminalId: string): ParseR
   let amountRaw: string | undefined;
   let timestampRaw: string | undefined;
   let driver_uid: string | undefined;
+  let location: string | undefined;
+  let effectiveTerminalId = terminalId;
 
   if (line.includes(":") && !line.startsWith("PENDING_LINK")) {
     const colonIdx = line.indexOf(":");
+    const prefix = line.slice(0, colonIdx).trim();
+    if (prefix && (!terminalId || terminalId === "UNKNOWN")) {
+      effectiveTerminalId = prefix;
+    }
+
     const rest = line.slice(colonIdx + 1); 
     const parts = rest.split(",").map((p) => p.trim());
 
-    if (parts.length < 3 || parts.length > 4) {
+    if (parts.length < 3 || parts.length > 5) {
       return {
-        error: `Format B expects 3-4 fields after colon, got ${parts.length}`,
+        error: `Format B expects 3-5 fields after colon, got ${parts.length}`,
       };
     }
 
-    [student_uid, amountRaw, timestampRaw, driver_uid] = parts;
+    if (parts.length === 5) {
+      [student_uid, amountRaw, timestampRaw, driver_uid, location] = parts;
+    } else if (parts.length === 4) {
+      [student_uid, amountRaw, timestampRaw, driver_uid] = parts;
+    } else {
+      [student_uid, amountRaw, timestampRaw] = parts;
+    }
 
     if (!timestampRaw) return { error: "Missing timestamp field" };
     const ts = parseInt(timestampRaw, 10);
-    transaction_id = `${terminalId}-${ts}-${Math.random()
+    transaction_id = `${effectiveTerminalId || terminalId}-${ts}-${Math.random()
       .toString(36)
       .slice(2, 7)
       .toUpperCase()}`;
   } else {
     const parts = line.split(",").map((p) => p.trim());
 
-    // Accept 3-4 fields (Format B without colon) or 5 fields (Format A CSV)
     if (parts.length >= 3 && parts.length <= 4) {
       // Format B: student_uid, amount, timestamp, [driver_uid]
       [student_uid, amountRaw, timestampRaw, driver_uid] = parts;
@@ -155,10 +172,28 @@ export function parseSingleTransaction(line: string, terminalId: string): ParseR
         .slice(2, 7)
         .toUpperCase()}`;
     } else if (parts.length === 5) {
-      // Format A: transaction_id, student_uid, amount, timestamp, driver_uid
-      [transaction_id, student_uid, amountRaw, timestampRaw, driver_uid] = parts;
+      // Distinguish Format A (tx_id, student, amount, ts, driver) vs Format B with location (student, amount, ts, driver, location)
+      const p1Num = parseFloat(parts[1]);
+      const p2Num = parseInt(parts[2], 10);
+      const isFormatBLocation = !isNaN(p1Num) && !isNaN(p2Num) && p2Num > 100000000;
+
+      if (isFormatBLocation) {
+        [student_uid, amountRaw, timestampRaw, driver_uid, location] = parts;
+        if (!timestampRaw) return { error: "Missing timestamp field" };
+        const ts = parseInt(timestampRaw, 10);
+        transaction_id = `${terminalId}-${ts}-${Math.random()
+          .toString(36)
+          .slice(2, 7)
+          .toUpperCase()}`;
+      } else {
+        // Format A: transaction_id, student_uid, amount, timestamp, driver_uid
+        [transaction_id, student_uid, amountRaw, timestampRaw, driver_uid] = parts;
+      }
+    } else if (parts.length === 6) {
+      // Format A with location: transaction_id, student_uid, amount, timestamp, driver_uid, location
+      [transaction_id, student_uid, amountRaw, timestampRaw, driver_uid, location] = parts;
     } else {
-      return { error: `Expected 3-5 CSV fields, got ${parts.length}` };
+      return { error: `Expected 3-6 CSV fields, got ${parts.length}` };
     }
   }
 
@@ -186,16 +221,22 @@ export function parseSingleTransaction(line: string, terminalId: string): ParseR
   if (isNaN(epochSeconds) || epochSeconds <= 0) {
     return { error: `Invalid timestamp: "${timestampRaw}"` };
   }
-  const synced_at = new Date(epochSeconds * 1000);
+  const tapped_at = new Date(epochSeconds * 1000);
+  const synced_at = new Date();
 
   return {
     data: {
       transaction_id,
-      terminal_id: terminalId,
+      terminal_id: effectiveTerminalId || terminalId,
       student_uid,
       amount,
       driver_uid: driver_uid || null,
       synced_at,
+      location: location || null,
+      card_uid: student_uid,
+      raw_amount: amountRaw,
+      timestamp: epochSeconds,
+      tapped_at,
     },
   };
 }

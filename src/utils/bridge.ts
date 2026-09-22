@@ -18,15 +18,84 @@ import logger from "../config/logger.js";
 const MQTT_URL = env.mqtt.internalUrl;
 const API_KEY = env.mqtt.internalSecret;
 
+export interface BroadcastResult {
+  success: boolean;
+  partial?: boolean;
+  totalTerminals?: number;
+  deliveredCount?: number;
+  failedCount?: number;
+  delivered?: string[] | number;
+  failed?: string[] | number;
+  failedTerminals?: string[];
+  failures?: Array<{ terminalId: string; error?: string }> | string[];
+  message?: string;
+  [key: string]: unknown;
+}
+
+export function detectPartialBroadcastFailure(result: BroadcastResult | null | undefined): {
+  isPartial: boolean;
+  failedCount: number;
+  deliveredCount?: number;
+  failedTerminals: string[];
+} {
+  if (!result) {
+    return { isPartial: false, failedCount: 0, failedTerminals: [] };
+  }
+
+  const failedTerminals: string[] = [];
+  if (Array.isArray(result.failedTerminals)) {
+    failedTerminals.push(...result.failedTerminals);
+  } else if (Array.isArray(result.failed)) {
+    failedTerminals.push(...result.failed.map(String));
+  } else if (Array.isArray(result.failures)) {
+    for (const f of result.failures) {
+      if (typeof f === "string") {
+        failedTerminals.push(f);
+      } else if (f && typeof f === "object" && "terminalId" in f) {
+        failedTerminals.push(String((f as { terminalId: string | number }).terminalId));
+      }
+    }
+  }
+
+  const failedCount =
+    typeof result.failedCount === "number"
+      ? result.failedCount
+      : typeof result.failed === "number"
+      ? result.failed
+      : failedTerminals.length;
+
+  const deliveredCount =
+    typeof result.deliveredCount === "number"
+      ? result.deliveredCount
+      : typeof result.delivered === "number"
+      ? result.delivered
+      : Array.isArray(result.delivered)
+      ? result.delivered.length
+      : undefined;
+
+  const isPartial =
+    result.partial === true ||
+    result.success === false ||
+    failedCount > 0 ||
+    failedTerminals.length > 0;
+
+  return {
+    isPartial,
+    failedCount,
+    deliveredCount,
+    failedTerminals,
+  };
+}
+
 // ─────────────────────────────────────────────
 // _post – internal helper with retries & idempotency
 // ─────────────────────────────────────────────
-async function _post(
+async function _post<T = Record<string, unknown>>(
   endpoint: string,
   body: Record<string, unknown>,
   commandId?: string,
   retries = 3
-): Promise<void> {
+): Promise<T> {
   const url = `${MQTT_URL}${endpoint}`;
   const id = commandId || (body.commandId as string) || randomUUID();
   const payload = { ...body, commandId: id };
@@ -44,13 +113,14 @@ async function _post(
         body: JSON.stringify(payload),
       });
 
-      if (!res.ok) {
+      if (!res.ok && res.status !== 207) {
         const text = await res.text();
         throw new Error(`MQTT service returned ${res.status}: ${text}`);
       }
 
-      log.debug({ attempt }, "mqtt_bridge.http_success");
-      return;
+      const data = (await res.json().catch(() => ({}))) as T;
+      log.debug({ attempt, data }, "mqtt_bridge.http_success");
+      return data;
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       log.warn({ attempt, err: errMsg }, "mqtt_bridge.http_failed");
@@ -64,6 +134,7 @@ async function _post(
       );
     }
   }
+  throw new Error("HTTP bridge request failed after retries");
 }
 
 // ─────────────────────────────────────────────
@@ -73,10 +144,15 @@ async function _post(
 export async function enqueueBroadcast(
   command: string,
   commandId?: string
-): Promise<void> {
+): Promise<BroadcastResult> {
   const id = commandId || randomUUID();
-  await _post("/internal/broadcast", { command, commandId: id }, id);
-  logger.debug({ commandId: id, command }, "mqtt_bridge.broadcast_sent");
+  const result = await _post<BroadcastResult>(
+    "/internal/broadcast",
+    { command, commandId: id },
+    id
+  );
+  logger.debug({ commandId: id, command, result }, "mqtt_bridge.broadcast_sent");
+  return result || { success: true };
 }
 
 // ─────────────────────────────────────────────
@@ -87,10 +163,15 @@ export async function enqueueRoute(
   terminalId: string,
   command: string,
   commandId?: string
-): Promise<void> {
+): Promise<Record<string, unknown>> {
   const id = commandId || randomUUID();
-  await _post(`/internal/route/${terminalId}`, { command, commandId: id }, id);
-  logger.debug({ terminalId, commandId: id, command }, "mqtt_bridge.route_sent");
+  const result = await _post<Record<string, unknown>>(
+    `/internal/route/${terminalId}`,
+    { command, commandId: id },
+    id
+  );
+  logger.debug({ terminalId, commandId: id, command, result }, "mqtt_bridge.route_sent");
+  return result || { success: true };
 }
 
 // ─────────────────────────────────────────────

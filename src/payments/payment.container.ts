@@ -15,25 +15,40 @@ import { MockProvider } from "./mock.provider.js";
 import { KoraProvider } from "./kora.provider.js";
 import { FincraProvider } from "./fincra.provider.js";
 import logger from "../config/logger.js";
+import env from "../config/env.js";
 
-const PROVIDER = process.env.PAYMENT_PROVIDER ?? "MOCK";
-const SECRET_KEY = process.env.PAYMENT_SECRET_KEY ?? "dummy_key";
+const PROVIDER = (env.payment.provider || "MOCK").toUpperCase();
+const SECRET_KEY = env.payment.secretKey;
+const allowMockPayments = process.env.ALLOW_MOCK_PAYMENTS === "true";
 
 let paymentContainer: IPaymentGateway;
 
 switch (PROVIDER) {
+  case "MOCK":
+    if (!allowMockPayments) {
+      throw new Error(
+        "FATAL: MOCK payment provider requires ALLOW_MOCK_PAYMENTS=true."
+      );
+    }
+    paymentContainer = new MockProvider();
+    logger.warn("payment.provider_loaded — MOCK (explicitly enabled)");
+    break;
   case "KORA":
+    if (!SECRET_KEY) {
+      throw new Error("FATAL: PAYMENT_SECRET_KEY is required when using KORA provider.");
+    }
     paymentContainer = new KoraProvider(SECRET_KEY);
     logger.info("payment.provider_loaded — KORA");
     break;
   case "FINCRA":
+    if (!SECRET_KEY) {
+      throw new Error("FATAL: PAYMENT_SECRET_KEY is required when using FINCRA provider.");
+    }
     paymentContainer = new FincraProvider(SECRET_KEY);
     logger.info("payment.provider_loaded — FINCRA");
     break;
   default:
-    paymentContainer = new MockProvider();
-    logger.info("payment.provider_loaded — MOCK (beta sandbox)");
-    break;
+    throw new Error(`FATAL: Unsupported payment provider: ${PROVIDER}`);
 }
 
 export { paymentContainer };

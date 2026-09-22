@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { getRedisClient } from "../config/redis.js";
 import { prisma } from "../services/ledger.service.js";
 import logger from "../config/logger.js";
+import env from "../config/env.js";
 
 const router = Router();
 
@@ -43,6 +44,8 @@ router.get("/", async (req: Request, res: Response) => {
 
   res.status(statusCode).json({
     status: allHealthy ? "healthy" : "degraded",
+    environment: env.NODE_ENV,
+    uptimeSeconds: Math.floor(process.uptime()),
     timestamp: new Date().toISOString(),
     checks,
   });

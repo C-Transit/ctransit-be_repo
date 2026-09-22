@@ -8,3 +8,6 @@ package-lock.json
 dist/
 eng.traineddata
 prisma/seed.ts
+/docs
+/tests
+/prisma/migrations
