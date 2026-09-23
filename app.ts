@@ -40,6 +40,25 @@ const app = express();
 
 app.set("trust proxy", 1);
 
+app.use(
+  cors({
+    origin: [
+      "https://www.ctransit.me",
+      "https://admin.ctransit.me",
+      "https://agent.ctransit.me",
+      "https://driver.ctransit.me",
+      "http://localhost:3000",
+      "http://localhost:3001",
+      "http://localhost:3002",
+      "http://localhost:3003",
+      "https://c-transit-pink.vercel.app",
+      "https://ctransit-driver.vercel.app",
+    ],
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  })
+);
+
 app.use((req: RequestWithId, _res: Response, next: NextFunction) => {
   const requestId =
     (req.headers["x-request-id"] as string | undefined) || randomUUID();
@@ -67,13 +86,6 @@ app.use((req: Request, res: Response, next: NextFunction) => {
     );
   }
 
-  if (req.method === "OPTIONS") {
-    res.setHeader("access-control-allow-methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
-    res.setHeader("access-control-allow-headers", "Content-Type, Authorization, X-Request-Id, X-Internal-Secret, X-Admin-Secret, X-Critical-Approval-Token");
-    res.status(204).end();
-    return;
-  }
-
   next();
 });
 
@@ -82,25 +94,6 @@ if (process.env.NODE_ENV === "development") {
 }
 app.use(express.json({ limit: "10kb" }));
 app.use(express.urlencoded({ extended: false }));
-
-app.use(
-  cors({
-    origin: [
-      "https://www.ctransit.me",
-      "https://admin.ctransit.me",
-      "https://agent.ctransit.me",
-      "https://driver.ctransit.me",
-      "http://localhost:3000",
-      "http://localhost:3001",
-      "http://localhost:3002",
-      "http://localhost:3003",
-      "https://c-transit-pink.vercel.app",
-      "https://ctransit-driver.vercel.app",
-    ],
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  })
-);
 
 app.use((req: Request, res: Response, next: NextFunction) => {
   const start = Date.now();
