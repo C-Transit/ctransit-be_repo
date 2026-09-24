@@ -9,6 +9,7 @@ import {
   linkCardHandler,
   listUsersHandler,
   getStudentTransactionsHandler,
+  unlinkCardAgentHandler,
 } from "../controller/agent.controller.js";
 
 const router = Router();
@@ -20,6 +21,7 @@ router.get("/drivers", listDriversHandler);
 router.post("/drivers/register", registerDriverHandler);
 router.get("/terminals", listTerminalsHandler);
 router.post("/card/link", linkCardHandler);
+router.post("/card/unlink", unlinkCardAgentHandler);
 router.get("/users", listUsersHandler);
 router.get("/users/:matricNumber/transactions", getStudentTransactionsHandler);
 

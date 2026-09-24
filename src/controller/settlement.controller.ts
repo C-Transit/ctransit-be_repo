@@ -1,4 +1,4 @@
-﻿"use strict";
+"use strict";
 
 import type { Request, Response } from "express";
 import logger from "../config/logger.js";
@@ -6,7 +6,6 @@ import env from "../config/env.js";
 import { settleRide } from "../services/settlement.service.js";
 
 // requireInternalSecret
-// Guards the /internal/* namespace.
 export function requireInternalSecret(req: Request, res: Response, next: () => void): void {
   const provided = req.headers["x-internal-secret"] as string | undefined;
 
@@ -20,7 +19,6 @@ export function requireInternalSecret(req: Request, res: Response, next: () => v
 }
 
 // handleSettle
-// POST /internal/settle
 export const handleSettle = async (req: Request, res: Response): Promise<void> => {
   const { transaction_id, terminal_id, student_uid, amount } = req.body as {
     transaction_id?: unknown;

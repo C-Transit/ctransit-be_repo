@@ -5,6 +5,8 @@ import { sendNotification } from "../services/notification.service.js";
 import { creditWallet } from "../services/ledger.service.js";
 import {
   createVirtualAccountForStudent,
+  initializeCheckoutForStudent,
+  getCheckoutStatusForStudent,
   getVirtualAccount,
 } from "../services/payment.service.js";
 import { buildDeltaCommand } from "../utils/parser.js";
@@ -13,10 +15,68 @@ import { hasCrossedAboveThreshold } from "../services/ledger.service.js";
 import logger from "../config/logger.js";
 import env from "../config/env.js";
 
-// ─────────────────────────────────────────────
+export const initializeCheckout = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  const userId = req.user?.userId;
+  if (!userId) return res.status(401).json({ success: false, message: "Unauthorized" });
+
+  const amount = req.body?.amount;
+  if (typeof amount !== "number") {
+    return res.status(400).json({ success: false, message: "Amount must be a number" });
+  }
+
+  try {
+    const result = await initializeCheckoutForStudent(userId, amount);
+    return res.status(200).json({
+      success: true,
+      data: {
+        reference: result.reference,
+        checkoutUrl: result.checkoutUrl,
+        status: result.status,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Checkout initialization failed";
+    if (message === "INVALID_CHECKOUT_AMOUNT") {
+      return res.status(400).json({
+        success: false,
+        message: "Amount must be an integer between 150 and 10000 NGN",
+      });
+    }
+    if (message === "USER_NOT_FOUND") return res.status(404).json({ success: false, message: "User not found" });
+    if (message === "WALLET_NOT_ACTIVATED") return res.status(403).json({ success: false, message: "Wallet not activated" });
+    if (message === "CHECKOUT_NOT_SUPPORTED") return res.status(501).json({ success: false, message: "Checkout is not supported by the active provider" });
+
+    logger.error({ err: message }, "payment.checkout_initialization_error");
+    return res.status(502).json({ success: false, message: "Unable to initialize payment checkout" });
+  }
+};
+
+export const getCheckoutStatus = async (
+  req: AuthenticatedRequest,
+  res: Response
+) => {
+  const userId = req.user?.userId;
+  const reference = typeof req.params.reference === "string" ? req.params.reference : "";
+  if (!userId) return res.status(401).json({ success: false, message: "Unauthorized" });
+  if (!reference) return res.status(400).json({ success: false, message: "Payment reference is required" });
+
+  try {
+    const data = await getCheckoutStatusForStudent(userId, reference);
+    return res.status(200).json({ success: true, data });
+  } catch (error) {
+    if (error instanceof Error && error.message === "PAYMENT_ATTEMPT_NOT_FOUND") {
+      return res.status(404).json({ success: false, message: "Payment attempt not found" });
+    }
+    logger.error({ err: error instanceof Error ? error.message : String(error) }, "payment.checkout_status_error");
+    return res.status(500).json({ success: false, message: "Unable to retrieve payment status" });
+  }
+};
+
 // Student requests their dedicated top-up account.
 // Requires: authenticated student with approved KYC.
-// ─────────────────────────────────────────────
 export const requestVirtualAccount = async (
   req: AuthenticatedRequest,
   res: Response
@@ -60,9 +120,7 @@ export const requestVirtualAccount = async (
   }
 };
 
-// ─────────────────────────────────────────────
 // Returns the student's existing virtual account and current wallet balance.
-// ─────────────────────────────────────────────
 export const getVirtualAccountDetails = async (
   req: AuthenticatedRequest,
   res: Response
@@ -89,11 +147,22 @@ export const getVirtualAccountDetails = async (
   }
 };
 
-// Mock Payment for Beta Testing
+// Mock Payment for Beta Testing (strictly disabled in production)
 export const mockTopup = async (
   req: AuthenticatedRequest,
   res: Response
 ) => {
+  if (
+    env.NODE_ENV === "production" ||
+    env.NODE_ENV === "staging" ||
+    process.env.ALLOW_MOCK_PAYMENTS !== "true"
+  ) {
+    return res.status(403).json({
+      success: false,
+      message: "Mock top-up is disabled in production environment.",
+    });
+  }
+
   try {
     const userId = req.user?.userId;
     if (!userId) {

@@ -1,4 +1,4 @@
-﻿"use strict";
+"use strict";
 
 import { Decimal } from "@prisma/client/runtime/library";
 import prisma from "../lib/prisma.js";

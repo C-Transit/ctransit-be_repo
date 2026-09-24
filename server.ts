@@ -70,8 +70,8 @@ async function boot(): Promise<void> {
   });
 
   await new Promise<void>((resolve, reject) => {
-    server.listen(env.PORT, () => {
-      logger.info({ port: env.PORT }, "server.http_listening");
+    server.listen(env.PORT, "0.0.0.0", () => {
+      logger.info({ port: env.PORT, host: "0.0.0.0" }, "server.http_listening");
       resolve();
     });
     server.once("error", reject);

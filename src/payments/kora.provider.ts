@@ -5,8 +5,17 @@ import {
   PayoutResponse,
   PayoutStatusQuery,
   VirtualAccountResponse,
+  BankAccountResolution,
+  CheckoutInitializationParams,
+  CheckoutInitializationResponse,
 } from "./payment.interface.js";
 import logger from "../config/logger.js";
+
+function maskAccountNumber(accountNumber: string): string {
+  return accountNumber.length > 4
+    ? `${"*".repeat(accountNumber.length - 4)}${accountNumber.slice(-4)}`
+    : "****";
+}
 
 export class KoraProvider implements IPaymentGateway {
   private secretKey: string;
@@ -17,16 +26,186 @@ export class KoraProvider implements IPaymentGateway {
     this.baseUrl = baseUrl || process.env.KORA_BASE_URL || "https://api.korapay.com/merchant";
   }
 
+  async initializeCheckout(
+    params: CheckoutInitializationParams
+  ): Promise<CheckoutInitializationResponse> {
+    const endpoint = `${this.baseUrl}/api/v1/charges/initialize`;
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.secretKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        amount: params.amount,
+        currency: params.currency,
+        reference: params.reference,
+        redirect_url: params.redirectUrl,
+        notification_url: params.notificationUrl,
+        narration: params.narration,
+        customer: params.customer,
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+
+    const body = await response.json().catch(() => null);
+    const checkoutUrl = body?.data?.checkout_url;
+    if (!response.ok || body?.status !== true || typeof checkoutUrl !== "string") {
+      throw new Error(body?.message || `Kora checkout initialization failed (HTTP ${response.status})`);
+    }
+
+    return {
+      reference: body.data.reference || params.reference,
+      checkoutUrl,
+    };
+  }
+
   async createVirtualAccount(
-    _name: string,
-    _email: string,
+    name: string,
+    email: string,
     reference: string
   ): Promise<VirtualAccountResponse> {
-    return {
-      accountNumber: "KORA_PENDING_LIVE",
-      bankName: "Kora Provider Bank",
-      reference,
+    const endpoint = `${this.baseUrl}/api/v1/virtual-bank-account`;
+    const bankCode = process.env.KORA_VIRTUAL_ACCOUNT_BANK_CODE || "000";
+
+    const requestPayload = {
+      account_name: name,
+      account_reference: reference,
+      permanent: true,
+      bank_code: bankCode,
+      customer: {
+        name,
+        email,
+      },
     };
+
+    logger.info(
+      { reference, bankCode, customerEmail: email },
+      "kora.virtual_account_initiating"
+    );
+
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.secretKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(requestPayload),
+        signal: AbortSignal.timeout(10000),
+      });
+
+      const responseBody = await response.json().catch(() => null);
+
+      if (!response.ok || !responseBody || responseBody.status === false) {
+        const errorMsg =
+          responseBody?.message ||
+          `Kora virtual account creation failed (HTTP ${response.status})`;
+        logger.error({ reference, error: errorMsg }, "kora.virtual_account_failed");
+        throw new Error(errorMsg);
+      }
+
+      const data = responseBody.data || {};
+      const accountNumber = data.account_number;
+      const bankName = data.bank_name || "Kora Virtual Bank";
+      const resolvedRef = data.account_reference || reference;
+
+      if (!accountNumber) {
+        logger.error(
+          { reference },
+          "kora.virtual_account_missing_account_number"
+        );
+        throw new Error("Kora returned virtual account response without account number");
+      }
+
+      logger.info(
+        {
+          reference: resolvedRef,
+          accountNumber: maskAccountNumber(accountNumber),
+          bankName,
+        },
+        "kora.virtual_account_created_success"
+      );
+
+      return {
+        accountNumber,
+        bankName,
+        reference: resolvedRef,
+      };
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.error({ reference, err: errMsg }, "kora.virtual_account_exception");
+      throw err;
+    }
+  }
+
+  async resolveBankAccount(
+    bankCode: string,
+    accountNumber: string
+  ): Promise<BankAccountResolution> {
+    const endpoint = `${this.baseUrl}/api/v1/misc/banks/resolve`;
+
+    const requestPayload = {
+      bank: bankCode,
+      account: accountNumber,
+      currency: "NGN",
+    };
+
+    logger.info(
+      { bankCode, accountNumber: maskAccountNumber(accountNumber) },
+      "kora.bank_account_resolution_initiating"
+    );
+
+    try {
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.secretKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(requestPayload),
+        signal: AbortSignal.timeout(8000),
+      });
+
+      const responseBody = await response.json().catch(() => null);
+
+      if (!response.ok || !responseBody || responseBody.status === false) {
+        const errorMsg =
+          responseBody?.message ||
+          `Bank account resolution failed (HTTP ${response.status})`;
+        logger.warn(
+          { bankCode, accountNumber: maskAccountNumber(accountNumber), error: errorMsg },
+          "kora.bank_account_resolution_rejected"
+        );
+        throw new Error(errorMsg);
+      }
+
+      const data = responseBody.data || {};
+      const accountName = data.account_name;
+
+      if (!accountName) {
+        throw new Error("Could not resolve account name from Kora response");
+      }
+
+      logger.info(
+        { bankCode, accountNumber: maskAccountNumber(accountNumber) },
+        "kora.bank_account_resolved_successfully"
+      );
+
+      return {
+        accountName,
+        accountNumber: data.account_number || accountNumber,
+        bankCode: data.bank_code || bankCode,
+        bankName: data.bank_name,
+      };
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.warn(
+        { bankCode, accountNumber: maskAccountNumber(accountNumber), err: errMsg },
+        "kora.bank_account_resolution_error"
+      );
+      throw err;
+    }
   }
 
   verifyWebhook(rawBody: string, signature: string): boolean {

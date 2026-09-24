@@ -63,6 +63,15 @@ enum WithdrawalStatus {
   FAILED
 }
 
+enum PaymentAttemptStatus {
+  PENDING
+  PROCESSING
+  SUCCESS
+  FAILED
+  CANCELLED
+  EXPIRED
+}
+
 model User {
   id           String   @id @default(uuid())
   firstname    String
@@ -75,16 +84,21 @@ model User {
   phone        String?  @db.VarChar(20)
   vehicleType  String?  @db.VarChar(50)
   vehiclePlate String?  @db.VarChar(50)
+  bankCode     String?  @db.VarChar(20)
   bankName     String?  @db.VarChar(100)
   accountNumber String? @db.VarChar(50)
+  accountName  String?  @db.VarChar(100)
+  bankVerified Boolean  @default(false)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
   wallet            Wallet?
   driverWallet      DriverWallet?
+  driverCredential  DriverCardCredential?
   transactions      Transaction[]      @relation("StudentTransactions")
   driverTransactions Transaction[]     @relation("DriverTransactions")
   driverWithdrawals DriverWithdrawal[] @relation("DriverWithdrawals")
+  paymentAttempts  PaymentAttempt[]
   kyc               Kyc?
 
   createdAgents     Agent[]        @relation("AdminCreatedAgents")
@@ -202,6 +216,28 @@ model DriverWithdrawal {
   @@map("driver_withdrawals")
 }
 
+model PaymentAttempt {
+  id                String              @id @default(uuid())
+  reference         String              @unique @db.VarChar(64)
+  provider          String              @db.VarChar(20)
+  providerReference String?             @db.VarChar(100)
+  userId            String
+  amount            Decimal             @db.Decimal(10, 2)
+  currency          String              @db.VarChar(3)
+  status            PaymentAttemptStatus @default(PENDING)
+  failureReason     String?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+  completedAt       DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status])
+  @@index([providerReference])
+  @@map("payment_attempts")
+}
+
 model SystemWallet {
   id            String   @id @default("CTRANSIT_SYSTEM")
   name          String   @default("C-Transit Platform")
@@ -250,6 +286,21 @@ model CardMapping {
   @@index([linked_at(sort: Desc)])
 
   @@map("card_mappings")
+}
+
+model DriverCardCredential {
+  id          String   @id @default(uuid())
+  driver_uid  String   @unique @db.VarChar(20)
+  card_uid    String   @unique @db.VarChar(20)
+  pin_hash    String   @db.VarChar(255)
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+  updated_at  DateTime @updatedAt @db.Timestamptz(6)
+
+  driver      User     @relation(fields: [driver_uid], references: [matricNumber], onDelete: Cascade)
+
+  @@index([driver_uid])
+  @@index([card_uid])
+  @@map("driver_card_credentials")
 }
 
 model Agent {

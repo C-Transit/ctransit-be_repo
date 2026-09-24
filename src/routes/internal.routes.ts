@@ -1,4 +1,4 @@
-﻿// src/routes/internal.routes.ts
+// src/routes/internal.routes.ts
 //
 // Internal service-to-service routes — not exposed to end users.
 // All routes here require the X-Internal-Secret header.
