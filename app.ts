@@ -34,7 +34,7 @@ import {
   notificationLimiter,
 } from "./src/middleware/rate-limit.middleware.js";
 
-type RequestWithId = Request & { id?: string };
+type RequestWithId = Request & { id?: string; rawBody?: string };
 
 const app = express();
 
@@ -92,7 +92,14 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 if (process.env.NODE_ENV === "development") {
   app.use(morgan("dev"));
 }
-app.use(express.json({ limit: "10kb" }));
+app.use(
+  express.json({
+    limit: "10kb",
+    verify: (req, _res, buffer) => {
+      (req as RequestWithId).rawBody = buffer.toString("utf8");
+    },
+  })
+);
 app.use(express.urlencoded({ extended: false }));
 
 app.use((req: Request, res: Response, next: NextFunction) => {

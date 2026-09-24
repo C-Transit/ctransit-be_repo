@@ -1,90 +1,101 @@
 // src/config/redis.ts
-import * as IORedisPkg from "ioredis";
-import { type RedisOptions } from "ioredis";
-import env from "./env.js";
+import { Redis } from "ioredis";
 import logger from "./logger.js";
+import env from "./env.js";
 
-const Redis = IORedisPkg.default;
+const isLiveLikeEnvironment =
+  env.NODE_ENV === "production" || env.NODE_ENV === "staging";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let redisClient: any = null;
+const store = new Map<string, string | number>();
+const lists = new Map<string, string[]>();
+
+const memoryRedis = {
+  connect: async (): Promise<void> => {
+    logger.info("redis.mock_connected");
+  },
+  ping: async (): Promise<string> => "PONG",
+  quit: async (): Promise<void> => {
+    logger.info("redis.mock_quit");
+  },
+  disconnect: async (): Promise<void> => {},
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  on: (_event: string, _callback: (...args: unknown[]) => void) => memoryRedis,
+  get: async (k: string): Promise<string | null> => {
+    const val = store.get(k);
+    return val !== undefined ? String(val) : null;
+  },
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  set: async (k: string, v: unknown, ..._args: unknown[]): Promise<string> => {
+    store.set(k, String(v));
+    return "OK";
+  },
+  setex: async (k: string, _ttl: number, v: unknown): Promise<string> => {
+    store.set(k, String(v));
+    return "OK";
+  },
+  del: async (k: string): Promise<number> => (store.delete(k) ? 1 : 0),
+  incr: async (k: string): Promise<number> => {
+    const n = (Number(store.get(k)) || 0) + 1;
+    store.set(k, n);
+    return n;
+  },
+  lpush: async (k: string, ...values: string[]): Promise<number> => {
+    const list = lists.get(k) || [];
+    list.unshift(...values);
+    lists.set(k, list);
+    return list.length;
+  },
+  rpush: async (k: string, ...values: string[]): Promise<number> => {
+    const list = lists.get(k) || [];
+    list.push(...values);
+    lists.set(k, list);
+    return list.length;
+  },
+  lpop: async (k: string): Promise<string | null> => {
+    const list = lists.get(k) || [];
+    const item = list.shift() ?? null;
+    lists.set(k, list);
+    return item;
+  },
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  expire: async (_k: string, _ttl: number): Promise<number> => 1,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  ttl: async (_k: string): Promise<number> => 300,
+};
+
+const networkRedis = new Redis(env.redis.url, {
+  lazyConnect: true,
+  enableOfflineQueue: false,
+  maxRetriesPerRequest: 1,
+});
+
+networkRedis.on("error", (error) => {
+  logger.error({ err: error.message }, "redis.connection_error");
+});
+
+export const redis = isLiveLikeEnvironment ? networkRedis : memoryRedis;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function getRedisClient(): any {
-  if (redisClient) return redisClient;
-
-  const options: RedisOptions = {
-    db: 0,
-    retryStrategy(times: number): number | null {
-      return times > 3 ? null : Math.min(times * 100, 1000);
-    },
-    enableOfflineQueue: false,
-    maxRetriesPerRequest: 1,
-    lazyConnect: true,
-    connectTimeout: 2000,
-  };
-
-  // @ts-expect-error - ioredis has complex module exports
-  redisClient = new Redis(env.redis.url, options);
-
-  (redisClient as IORedisPkg.Redis).on("connect", () =>
-    logger.info("redis.connected")
-  );
-  (redisClient as IORedisPkg.Redis).on("ready", () =>
-    logger.info("redis.ready")
-  );
-  (redisClient as IORedisPkg.Redis).on("error", (err: Error) => {
-    logger.error({ err: err.message }, "redis.connection_error");
-  });
-  (redisClient as IORedisPkg.Redis).on("close", () =>
-    logger.error("redis.connection_closed")
-  );
-
-  return redisClient;
+  return redis;
 }
 
-// ── MQTT & OTP Keys ───────────────────────────────────────────────────────────
+// MQTT & OTP Keys 
 const redisKeys = {
-  // Card registration OTP: SETEX link_otp:{otp} 300 "cardUid|terminalId"
   linkOtp: (otp: string | number): string => `link_otp:${otp}`,
-
-  // Per-terminal downlink queue: RPUSH queue:term_01 "ADD:WL,uid"
   terminalQueue: (terminalId: string): string =>
     `queue:${terminalId.toLowerCase()}`,
 };
 
-// ── Hot Read Cache Keys ───────────────────────────────────────────────────────
+// Hot Read Cache Keys 
 const cacheKeys = {
-  // Maps hardware card UID → student matricNumber
-  // No TTL — permanent mapping, invalidated only on card re-link
   cardMap: (cardUid: string): string => `card:map:${cardUid}`,
-
-  // Idempotency and dedupe keys for expensive or sensitive webhook/sync events.
-  // Redis is used as the hot-path protection layer; final writes still persist to Postgres.
   webhookDedup: (reference: string): string => `webhook:dedupe:${reference}`,
   settlementDedup: (reference: string): string => `settlement:dedupe:${reference}`,
-
-  // Caches wallet { balance, is_linked } per student
-  // Short TTL — balance changes on every tap
   wallet: (matricNumber: string): string => `wallet:${matricNumber}`,
-
-  // Caches blacklist presence per student
-  // Longer TTL — changes less frequently than balance
   blacklist: (matricNumber: string): string => `blacklist:${matricNumber}`,
-
-  // Caches agent account status for middleware checks on every agent request
-  // MUST be DEL'd immediately when admin changes agent status
   agentStatus: (agentId: string): string => `agent:status:${agentId}`,
-
-  // Refresh token store — keyed by tokenId (UUID v4 generated at login)
-  // Value: JSON { userId, role, email }
-  // TTL: REFRESH_TOKEN_TTL (7 days)
-  // DEL on logout or account deactivation — instant revocation
   refreshToken: (tokenId: string): string => `refresh:${tokenId}`,
-
-  // Caches terminal secret_key for HMAC verification on every uplink message.
-  // Short TTL — secret rotations propagate within 60s.
-  // DEL this key when admin updates a terminal's secret_key.
   terminalSecret: (terminalId: string): string =>
     `terminal:secret:${terminalId}`,
 };

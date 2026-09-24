@@ -52,6 +52,28 @@ export interface PayoutStatusQuery {
   message?: string;
 }
 
+export interface BankAccountResolution {
+  accountName: string;
+  accountNumber: string;
+  bankCode: string;
+  bankName?: string;
+}
+
+export interface CheckoutInitializationParams {
+  amount: number;
+  currency: string;
+  reference: string;
+  redirectUrl: string;
+  notificationUrl: string;
+  narration: string;
+  customer: PayoutCustomer;
+}
+
+export interface CheckoutInitializationResponse {
+  reference: string;
+  checkoutUrl: string;
+}
+
 export interface IPaymentGateway {
   // Creates a dedicated virtual bank account for a student.
   // Called once after KYC approval — account details persisted to Wallet.
@@ -70,4 +92,14 @@ export interface IPaymentGateway {
 
   // Queries the current status of an outbound payout
   verifyPayout?(reference: string): Promise<PayoutStatusQuery>;
+
+  // Resolves and verifies a bank account number against bank name
+  resolveBankAccount?(
+    bankCode: string,
+    accountNumber: string
+  ): Promise<BankAccountResolution>;
+
+  initializeCheckout?(
+    params: CheckoutInitializationParams
+  ): Promise<CheckoutInitializationResponse>;
 }

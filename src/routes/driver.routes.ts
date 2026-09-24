@@ -3,7 +3,12 @@ import {
   authenticateToken,
   requireDriver,
 } from "../middleware/auth.middleware.js";
-import { loginLimiter } from "../middleware/rate-limit.middleware.js";
+import {
+  loginLimiter,
+  driverCardLinkLimiter,
+  driverPinLimiter,
+  bankVerifyLimiter,
+} from "../middleware/rate-limit.middleware.js";
 import {
   loginDriverHandler,
   getDriverMeHandler,
@@ -12,6 +17,9 @@ import {
   createDriverWithdrawalHandler,
   getDriverWithdrawalsHandler,
   linkDriverCardHandler,
+  setDriverCardPinHandler,
+  getDriverPinStatusHandler,
+  verifyDriverBankHandler,
   getDriverNotificationsHandler,
   markDriverNotificationReadHandler,
   markAllDriverNotificationsReadHandler,
@@ -46,9 +54,18 @@ router.post("/withdraw", createDriverWithdrawalHandler);
 router.get("/withdrawals", getDriverWithdrawalsHandler);
 
 // 7. POST /api/drivers/card/link
-router.post("/card/link", linkDriverCardHandler);
+router.post("/card/link", driverCardLinkLimiter, linkDriverCardHandler);
 
-// 8. GET /api/drivers/notifications
+// 8. POST /api/drivers/card/pin
+router.post("/card/pin", driverPinLimiter, setDriverCardPinHandler);
+
+// 9. GET /api/drivers/card/pin/status
+router.get("/card/pin/status", getDriverPinStatusHandler);
+
+// 10. POST /api/drivers/bank/verify
+router.post("/bank/verify", bankVerifyLimiter, verifyDriverBankHandler);
+
+// 11. GET /api/drivers/notifications
 router.get("/notifications", getDriverNotificationsHandler);
 
 // 10. PATCH /api/drivers/notifications/mark-all-read (must be before :id)

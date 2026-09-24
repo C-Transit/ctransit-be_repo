@@ -9,6 +9,9 @@ import {
   createDriverWithdrawal,
   getDriverWithdrawals,
   linkDriverCard,
+  setDriverCardPin,
+  getDriverPinStatus,
+  verifyAndSaveDriverBank,
 } from "../services/driver.service.js";
 import {
   getNotifications,
@@ -178,6 +181,12 @@ export const createDriverWithdrawalHandler = async (
   } catch (error) {
     if (error instanceof Error) {
       switch (error.message) {
+        case "BANK_NOT_VERIFIED":
+          return res.status(400).json({
+            success: false,
+            message:
+              "Bank account must be verified before initiating withdrawals. Please verify your bank account first.",
+          });
         case "INSUFFICIENT_BALANCE":
           return res.status(400).json({
             success: false,
@@ -280,6 +289,22 @@ export const linkDriverCardHandler = async (
   } catch (error) {
     if (error instanceof Error) {
       switch (error.message) {
+        case "CARD_ALREADY_LINKED":
+          return res.status(409).json({
+            success: false,
+            message: "Physical card is already linked to another user.",
+          });
+        case "DRIVER_ALREADY_HAS_CARD":
+          return res.status(400).json({
+            success: false,
+            message:
+              "Driver already has a linked physical card. Please unlink the existing card first.",
+          });
+        case "MISSING_TERMINAL_CONTEXT":
+          return res.status(400).json({
+            success: false,
+            message: "Registration OTP is missing origin terminal context.",
+          });
         case "UNAUTHORIZED_DRIVER_ID":
           return res.status(403).json({
             success: false,
@@ -412,3 +437,142 @@ export const markAllDriverNotificationsReadHandler = async (
       .json({ success: false, message: "Failed to mark notifications as read" });
   }
 };
+
+// POST /api/drivers/card/pin
+export const setDriverCardPinHandler = async (
+  req: CustomAuthRequest,
+  res: Response
+) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    const { pin } = req.body;
+    if (!pin) {
+      return res.status(400).json({
+        success: false,
+        message: "PIN is required",
+      });
+    }
+
+    const result = await setDriverCardPin(userId, {
+      pin: String(pin).trim(),
+    });
+
+    return res.status(200).json(result);
+  } catch (error) {
+    if (error instanceof Error) {
+      switch (error.message) {
+        case "CARD_NOT_LINKED":
+          return res.status(400).json({
+            success: false,
+            message:
+              "Driver must link a physical card before setting a terminal PIN.",
+          });
+        case "INVALID_PIN_FORMAT":
+          return res.status(400).json({
+            success: false,
+            message: "PIN must be 4 to 6 numeric digits.",
+          });
+        case "DRIVER_NOT_FOUND":
+          return res.status(404).json({
+            success: false,
+            message: "Driver not found",
+          });
+      }
+    }
+
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
+    logger.error({ err: errMessage }, "driver.pin_set_controller_error");
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+// GET /api/drivers/card/pin/status
+export const getDriverPinStatusHandler = async (
+  req: CustomAuthRequest,
+  res: Response
+) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    const result = await getDriverPinStatus(userId);
+    return res.status(200).json(result);
+  } catch (error) {
+    if (error instanceof Error && error.message === "DRIVER_NOT_FOUND") {
+      return res.status(404).json({ success: false, message: "Driver not found" });
+    }
+
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
+    logger.error({ err: errMessage }, "driver.pin_status_controller_error");
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+// POST /api/drivers/bank/verify
+export const verifyDriverBankHandler = async (
+  req: CustomAuthRequest,
+  res: Response
+) => {
+  try {
+    const userId = req.user?.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Unauthorized" });
+    }
+
+    const { bankCode, accountNumber } = req.body;
+    if (!bankCode || !accountNumber) {
+      return res.status(400).json({
+        success: false,
+        message: "Both bankCode and accountNumber are required",
+      });
+    }
+
+    const result = await verifyAndSaveDriverBank(userId, {
+      bankCode: String(bankCode).trim(),
+      accountNumber: String(accountNumber).trim(),
+    });
+
+    return res.status(200).json(result);
+  } catch (error) {
+    if (error instanceof Error) {
+      switch (error.message) {
+        case "MISSING_BANK_CODE":
+          return res.status(400).json({
+            success: false,
+            message: "Bank code is required",
+          });
+        case "INVALID_ACCOUNT_NUMBER":
+          return res.status(400).json({
+            success: false,
+            message: "Account number must be exactly 10 digits",
+          });
+        case "DRIVER_NOT_FOUND":
+          return res.status(404).json({
+            success: false,
+            message: "Driver not found",
+          });
+        case "BANK_VERIFICATION_NOT_SUPPORTED":
+          return res.status(501).json({
+            success: false,
+            message: "Bank account resolution is not supported by payment provider",
+          });
+        default:
+          return res.status(400).json({
+            success: false,
+            message: error.message || "Failed to resolve bank account details",
+          });
+      }
+    }
+
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
+    logger.error({ err: errMessage }, "driver.bank_verify_controller_error");
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+

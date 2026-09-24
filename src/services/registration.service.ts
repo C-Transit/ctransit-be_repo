@@ -116,14 +116,30 @@ async function confirmRegistration(
         throw new Error("OTP_ALREADY_USED");
       }
 
-      await tx.cardMapping.upsert({
+      const existingCardMapping = await tx.cardMapping.findUnique({
         where: { card_uid: cardUid },
-        update: { student_uid: user.matricNumber },
-        create: {
-          card_uid: cardUid,
-          student_uid: user.matricNumber,
-        },
       });
+
+      if (existingCardMapping && existingCardMapping.student_uid !== user.matricNumber) {
+        throw new Error("CARD_ALREADY_LINKED");
+      }
+
+      const existingStudentMapping = await tx.cardMapping.findUnique({
+        where: { student_uid: user.matricNumber },
+      });
+
+      if (existingStudentMapping && existingStudentMapping.card_uid !== cardUid) {
+        throw new Error("STUDENT_ALREADY_HAS_CARD");
+      }
+
+      if (!existingCardMapping && !existingStudentMapping) {
+        await tx.cardMapping.create({
+          data: {
+            card_uid: cardUid,
+            student_uid: user.matricNumber,
+          },
+        });
+      }
     });
   } catch (err) {
     if (err instanceof Error && err.message === "OTP_ALREADY_USED") {
@@ -144,6 +160,18 @@ async function confirmRegistration(
         success: false,
         message:
           "This OTP has already been used. Please tap your card again for a new OTP.",
+      };
+    }
+    if (err instanceof Error && err.message === "CARD_ALREADY_LINKED") {
+      return {
+        success: false,
+        message: "This card is already linked to another user.",
+      };
+    }
+    if (err instanceof Error && err.message === "STUDENT_ALREADY_HAS_CARD") {
+      return {
+        success: false,
+        message: "This student already has a different card linked.",
       };
     }
     const errMsg = err instanceof Error ? err.message : "Unknown error";

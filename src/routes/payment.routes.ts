@@ -1,5 +1,7 @@
 import { Router } from "express";
 import {
+  initializeCheckout,
+  getCheckoutStatus,
   requestVirtualAccount,
   getVirtualAccountDetails,
   mockTopup,
@@ -15,6 +17,19 @@ const router = Router();
 router.post("/fund", handlePaymentWebhook);
 router.post("/webhook", handlePaymentWebhook);
 router.post("/payout-webhook", handlePaymentWebhook);
+
+router.post(
+  "/initialize",
+  authenticateToken,
+  requireStudent,
+  initializeCheckout
+);
+router.get(
+  "/status/:reference",
+  authenticateToken,
+  requireStudent,
+  getCheckoutStatus
+);
 
 router.post(
   "/create",

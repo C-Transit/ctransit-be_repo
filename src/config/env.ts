@@ -13,6 +13,9 @@ export const REQUIRED_PRODUCTION_SECRETS = [
 ] as const;
 
 export const INSECURE_FALLBACK_SECRETS: Record<string, string> = {
+  DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/ctransit?schema=public",
+  DATABASE_URL_POOLED: "postgresql://postgres:postgres@localhost:5432/ctransit?schema=public",
+  REDIS_URL: "redis://localhost:6379",
   ADMIN_API_SECRET: "dev_admin_secret",
   JWT_SECRET: "dev_jwt_secret",
   JWT_REFRESH_SECRET: "dev_jwt_refresh_secret",
@@ -20,6 +23,45 @@ export const INSECURE_FALLBACK_SECRETS: Record<string, string> = {
   PAYMENT_SECRET_KEY: "dev_payment_secret",
   MQTT_INTERNAL_SECRET: "dev_mqtt_internal_secret",
 };
+
+export const DEFAULT_DEV_VARS: Record<string, string> = {
+  NODE_ENV: "development",
+  PORT: "3000",
+  DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/ctransit?schema=public",
+  DATABASE_URL_POOLED: "postgresql://postgres:postgres@localhost:5432/ctransit?schema=public",
+  REDIS_URL: "redis://localhost:6379",
+  ADMIN_API_SECRET: "dev_admin_secret",
+  JWT_SECRET: "dev_jwt_secret",
+  JWT_REFRESH_SECRET: "dev_jwt_refresh_secret",
+  OTP_SECRET: "dev_otp_secret",
+  MAIL_USER: "dev@ctransit.me",
+  MAIL_PASSWORD: "dev_mail_password",
+  ALLOWED_EMAIL_DOMAIN: "student.ctransit.me",
+  ALLOW_MOCK_PAYMENTS: "true",
+  CLOUDINARY_CLOUD_NAME: "dev_cloud",
+  CLOUDINARY_API_KEY: "dev_cloud_key",
+  CLOUDINARY_API_SECRET: "dev_cloud_secret",
+  PAYMENT_PROVIDER: "MOCK",
+  PAYMENT_SECRET_KEY: "dev_payment_secret",
+  KORA_PUBLIC_KEY: "pk_test_dev",
+  KORA_SECRET_KEY: "sk_test_dev",
+  KORA_ENCRYPTION_KEY: "enc_test_dev",
+  MQTT_INTERNAL_URL: "http://localhost:4000",
+  MQTT_INTERNAL_SECRET: "dev_mqtt_internal_secret",
+};
+
+const runtimeEnvironment = process.env.NODE_ENV || "development";
+const isLiveLikeEnvironment =
+  runtimeEnvironment === "production" || runtimeEnvironment === "staging";
+
+// Development defaults are never allowed to populate a production-like process.
+if (!isLiveLikeEnvironment) {
+  for (const [key, value] of Object.entries(DEFAULT_DEV_VARS)) {
+    if (!process.env[key]) {
+      process.env[key] = value;
+    }
+  }
+}
 
 export function validateProductionSecrets(
   envLike: Record<string, string | undefined> = process.env
@@ -85,7 +127,7 @@ if (missing.length > 0) {
   process.exit(1);
 }
 
-if (process.env.NODE_ENV === "production" || process.env.NODE_ENV === "staging") {
+if (isLiveLikeEnvironment) {
   validateProductionSecrets(process.env);
 }
 
@@ -166,7 +208,7 @@ interface Config {
 }
 
 const env: Config = {
-  NODE_ENV: process.env.NODE_ENV || "production",
+  NODE_ENV: process.env.NODE_ENV || "development",
   PORT: parseIntSafe(process.env.PORT, 3000),
   db: {
     url: process.env.DATABASE_URL as string,

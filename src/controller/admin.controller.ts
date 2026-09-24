@@ -35,6 +35,7 @@ import {
   updateDisputeStatus,
   sendNotification,
 } from "../services/admin.service.js";
+import { unlinkCard } from "../services/card.service.js";
 
 const router = express.Router();
 
@@ -1082,6 +1083,54 @@ export const registerTerminalHandler = async (
       error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.terminal_registration_error");
     res.status(500).json({ error: "Failed to register terminal" });
+  }
+};
+
+export const unlinkCardAdminHandler = async (
+  req: CustomAuthRequest,
+  res: Response
+) => {
+  try {
+    if (!req.user || req.user.role !== "ADMIN") {
+      return res.status(403).json({ success: false, message: "Admin access required" });
+    }
+
+    const { cardUid, userIdentifier } = req.body;
+    if (!cardUid && !userIdentifier) {
+      return res.status(400).json({
+        success: false,
+        message: "Either cardUid or userIdentifier must be provided",
+      });
+    }
+
+    const result = await unlinkCard({
+      cardUid: cardUid ? String(cardUid).trim() : undefined,
+      userIdentifier: userIdentifier ? String(userIdentifier).trim() : undefined,
+      callerId: req.user.userId,
+      callerRole: req.user.role,
+    });
+
+    return res.status(200).json(result);
+  } catch (error) {
+    if (error instanceof Error) {
+      switch (error.message) {
+        case "CARD_NOT_FOUND":
+          return res.status(404).json({ success: false, message: "Card mapping not found" });
+        case "USER_NOT_FOUND":
+          return res.status(404).json({ success: false, message: "User not found" });
+        case "CARD_ALREADY_UNLINKED":
+          return res.status(400).json({ success: false, message: "No active card is linked to this user" });
+        case "CARD_USER_MISMATCH":
+        case "CARD_BELONGS_TO_ANOTHER_USER":
+          return res.status(400).json({ success: false, message: "Card does not belong to the specified user" });
+        case "UNAUTHORIZED_CALLER":
+          return res.status(403).json({ success: false, message: "Unauthorized to unlink card" });
+      }
+    }
+
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
+    logger.error({ err: errMessage }, "admin.unlink_card_controller_error");
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 };
 

@@ -15,14 +15,16 @@ import env from "../config/env.js";
 
 const processedTransactions = new Set<string>();
 
-export const handlePaymentWebhook = async (req: Request, res: Response) => {
+type WebhookRequest = Request & { rawBody?: string };
+
+export const handlePaymentWebhook = async (req: WebhookRequest, res: Response) => {
 
   // Step 1: Verify webhook signature 
   const signature = (req.headers["x-korapay-signature"] ||
     req.headers["fincra-signature"] ||
     "") as string;
 
-  const rawBody = JSON.stringify(req.body);
+  const rawBody = req.rawBody || JSON.stringify(req.body);
   const isValid = paymentContainer.verifyWebhook(rawBody, signature);
 
   if (!isValid) {
@@ -37,6 +39,24 @@ export const handlePaymentWebhook = async (req: Request, res: Response) => {
   const { event, eventType, data, eventData } = req.body;
   const currentEvent = event || eventType;
   const payloadData = data || eventData;
+
+  const chargeReference =
+    payloadData?.reference || payloadData?.transactionReference;
+  const isFailedChargeEvent =
+    currentEvent === "charge.failed" ||
+    currentEvent === "charge.failure" ||
+    currentEvent === "transaction.failed";
+
+  if (isFailedChargeEvent && chargeReference) {
+    await prisma.paymentAttempt.updateMany({
+      where: { reference: chargeReference, status: { not: "SUCCESS" } },
+      data: {
+        status: "FAILED",
+        failureReason: payloadData?.message || payloadData?.reason || "Kora charge failed",
+      },
+    });
+    return res.status(200).json({ success: true, message: "Payment failure acknowledged." });
+  }
 
   // Check for payout / transfer events first
   const isPayoutEvent =
@@ -99,22 +119,27 @@ export const handlePaymentWebhook = async (req: Request, res: Response) => {
     });
   }
 
-  //  Step 3: Extract fields 
+  // Step 3: Extract fields 
   const txReference =
     payloadData?.reference || payloadData?.transactionReference;
   const studentEmail = payloadData?.customer?.email;
+  const accountRef =
+    payloadData?.account_reference ||
+    payloadData?.virtual_bank_account_details?.account_reference;
+  const vAccountNumber =
+    payloadData?.virtual_bank_account_details?.virtual_bank_account_number;
   const depositAmount = parseFloat(
     payloadData?.amount || payloadData?.amountPaid || "0"
   );
 
   if (
     !txReference ||
-    !studentEmail ||
+    (!studentEmail && !accountRef && !vAccountNumber) ||
     isNaN(depositAmount) ||
     depositAmount <= 0
   ) {
     logger.warn(
-      { txReference, studentEmail, depositAmount },
+      { txReference, studentEmail, accountRef, vAccountNumber, depositAmount },
       "webhook.invalid_payload — missing required fields"
     );
     return res.status(400).json({
@@ -123,11 +148,21 @@ export const handlePaymentWebhook = async (req: Request, res: Response) => {
     });
   }
 
-  const log = logger.child({ txReference, studentEmail, depositAmount });
+  const paymentAttempt = await prisma.paymentAttempt.findUnique({
+    where: { reference: txReference },
+    select: { userId: true, amount: true, status: true },
+  });
+
+  if (paymentAttempt && Number(paymentAttempt.amount) !== depositAmount) {
+    logger.warn({ txReference }, "webhook.amount_mismatch");
+    return res.status(400).json({ success: false, message: "Payment amount mismatch." });
+  }
+
+  const log = logger.child({ txReference, studentEmail, accountRef, depositAmount });
 
   //  Step 4: Idempotency check (Redis hot path + persistent DB verification).
   // Redis is the ephemeral dedupe layer; the final source of truth remains the database.
-  let redisDuplicate = false;
+  let redisDuplicate: boolean;
   try {
     const redis = getRedisClient();
     const dedupeKey = cacheKeys.webhookDedup(txReference);
@@ -150,11 +185,37 @@ export const handlePaymentWebhook = async (req: Request, res: Response) => {
     });
   }
 
-  //  Step 5: Resolve student from email 
-  const user = await prisma.user.findUnique({
-    where: { email: studentEmail.toLowerCase() },
-    select: { matricNumber: true },
-  });
+  //  Step 5: Resolve student from email or virtual account reference 
+  let user = paymentAttempt
+    ? await prisma.user.findUnique({
+        where: { id: paymentAttempt.userId },
+        select: { matricNumber: true },
+      })
+    : null;
+  if (studentEmail) {
+    user = await prisma.user.findUnique({
+      where: { email: studentEmail.toLowerCase() },
+      select: { matricNumber: true },
+    });
+  }
+
+  if (!user && accountRef && typeof accountRef === "string" && accountRef.startsWith("CTRANSIT-")) {
+    const matricFromRef = accountRef.replace("CTRANSIT-", "").trim();
+    user = await prisma.user.findUnique({
+      where: { matricNumber: matricFromRef },
+      select: { matricNumber: true },
+    });
+  }
+
+  if (!user && vAccountNumber) {
+    const wallet = await prisma.wallet.findFirst({
+      where: { v_account_number: String(vAccountNumber) },
+      select: { student_uid: true },
+    });
+    if (wallet) {
+      user = { matricNumber: wallet.student_uid };
+    }
+  }
 
   if (!user) {
     log.warn("webhook.student_not_found");
@@ -177,6 +238,17 @@ export const handlePaymentWebhook = async (req: Request, res: Response) => {
     }
 
     const { previousBalance, newBalance } = result;
+
+    if (paymentAttempt) {
+      await prisma.paymentAttempt.update({
+        where: { reference: txReference },
+        data: {
+          status: "SUCCESS",
+          completedAt: new Date(),
+          providerReference: txReference,
+        },
+      });
+    }
 
     //  Step 7: Mark as processed 
     processedTransactions.add(txReference);

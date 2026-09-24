@@ -16,6 +16,7 @@ import {
   updateDisputeStatusHandler,
   sendNotificationHandler,
   syncWhitelistHandler,
+  unlinkCardAdminHandler,
 } from "../controller/admin.controller.js";
 
 const router = Router();
@@ -34,5 +35,6 @@ router.get("/disputes/:id", getDisputeByIdHandler);
 router.patch("/disputes/:id/status", updateDisputeStatusHandler);
 router.post("/notifications", sendNotificationHandler);
 router.post("/sync/whitelist", syncWhitelistHandler);
+router.post("/card/unlink", unlinkCardAdminHandler);
 
 export default router;

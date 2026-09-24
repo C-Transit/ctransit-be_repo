@@ -4,6 +4,7 @@ import {
   PayoutResponse,
   PayoutStatusQuery,
   VirtualAccountResponse,
+  BankAccountResolution,
 } from "./payment.interface.js";
 
 export class MockProvider implements IPaymentGateway {
@@ -21,6 +22,23 @@ export class MockProvider implements IPaymentGateway {
       accountNumber: fakeAccountNumber,
       bankName: "CTransit Simulation Bank",
       reference,
+    };
+  }
+
+  async resolveBankAccount(
+    bankCode: string,
+    accountNumber: string
+  ): Promise<BankAccountResolution> {
+    const cleanAccount = accountNumber ? accountNumber.trim() : "";
+    if (!/^\d{10}$/.test(cleanAccount) || cleanAccount === "0000000000") {
+      throw new Error("Invalid bank account number");
+    }
+
+    return {
+      accountName: "MOCK VERIFIED ACCOUNT HOLDER",
+      accountNumber: cleanAccount,
+      bankCode: bankCode || "058",
+      bankName: "Mock Test Bank",
     };
   }
 

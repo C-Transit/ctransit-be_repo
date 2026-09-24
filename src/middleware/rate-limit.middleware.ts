@@ -1,15 +1,7 @@
-// To adjust any limit: edit env.ts → rateLimit section only.
-// No code changes needed here.
-
+// To adjust any limit: edit env.ts - rateLimit section only.
 import rateLimit from "express-rate-limit";
 import env from "../config/env.js";
 
-// Factory so every limiter gets consistent error
-// shape and logging-friendly headers.
-
-// standardHeaders: true  → sends RateLimit-* headers (RFC 6585)
-// legacyHeaders: false   → suppresses deprecated X-RateLimit-* headers
-// ─
 const buildLimiter = (windowMs: number, max: number, message: string) =>
   rateLimit({
     windowMs,
@@ -17,10 +9,6 @@ const buildLimiter = (windowMs: number, max: number, message: string) =>
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: message },
-    
-    // keyGenerator defaults to req.ip — suitable for CTransit's scale.
-    // If you add a reverse proxy later, set app.set('trust proxy', 1)
-    // in app.ts so req.ip resolves the real client IP from X-Forwarded-For.
   });
 
 const { rateLimit: rl } = env;
@@ -91,9 +79,25 @@ export const notificationLimiter = buildLimiter(
   "Too many notification requests. Please try again in 15 minutes."
 );
 
-//  Global fallback 
-// Applied in app.ts before all routes.
-// Specific limiters above override this for sensitive endpoints.
+//  Driver PIN & Bank Verification
+export const driverPinLimiter = buildLimiter(
+  15 * 60 * 1000,
+  10,
+  "Too many PIN configuration attempts. Please try again in 15 minutes."
+);
+
+export const driverCardLinkLimiter = buildLimiter(
+  15 * 60 * 1000,
+  10,
+  "Too many card-link attempts. Please try again in 15 minutes."
+);
+
+export const bankVerifyLimiter = buildLimiter(
+  15 * 60 * 1000,
+  15,
+  "Too many bank verification requests. Please try again in 15 minutes."
+);
+
 export const globalLimiter = buildLimiter(
   rl.global.windowMs,
   rl.global.max,
