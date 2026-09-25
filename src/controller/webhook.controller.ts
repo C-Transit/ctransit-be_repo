@@ -5,11 +5,7 @@ import {
   creditWallet,
   hasCrossedAboveThreshold,
 } from "../services/ledger.service.js";
-import {
-  getRedisClient,
-  cacheKeys,
-  WEBHOOK_DEDUPE_TTL,
-} from "../config/redis.js";
+import { getRedisClient, cacheKeys, WEBHOOK_DEDUPE_TTL } from "../config/redis.js";
 import { enqueueBroadcast } from "../utils/bridge.js";
 import { buildDeltaCommand } from "../utils/parser.js";
 import { sendNotification } from "../services/notification.service.js";
@@ -25,19 +21,17 @@ type WebhookRequest = Request & { rawBody?: string };
 /**
  * Build the list of payload candidates that KORA might be signing.
  *
- * KORA's documentation is inconsistent:
- *   - Some pages: "HMAC-SHA256 of ONLY the `data` object"
- *   - Others / older integrations: "HMAC-SHA256 of the full request body"
+ * Empirical finding (2026-09-25): KORA signs ONLY the `data` object
+ * with HMAC-SHA256 — NOT the full body. Confirmed by matching a real
+ * webhook signature against the computed hash.
  *
- * Rather than guess, we compute all plausible candidates and accept if
- * any of them matches the received signature. This is safe because the
- * signature is still cryptographically verified — we're only loosening
- * WHICH bytes we hash, not whether we hash at all.
+ * We keep the full-body and raw-body candidates as defensive fallbacks
+ * in case KORA changes their behavior or a different provider is wired in.
  */
 function buildSignatureCandidates(req: WebhookRequest): string[] {
   const candidates: string[] = [];
 
-  // 1. data-object only (newer KORA docs)
+  // 1. data-object only (KORA — confirmed working)
   if (req.body && typeof req.body === "object" && req.body.data !== undefined) {
     try {
       candidates.push(JSON.stringify(req.body.data));
@@ -46,7 +40,7 @@ function buildSignatureCandidates(req: WebhookRequest): string[] {
     }
   }
 
-  // 2. full parsed body re-serialized (older KORA docs / most providers)
+  // 2. full parsed body re-serialized (fallback for other providers)
   if (req.body && typeof req.body === "object") {
     try {
       candidates.push(JSON.stringify(req.body));
@@ -55,19 +49,15 @@ function buildSignatureCandidates(req: WebhookRequest): string[] {
     }
   }
 
-  // 3. raw body bytes as received (most reliable when available)
+  // 3. raw body bytes (most reliable when raw-body capture is wired up)
   if (typeof req.rawBody === "string" && req.rawBody.length > 0) {
     candidates.push(req.rawBody);
   }
 
-  // Deduplicate while preserving order
   return Array.from(new Set(candidates));
 }
 
-export const handlePaymentWebhook = async (
-  req: WebhookRequest,
-  res: Response
-) => {
+export const handlePaymentWebhook = async (req: WebhookRequest, res: Response) => {
   // ─────────────────────────────────────────────
   // Step 1: Verify webhook signature
   // ─────────────────────────────────────────────
@@ -107,7 +97,6 @@ export const handlePaymentWebhook = async (
       {
         signaturePrefix: signature ? signature.slice(0, 16) : "(empty)",
         candidateCount: candidates.length,
-        candidatePreviews: candidates.map((c) => c.slice(0, 80)),
       },
       "webhook.invalid_signature — rejecting"
     );
@@ -173,9 +162,7 @@ export const handlePaymentWebhook = async (
         ? parseFloat(payloadData.amount.toString())
         : undefined;
     const pReason =
-      payloadData?.reason ||
-      payloadData?.message ||
-      payloadData?.failure_reason;
+      payloadData?.reason || payloadData?.message || payloadData?.failure_reason;
 
     const result = await handleDriverPayoutWebhook({
       reference: pReference,
@@ -223,15 +210,12 @@ export const handlePaymentWebhook = async (
     payloadData?.amount || payloadData?.amountPaid || "0"
   );
 
-  if (
-    !txReference ||
-    (!studentEmail && !accountRef && !vAccountNumber) ||
-    isNaN(depositAmount) ||
-    depositAmount <= 0
-  ) {
+  // Minimal hard requirements: we need a reference and a valid amount.
+  // Everything else can be resolved below.
+  if (!txReference || isNaN(depositAmount) || depositAmount <= 0) {
     logger.warn(
       { txReference, studentEmail, accountRef, vAccountNumber, depositAmount },
-      "webhook.invalid_payload — missing required fields"
+      "webhook.invalid_payload — missing reference or amount"
     );
     return res.status(400).json({
       success: false,
@@ -239,13 +223,41 @@ export const handlePaymentWebhook = async (
     });
   }
 
+  // Look up the payment attempt FIRST. This is the primary way we link a
+  // checkout-session webhook back to a user — the reference we generated
+  // at /initialize time is the key.
   const paymentAttempt = await prisma.paymentAttempt.findUnique({
     where: { reference: txReference },
     select: { userId: true, amount: true, status: true },
   });
 
+  // Now we can decide if we have any path to resolve the student.
+  const canResolveUser =
+    !!paymentAttempt ||
+    !!studentEmail ||
+    !!accountRef ||
+    !!vAccountNumber;
+
+  if (!canResolveUser) {
+    logger.warn(
+      { txReference, studentEmail, accountRef, vAccountNumber, depositAmount },
+      "webhook.invalid_payload — no resolution path to a user"
+    );
+    return res.status(400).json({
+      success: false,
+      message: "Invalid webhook payload.",
+    });
+  }
+
   if (paymentAttempt && Number(paymentAttempt.amount) !== depositAmount) {
-    logger.warn({ txReference }, "webhook.amount_mismatch");
+    logger.warn(
+      {
+        txReference,
+        expectedAmount: Number(paymentAttempt.amount),
+        receivedAmount: depositAmount,
+      },
+      "webhook.amount_mismatch"
+    );
     return res
       .status(400)
       .json({ success: false, message: "Payment amount mismatch." });
@@ -291,7 +303,7 @@ export const handlePaymentWebhook = async (
   }
 
   // ─────────────────────────────────────────────
-  // Step 5: Resolve student from email or virtual account reference
+  // Step 5: Resolve student from paymentAttempt, email, or virtual account ref
   // ─────────────────────────────────────────────
   let user = paymentAttempt
     ? await prisma.user.findUnique({
@@ -299,7 +311,8 @@ export const handlePaymentWebhook = async (
         select: { matricNumber: true },
       })
     : null;
-  if (studentEmail) {
+
+  if (!user && studentEmail) {
     user = await prisma.user.findUnique({
       where: { email: studentEmail.toLowerCase() },
       select: { matricNumber: true },
