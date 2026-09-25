@@ -76,6 +76,7 @@ export const handlePaymentWebhook = async (
       },
       "webhook.invalid_signature — rejecting"
     );
+    logger.info({ headers: req.headers }, "webhook.debug_all_headers");
     return res.status(401).json({
       success: false,
       message: "Cryptographic signature validation failed.",
