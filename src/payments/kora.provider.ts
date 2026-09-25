@@ -23,7 +23,10 @@ export class KoraProvider implements IPaymentGateway {
 
   constructor(secretKey: string, baseUrl?: string) {
     this.secretKey = secretKey;
-    this.baseUrl = baseUrl || process.env.KORA_BASE_URL || "https://api.korapay.com/merchant";
+    this.baseUrl =
+      baseUrl ||
+      process.env.KORA_BASE_URL ||
+      "https://api.korapay.com/merchant";
   }
 
   async initializeCheckout(
@@ -50,8 +53,32 @@ export class KoraProvider implements IPaymentGateway {
 
     const body = await response.json().catch(() => null);
     const checkoutUrl = body?.data?.checkout_url;
-    if (!response.ok || body?.status !== true || typeof checkoutUrl !== "string") {
-      throw new Error(body?.message || `Kora checkout initialization failed (HTTP ${response.status})`);
+    if (
+      !response.ok ||
+      body?.status !== true ||
+      typeof checkoutUrl !== "string"
+    ) {
+      const detail = body?.errors
+        ? ` [${body.errors.attribute ?? "unknown_field"}: ${
+            body.errors.message ?? "no detail"
+          }]`
+        : "";
+      logger.error(
+        { koraResponse: body, statusCode: response.status },
+        "kora.checkout_validation_failed"
+      );
+
+      // Preserve KORA's actual HTTP status on the thrown error so the
+      // upstream error handler can respond with 4xx for client errors
+      // (422, 400, 401) instead of a misleading 502.
+      const err = new Error(
+        (body?.message ||
+          `Kora checkout initialization failed (HTTP ${response.status})`) +
+          detail
+      ) as Error & { statusCode?: number; koraBody?: unknown };
+      err.statusCode = response.status;
+      err.koraBody = body;
+      throw err;
     }
 
     return {
@@ -101,7 +128,10 @@ export class KoraProvider implements IPaymentGateway {
         const errorMsg =
           responseBody?.message ||
           `Kora virtual account creation failed (HTTP ${response.status})`;
-        logger.error({ reference, error: errorMsg }, "kora.virtual_account_failed");
+        logger.error(
+          { reference, error: errorMsg },
+          "kora.virtual_account_failed"
+        );
         throw new Error(errorMsg);
       }
 
@@ -115,7 +145,9 @@ export class KoraProvider implements IPaymentGateway {
           { reference },
           "kora.virtual_account_missing_account_number"
         );
-        throw new Error("Kora returned virtual account response without account number");
+        throw new Error(
+          "Kora returned virtual account response without account number"
+        );
       }
 
       logger.info(
@@ -134,7 +166,10 @@ export class KoraProvider implements IPaymentGateway {
       };
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      logger.error({ reference, err: errMsg }, "kora.virtual_account_exception");
+      logger.error(
+        { reference, err: errMsg },
+        "kora.virtual_account_exception"
+      );
       throw err;
     }
   }
@@ -174,7 +209,11 @@ export class KoraProvider implements IPaymentGateway {
           responseBody?.message ||
           `Bank account resolution failed (HTTP ${response.status})`;
         logger.warn(
-          { bankCode, accountNumber: maskAccountNumber(accountNumber), error: errorMsg },
+          {
+            bankCode,
+            accountNumber: maskAccountNumber(accountNumber),
+            error: errorMsg,
+          },
           "kora.bank_account_resolution_rejected"
         );
         throw new Error(errorMsg);
@@ -201,21 +240,35 @@ export class KoraProvider implements IPaymentGateway {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.warn(
-        { bankCode, accountNumber: maskAccountNumber(accountNumber), err: errMsg },
+        {
+          bankCode,
+          accountNumber: maskAccountNumber(accountNumber),
+          err: errMsg,
+        },
         "kora.bank_account_resolution_error"
       );
       throw err;
     }
   }
 
+  /**
+   * Verify KORA webhook signature.
+   *
+   * KORA signs ONLY the `data` object of the webhook payload using
+   * HMAC-SHA256 with the merchant's secret key. The signature is sent
+   * in the `x-korapay-signature` header.
+   *
+   * Note: the caller (webhook.controller.ts) is responsible for passing
+   * `JSON.stringify(body.data)` as `rawBody` — NOT the full request body.
+   */
   verifyWebhook(rawBody: string, signature: string): boolean {
-    if (!signature || !this.secretKey) {
+    if (!signature || !this.secretKey || !rawBody) {
       return false;
     }
 
     try {
       const expectedSignature = crypto
-        .createHmac("sha512", this.secretKey)
+        .createHmac("sha256", this.secretKey) // KORA uses SHA-256
         .update(rawBody)
         .digest("hex");
 
@@ -223,11 +276,22 @@ export class KoraProvider implements IPaymentGateway {
       const expectedBuffer = Buffer.from(expectedSignature);
 
       if (sigBuffer.length !== expectedBuffer.length) {
+        logger.warn(
+          {
+            receivedLength: sigBuffer.length,
+            expectedLength: expectedBuffer.length,
+          },
+          "kora.webhook_signature_length_mismatch"
+        );
         return false;
       }
 
       return crypto.timingSafeEqual(sigBuffer, expectedBuffer);
-    } catch {
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        "kora.webhook_signature_compute_failed"
+      );
       return false;
     }
   }
@@ -285,7 +349,8 @@ export class KoraProvider implements IPaymentGateway {
       if (!response.ok || !responseBody || responseBody.status === false) {
         // 4xx or business error from Kora
         const failureMsg =
-          responseBody?.message || `Kora payout rejected (HTTP ${response.status})`;
+          responseBody?.message ||
+          `Kora payout rejected (HTTP ${response.status})`;
         logger.warn(
           { reference: params.reference, error: failureMsg },
           "kora.payout_rejected"
@@ -305,8 +370,8 @@ export class KoraProvider implements IPaymentGateway {
         rawStatus === "success"
           ? "success"
           : rawStatus === "failed"
-            ? "failed"
-            : "processing";
+          ? "failed"
+          : "processing";
 
       const koraFee =
         data.fee !== undefined ? parseFloat(data.fee.toString()) : undefined;
@@ -339,7 +404,11 @@ export class KoraProvider implements IPaymentGateway {
           err.message.includes("timeout"));
 
       logger.warn(
-        { reference: params.reference, isTimeout, err: err instanceof Error ? err.message : String(err) },
+        {
+          reference: params.reference,
+          isTimeout,
+          err: err instanceof Error ? err.message : String(err),
+        },
         "kora.payout_request_error — verifying payout status"
       );
 
@@ -348,7 +417,9 @@ export class KoraProvider implements IPaymentGateway {
   }
 
   async verifyPayout(reference: string): Promise<PayoutStatusQuery> {
-    const endpoint = `${this.baseUrl}/api/v1/transactions/${encodeURIComponent(reference)}`;
+    const endpoint = `${this.baseUrl}/api/v1/transactions/${encodeURIComponent(
+      reference
+    )}`;
 
     try {
       const response = await fetch(endpoint, {
@@ -398,7 +469,9 @@ export class KoraProvider implements IPaymentGateway {
       const fee =
         data.fee !== undefined ? parseFloat(data.fee.toString()) : undefined;
       const amount =
-        data.amount !== undefined ? parseFloat(data.amount.toString()) : undefined;
+        data.amount !== undefined
+          ? parseFloat(data.amount.toString())
+          : undefined;
 
       return {
         status: mappedStatus,
@@ -416,12 +489,15 @@ export class KoraProvider implements IPaymentGateway {
       return {
         status: "unknown",
         reference,
-        message: err instanceof Error ? err.message : "Verification request failed",
+        message:
+          err instanceof Error ? err.message : "Verification request failed",
       };
     }
   }
 
-  private async verifyAndResolvePayout(reference: string): Promise<PayoutResponse> {
+  private async verifyAndResolvePayout(
+    reference: string
+  ): Promise<PayoutResponse> {
     const query = await this.verifyPayout(reference);
 
     if (query.status === "success") {
@@ -442,7 +518,9 @@ export class KoraProvider implements IPaymentGateway {
         reference,
         koraReference: query.koraReference,
         fee: query.fee,
-        message: query.message || "Payout verified as FAILED following initial timeout",
+        message:
+          query.message ||
+          "Payout verified as FAILED following initial timeout",
       };
     }
 

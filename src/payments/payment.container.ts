@@ -35,6 +35,10 @@ switch (PROVIDER) {
     }
     paymentContainer = new KoraProvider(SECRET_KEY);
     logger.info("payment.provider_loaded — KORA");
+    logger.info(
+  { keyPrefix: SECRET_KEY.slice(0, 8), keyLength: SECRET_KEY.length },
+  "payment.kora_key_debug"
+);
     break;
   case "FINCRA":
     if (!SECRET_KEY) {
