@@ -1,18 +1,20 @@
 import type { Request, Response } from "express";
-import crypto from "crypto";
 import { paymentContainer } from "../payments/payment.container.js";
 import {
   creditWallet,
   hasCrossedAboveThreshold,
 } from "../services/ledger.service.js";
-import { getRedisClient, cacheKeys, WEBHOOK_DEDUPE_TTL } from "../config/redis.js";
+import {
+  getRedisClient,
+  cacheKeys,
+  WEBHOOK_DEDUPE_TTL,
+} from "../config/redis.js";
 import { enqueueBroadcast } from "../utils/bridge.js";
 import { buildDeltaCommand } from "../utils/parser.js";
 import { sendNotification } from "../services/notification.service.js";
 import { handleDriverPayoutWebhook } from "../services/driver.service.js";
 import prisma from "../lib/prisma.js";
 import logger from "../config/logger.js";
-import env from "../config/env.js";
 
 const processedTransactions = new Set<string>();
 
@@ -21,12 +23,10 @@ type WebhookRequest = Request & { rawBody?: string };
 /**
  * Build the list of payload candidates that KORA might be signing.
  *
- * Empirical finding (2026-09-25): KORA signs ONLY the `data` object
- * with HMAC-SHA256 — NOT the full body. Confirmed by matching a real
- * webhook signature against the computed hash.
- *
- * We keep the full-body and raw-body candidates as defensive fallbacks
- * in case KORA changes their behavior or a different provider is wired in.
+ * Empirically confirmed (2026-09-25): KORA signs ONLY the `data` object
+ * with HMAC-SHA256 — NOT the full request body. We still compute the
+ * full-body and raw-body candidates as defensive fallbacks in case
+ * KORA changes their signing behavior or a different provider is wired in.
  */
 function buildSignatureCandidates(req: WebhookRequest): string[] {
   const candidates: string[] = [];
@@ -57,7 +57,10 @@ function buildSignatureCandidates(req: WebhookRequest): string[] {
   return Array.from(new Set(candidates));
 }
 
-export const handlePaymentWebhook = async (req: WebhookRequest, res: Response) => {
+export const handlePaymentWebhook = async (
+  req: WebhookRequest,
+  res: Response
+) => {
   // ─────────────────────────────────────────────
   // Step 1: Verify webhook signature
   // ─────────────────────────────────────────────
@@ -69,28 +72,6 @@ export const handlePaymentWebhook = async (req: WebhookRequest, res: Response) =
   const isValid = candidates.some((c) =>
     paymentContainer.verifyWebhook(c, signature)
   );
-
-  // Temporary debug — enable with WEBHOOK_DEBUG=true in env
-  if (process.env.WEBHOOK_DEBUG === "true") {
-    const secret = env.payment.secretKey || "";
-    logger.info(
-      {
-        receivedSig: signature ? signature.slice(0, 16) : "(empty)",
-        secretPrefix: secret ? secret.slice(0, 8) : "(missing)",
-        secretLength: secret.length,
-        candidates: candidates.map((c) => ({
-          length: c.length,
-          preview: c.slice(0, 60),
-          sha256: crypto
-            .createHmac("sha256", secret)
-            .update(c)
-            .digest("hex")
-            .slice(0, 16),
-        })),
-      },
-      "webhook.debug_hash_candidates"
-    );
-  }
 
   if (!isValid) {
     logger.warn(
@@ -162,7 +143,9 @@ export const handlePaymentWebhook = async (req: WebhookRequest, res: Response) =
         ? parseFloat(payloadData.amount.toString())
         : undefined;
     const pReason =
-      payloadData?.reason || payloadData?.message || payloadData?.failure_reason;
+      payloadData?.reason ||
+      payloadData?.message ||
+      payloadData?.failure_reason;
 
     const result = await handleDriverPayoutWebhook({
       reference: pReference,
@@ -210,7 +193,7 @@ export const handlePaymentWebhook = async (req: WebhookRequest, res: Response) =
     payloadData?.amount || payloadData?.amountPaid || "0"
   );
 
-  // Minimal hard requirements: we need a reference and a valid amount.
+  // Minimal hard requirements: reference + valid amount.
   // Everything else can be resolved below.
   if (!txReference || isNaN(depositAmount) || depositAmount <= 0) {
     logger.warn(
@@ -231,12 +214,9 @@ export const handlePaymentWebhook = async (req: WebhookRequest, res: Response) =
     select: { userId: true, amount: true, status: true },
   });
 
-  // Now we can decide if we have any path to resolve the student.
+  // Now decide if we have any path to resolve the student.
   const canResolveUser =
-    !!paymentAttempt ||
-    !!studentEmail ||
-    !!accountRef ||
-    !!vAccountNumber;
+    !!paymentAttempt || !!studentEmail || !!accountRef || !!vAccountNumber;
 
   if (!canResolveUser) {
     logger.warn(
@@ -351,7 +331,7 @@ export const handlePaymentWebhook = async (req: WebhookRequest, res: Response) =
   }
 
   // ─────────────────────────────────────────────
-  // Step 6: Credit wallet with explicit transaction reference for atomic idempotency
+  // Step 6: Credit wallet
   // ─────────────────────────────────────────────
   try {
     const result = await creditWallet(
@@ -386,7 +366,7 @@ export const handlePaymentWebhook = async (req: WebhookRequest, res: Response) =
 
     log.info({ previousBalance, newBalance }, "webhook.wallet_credited");
 
-    // Step 8: Send notification to student
+    // Step 8: Notify student
     sendNotification(
       user.matricNumber,
       "Wallet Top-Up Successful",
@@ -398,14 +378,8 @@ export const handlePaymentWebhook = async (req: WebhookRequest, res: Response) =
       log.warn({ err: errMsg }, "webhook.notification_failed — non-fatal");
     });
 
-    logger.info(
-      { previousBalance, newBalance, threshold: env.ledger.baseFare },
-      "payment.mock_topup_balance_check"
-    );
-
     // Step 9: Remove from blacklist if threshold crossed
     if (hasCrossedAboveThreshold(previousBalance, newBalance)) {
-      // 1. Get the student's card UID
       const cardMap = await prisma.cardMapping.findUnique({
         where: { student_uid: user.matricNumber },
         select: { card_uid: true },
@@ -422,12 +396,10 @@ export const handlePaymentWebhook = async (req: WebhookRequest, res: Response) =
         );
       }
 
-      // 2. Remove from blacklist DB
       await prisma.blacklist.deleteMany({
         where: { student_uid: user.matricNumber },
       });
 
-      // 3. Notify student
       sendNotification(
         user.matricNumber,
         "Ride Access Restored",
