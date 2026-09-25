@@ -1,4 +1,5 @@
 import type { Request, Response } from "express";
+import crypto from "crypto";
 import { paymentContainer } from "../payments/payment.container.js";
 import {
   creditWallet,
@@ -22,36 +23,45 @@ const processedTransactions = new Set<string>();
 type WebhookRequest = Request & { rawBody?: string };
 
 /**
- * Extract the exact string KORA signed.
+ * Build the list of payload candidates that KORA might be signing.
  *
- * KORA signs ONLY the `data` object with HMAC-SHA256, not the full body.
- * We re-serialize `req.body.data` with JSON.stringify, which preserves key
- * order from the original JSON.parse — so the resulting string matches the
- * bytes KORA signed, as long as nothing mutated the object in between.
+ * KORA's documentation is inconsistent:
+ *   - Some pages: "HMAC-SHA256 of ONLY the `data` object"
+ *   - Others / older integrations: "HMAC-SHA256 of the full request body"
  *
- * If raw body capture middleware is wired up, we prefer that path: it
- * extracts the substring of the raw body corresponding to `data`, which is
- * immune to any re-serialization drift.
+ * Rather than guess, we compute all plausible candidates and accept if
+ * any of them matches the received signature. This is safe because the
+ * signature is still cryptographically verified — we're only loosening
+ * WHICH bytes we hash, not whether we hash at all.
  */
-function extractDataPayload(req: WebhookRequest): string {
-  const raw = req.rawBody;
-  if (typeof raw === "string" && raw.length > 0) {
+function buildSignatureCandidates(req: WebhookRequest): string[] {
+  const candidates: string[] = [];
+
+  // 1. data-object only (newer KORA docs)
+  if (req.body && typeof req.body === "object" && req.body.data !== undefined) {
     try {
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object" && "data" in parsed) {
-        return JSON.stringify(parsed.data);
-      }
+      candidates.push(JSON.stringify(req.body.data));
     } catch {
-      // fall through to non-raw path
+      // ignore malformed
     }
   }
 
-  if (req.body && typeof req.body === "object" && "data" in req.body) {
-    return JSON.stringify(req.body.data);
+  // 2. full parsed body re-serialized (older KORA docs / most providers)
+  if (req.body && typeof req.body === "object") {
+    try {
+      candidates.push(JSON.stringify(req.body));
+    } catch {
+      // ignore
+    }
   }
 
-  // Last resort — hash the whole body (matches FINCRA-style providers).
-  return JSON.stringify(req.body);
+  // 3. raw body bytes as received (most reliable when available)
+  if (typeof req.rawBody === "string" && req.rawBody.length > 0) {
+    candidates.push(req.rawBody);
+  }
+
+  // Deduplicate while preserving order
+  return Array.from(new Set(candidates));
 }
 
 export const handlePaymentWebhook = async (
@@ -65,18 +75,42 @@ export const handlePaymentWebhook = async (
     req.headers["fincra-signature"] ||
     "") as string;
 
-  const dataToVerify = extractDataPayload(req);
-  const isValid = paymentContainer.verifyWebhook(dataToVerify, signature);
+  const candidates = buildSignatureCandidates(req);
+  const isValid = candidates.some((c) =>
+    paymentContainer.verifyWebhook(c, signature)
+  );
+
+  // Temporary debug — enable with WEBHOOK_DEBUG=true in env
+  if (process.env.WEBHOOK_DEBUG === "true") {
+    const secret = env.payment.secretKey || "";
+    logger.info(
+      {
+        receivedSig: signature ? signature.slice(0, 16) : "(empty)",
+        secretPrefix: secret ? secret.slice(0, 8) : "(missing)",
+        secretLength: secret.length,
+        candidates: candidates.map((c) => ({
+          length: c.length,
+          preview: c.slice(0, 60),
+          sha256: crypto
+            .createHmac("sha256", secret)
+            .update(c)
+            .digest("hex")
+            .slice(0, 16),
+        })),
+      },
+      "webhook.debug_hash_candidates"
+    );
+  }
 
   if (!isValid) {
     logger.warn(
       {
-        signaturePrefix: signature.slice(0, 16),
-        dataPreview: dataToVerify.slice(0, 160),
+        signaturePrefix: signature ? signature.slice(0, 16) : "(empty)",
+        candidateCount: candidates.length,
+        candidatePreviews: candidates.map((c) => c.slice(0, 80)),
       },
       "webhook.invalid_signature — rejecting"
     );
-    logger.info({ headers: req.headers }, "webhook.debug_all_headers");
     return res.status(401).json({
       success: false,
       message: "Cryptographic signature validation failed.",
