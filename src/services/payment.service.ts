@@ -1,9 +1,3 @@
-// src/services/payment.service.ts
-//
-// Business logic layer between the payment container and the route.
-// Controllers never call paymentContainer directly — they call this service.
-// Keeps the controller thin and the payment logic testable.
-
 import { randomUUID } from "node:crypto";
 import prisma from "../lib/prisma.js";
 import { paymentContainer } from "../payments/payment.container.js";
@@ -52,7 +46,7 @@ export async function initializeCheckoutForStudent(
     throw new Error("CHECKOUT_NOT_SUPPORTED");
   }
 
-  const reference = `CTRANSIT-TOPUP-${randomUUID()}`;
+  const reference = `CT-TOPUP-${randomUUID()}`;
   await prisma.paymentAttempt.create({
     data: {
       reference,

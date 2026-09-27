@@ -27,18 +27,24 @@ switch (PROVIDER) {
       );
     }
     paymentContainer = new MockProvider();
-    logger.warn("payment.provider_loaded — MOCK (explicitly enabled for testing)");
+    logger.warn(
+      "payment.provider_loaded — MOCK (explicitly enabled for testing)"
+    );
     break;
   case "KORA":
     if (!SECRET_KEY) {
-      throw new Error("FATAL: PAYMENT_SECRET_KEY is required when using KORA provider.");
+      throw new Error(
+        "FATAL: PAYMENT_SECRET_KEY is required when using KORA provider."
+      );
     }
     paymentContainer = new KoraProvider(SECRET_KEY);
     logger.info("payment.provider_loaded — KORA");
     break;
   case "FINCRA":
     if (!SECRET_KEY) {
-      throw new Error("FATAL: PAYMENT_SECRET_KEY is required when using FINCRA provider.");
+      throw new Error(
+        "FATAL: PAYMENT_SECRET_KEY is required when using FINCRA provider."
+      );
     }
     paymentContainer = new FincraProvider(SECRET_KEY);
     logger.info("payment.provider_loaded — FINCRA");
