@@ -57,20 +57,21 @@ export const loginAgentHandler = async (
       }
     }
 
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "agent.login_handler_error");
     return res.status(500).json({ error: "Login failed" });
   }
 };
 
-export const getPendingKycHandler = async (_req: CustomAuthRequest, res: Response) => {
+export const getPendingKycHandler = async (
+  _req: CustomAuthRequest,
+  res: Response
+) => {
   try {
     const queue = await getPendingKyc();
     return res.status(200).json({ success: true, queue });
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "agent.route_get_pending_kyc_error");
     return res.status(500).json({ error: "Failed to fetch KYC queue" });
   }
@@ -93,8 +94,7 @@ export const approveAgentKycHandler = async (
     if (error instanceof Error && error.message === "User not found") {
       return res.status(404).json({ error: "Student not found" });
     }
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage, userId }, "agent.route_kyc_approve_error");
     return res.status(500).json({ error: "Failed to approve KYC" });
   }
@@ -122,20 +122,21 @@ export const rejectAgentKycHandler = async (
     );
     return res.status(200).json({ success: true, kyc });
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage, userId }, "agent.route_kyc_reject_error");
     return res.status(500).json({ error: "Failed to reject KYC" });
   }
 };
 
-export const listDriversHandler = async (_req: CustomAuthRequest, res: Response) => {
+export const listDriversHandler = async (
+  _req: CustomAuthRequest,
+  res: Response
+) => {
   try {
     const drivers = await listDrivers();
     return res.status(200).json({ success: true, drivers });
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "agent.route_list_drivers_error");
     return res.status(500).json({ error: "Failed to fetch drivers" });
   }
@@ -143,23 +144,45 @@ export const listDriversHandler = async (_req: CustomAuthRequest, res: Response)
 
 export const registerDriverHandler = async (
   req: CustomAuthRequest & {
-    body: { firstname: string; lastname: string; matricNumber: string };
+    body: {
+      firstname: string;
+      lastname: string;
+      phone: string;
+      pin: string;
+      otp: string;
+      bankCode: string;
+      accountNumber: string;
+    };
   },
   res: Response
 ) => {
-  const { firstname, lastname, matricNumber } = req.body;
+  const { firstname, lastname, phone, pin, otp, bankCode, accountNumber } =
+    req.body;
 
-  if (!firstname || !lastname || !matricNumber) {
-    return res
-      .status(400)
-      .json({ error: "firstname, lastname, and matricNumber are required" });
+  if (
+    !firstname ||
+    !lastname ||
+    !phone ||
+    !pin ||
+    !otp ||
+    !bankCode ||
+    !accountNumber
+  ) {
+    return res.status(400).json({
+      error:
+        "firstname, lastname, phone, pin, otp, bankCode, and accountNumber are all required",
+    });
   }
 
   try {
     const driver = await registerDriverByAgent({
       firstname,
       lastname,
-      matricNumber,
+      phone,
+      pin,
+      otp,
+      bankCode,
+      accountNumber,
     });
     logger.info(
       { matricNumber: driver.matricNumber, agentId: req.user!.userId },
@@ -168,31 +191,77 @@ export const registerDriverHandler = async (
     return res.status(201).json({ success: true, driver });
   } catch (error) {
     if (error instanceof Error) {
-      if (error.message === "DRIVER_ALREADY_EXISTS") {
-        return res
-          .status(409)
-          .json({ error: "A driver with this matric number already exists" });
-      }
-      if (error.message === "MATRIC_NUMBER_IN_USE") {
-        return res.status(409).json({
-          error: "Matric number is already registered to another user",
-        });
+      const knownErrors: Record<string, { status: number; message: string }> = {
+        MISSING_NAME: {
+          status: 400,
+          message: "Firstname and lastname are required",
+        },
+        INVALID_PHONE: { status: 400, message: "Phone number is invalid" },
+        INVALID_PIN_FORMAT: {
+          status: 400,
+          message: "PIN must be exactly 4 digits",
+        },
+        INVALID_OTP_FORMAT: {
+          status: 400,
+          message: "OTP must be exactly 6 digits",
+        },
+        MISSING_BANK_CODE: { status: 400, message: "Bank code is required" },
+        INVALID_ACCOUNT_NUMBER: {
+          status: 400,
+          message: "Account number must be 10 digits",
+        },
+        PHONE_ALREADY_IN_USE: {
+          status: 409,
+          message: "This phone number is already registered",
+        },
+        INVALID_OTP: { status: 400, message: "OTP is invalid or unrecognized" },
+        OTP_ALREADY_USED: {
+          status: 409,
+          message: "This OTP has already been used",
+        },
+        OTP_EXPIRED: {
+          status: 410,
+          message:
+            "This OTP has expired — ask the driver to tap the card again",
+        },
+        MISSING_TERMINAL_CONTEXT: {
+          status: 400,
+          message: "OTP is missing terminal context",
+        },
+        CARD_ALREADY_LINKED: {
+          status: 409,
+          message: "This card is already linked to another user",
+        },
+        BANK_VERIFICATION_NOT_SUPPORTED: {
+          status: 503,
+          message: "Bank verification is currently unavailable",
+        },
+        DRIVER_UID_GENERATION_FAILED: {
+          status: 500,
+          message: "Failed to generate a driver ID — please try again",
+        },
+      };
+
+      const known = knownErrors[error.message];
+      if (known) {
+        return res.status(known.status).json({ error: known.message });
       }
     }
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "agent.route_register_driver_error");
     return res.status(500).json({ error: "Failed to register driver" });
   }
 };
 
-export const listTerminalsHandler = async (_req: CustomAuthRequest, res: Response) => {
+export const listTerminalsHandler = async (
+  _req: CustomAuthRequest,
+  res: Response
+) => {
   try {
     const terminals = await listTerminals();
     return res.status(200).json({ success: true, terminals });
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "agent.route_list_terminals_error");
     return res.status(500).json({ error: "Failed to fetch terminals" });
   }
@@ -221,14 +290,16 @@ export const linkCardHandler = async (
 
     return res.status(400).json(result);
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage, studentId }, "agent.route_card_link_error");
     return res.status(500).json({ error: "Card linking failed" });
   }
 };
 
-export const listUsersHandler = async (req: CustomAuthRequest, res: Response) => {
+export const listUsersHandler = async (
+  req: CustomAuthRequest,
+  res: Response
+) => {
   const rawVerified = qs(req.query.isVerified);
   const page = Math.max(1, parseInt(qs(req.query.page) ?? "1") || 1);
   const limit = Math.min(
@@ -270,8 +341,7 @@ export const getStudentTransactionsHandler = async (
     if (error instanceof Error && error.message === "STUDENT_NOT_FOUND") {
       return res.status(404).json({ error: "Student not found" });
     }
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error(
       { err: errMessage, matricNumber },
       "agent.route_student_transactions_error"
@@ -286,7 +356,9 @@ export const unlinkCardAgentHandler = async (
 ) => {
   try {
     if (!req.user || (req.user.role !== "AGENT" && req.user.role !== "ADMIN")) {
-      return res.status(403).json({ success: false, message: "Agent access required" });
+      return res
+        .status(403)
+        .json({ success: false, message: "Agent access required" });
     }
 
     const { cardUid, userIdentifier } = req.body;
@@ -299,7 +371,9 @@ export const unlinkCardAgentHandler = async (
 
     const result = await unlinkCard({
       cardUid: cardUid ? String(cardUid).trim() : undefined,
-      userIdentifier: userIdentifier ? String(userIdentifier).trim() : undefined,
+      userIdentifier: userIdentifier
+        ? String(userIdentifier).trim()
+        : undefined,
       callerId: req.user.userId,
       callerRole: req.user.role,
     });
@@ -309,16 +383,32 @@ export const unlinkCardAgentHandler = async (
     if (error instanceof Error) {
       switch (error.message) {
         case "CARD_NOT_FOUND":
-          return res.status(404).json({ success: false, message: "Card mapping not found" });
+          return res
+            .status(404)
+            .json({ success: false, message: "Card mapping not found" });
         case "USER_NOT_FOUND":
-          return res.status(404).json({ success: false, message: "User not found" });
+          return res
+            .status(404)
+            .json({ success: false, message: "User not found" });
         case "CARD_ALREADY_UNLINKED":
-          return res.status(400).json({ success: false, message: "No active card is linked to this user" });
+          return res
+            .status(400)
+            .json({
+              success: false,
+              message: "No active card is linked to this user",
+            });
         case "CARD_USER_MISMATCH":
         case "CARD_BELONGS_TO_ANOTHER_USER":
-          return res.status(400).json({ success: false, message: "Card does not belong to the specified user" });
+          return res
+            .status(400)
+            .json({
+              success: false,
+              message: "Card does not belong to the specified user",
+            });
         case "UNAUTHORIZED_CALLER":
-          return res.status(403).json({ success: false, message: "Unauthorized to unlink card" });
+          return res
+            .status(403)
+            .json({ success: false, message: "Unauthorized to unlink card" });
       }
     }
 
@@ -327,4 +417,3 @@ export const unlinkCardAgentHandler = async (
     return res.status(500).json({ success: false, message: "Server error" });
   }
 };
-

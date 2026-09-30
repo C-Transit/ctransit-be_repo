@@ -1,5 +1,6 @@
 "use strict";
 
+import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import { prisma } from "./ledger.service.js";
@@ -9,7 +10,10 @@ import { issueRefreshToken } from "./token.service.js";
 import { sendNotification } from "./notification.service.js";
 import { terminalProvisioningService } from "./terminal-provisioning.service.js";
 import { paymentContainer } from "../payments/payment.container.js";
-import type { IPaymentGateway, PayoutParams } from "../payments/payment.interface.js";
+import type {
+  IPaymentGateway,
+  PayoutParams,
+} from "../payments/payment.interface.js";
 
 function maskAccountNumber(accountNumber: string): string {
   return accountNumber.length > 4
@@ -159,7 +163,7 @@ async function listDrivers() {
       },
     }),
 
-    // Only fetch terminals that currently have a driver 
+    // Only fetch terminals that currently have a driver
     prisma.terminal.findMany({
       where: { active_driver_uid: { not: null } },
       select: {
@@ -178,72 +182,275 @@ async function listDrivers() {
   return drivers.map((driver) => ({
     ...driver,
     wallet: {
-      balance: driver.driverWallet ? parseFloat(driver.driverWallet.balance.toString()) : 0,
-      total_earnings: driver.driverWallet ? parseFloat(driver.driverWallet.total_earnings.toString()) : 0,
+      balance: driver.driverWallet
+        ? parseFloat(driver.driverWallet.balance.toString())
+        : 0,
+      total_earnings: driver.driverWallet
+        ? parseFloat(driver.driverWallet.total_earnings.toString())
+        : 0,
     },
     activeTerminal: terminalByDriver.get(driver.matricNumber) ?? null,
   }));
 }
 
-async function registerDriverByAgent(data: DriverRegisterData) {
-  const { firstname, lastname, matricNumber } = data;
-  const normalisedMatric = matricNumber.toUpperCase();
+// ─────────────────────────────────────────────
+// registerDriverByAgent
+//
+// One combined agent action that replaces what used to be three separate
+// steps (create driver → driver logs in → driver self-links a card):
+//
+//   1. Agent enters: firstname, lastname, phone, a 4-digit PIN, the
+//      terminal-generated card-link OTP, and bank code + account number.
+//   2. Bank account is verified against Kora — the stored accountName is
+//      always the bank's own answer, never what the agent typed in.
+//   3. The OTP (same mechanism students use) resolves a physical card UID.
+//   4. Everything — the User row, DriverWallet, CardMapping, and
+//      DriverCardCredential — is created atomically. If any step fails,
+//      nothing is half-created.
+//   5. Only once that transaction commits does the terminal get told about
+//      the new driver, via ADD:DR,{cardUid},{pin}.
+//
+// The driver's matricNumber is generated internally (DRV-XXXXXXXX) — agents
+// never see or type it. Login going forward is phone + PIN only; the same
+// PIN doubles as both the app-login credential and the terminal tap-in PIN
+// (see setDriverCardPin for how a later PIN change keeps both in sync).
+// ─────────────────────────────────────────────
 
-  const existing = await prisma.user.findUnique({
-    where: { matricNumber: normalisedMatric },
-    select: { id: true, role: true },
-  });
+export interface RegisterDriverWithCardData {
+  firstname: string;
+  lastname: string;
+  phone: string;
+  pin: string;
+  otp: string;
+  bankCode: string;
+  accountNumber: string;
+}
 
-  if (existing) {
+function generateDriverUid(): string {
+  // 4 random bytes → 8 hex chars. Collision odds are negligible, but the
+  // caller still retries on a P2002 hit against matricNumber, just in case.
+  const suffix = crypto.randomBytes(4).toString("hex").toUpperCase();
+  return `DRV-${suffix}`;
+}
 
-    // Surface a clear error code — controller maps it to 409
-    throw new Error(
-      existing.role === "DRIVER"
-        ? "DRIVER_ALREADY_EXISTS"
-        : "MATRIC_NUMBER_IN_USE"
-    );
+async function registerDriverByAgent(
+  data: RegisterDriverWithCardData,
+  payoutGateway: IPaymentGateway = paymentContainer
+) {
+  const firstname = data.firstname?.trim();
+  const lastname = data.lastname?.trim();
+  const phone = data.phone?.trim();
+  const pin = data.pin?.trim();
+  const otp = data.otp?.trim();
+  const bankCode = data.bankCode?.trim();
+  const accountNumber = data.accountNumber?.trim();
+
+  if (!firstname || !lastname) {
+    throw new Error("MISSING_NAME");
+  }
+  if (!phone || !/^\+?\d{7,15}$/.test(phone)) {
+    throw new Error("INVALID_PHONE");
+  }
+  if (!pin || !/^\d{4}$/.test(pin)) {
+    throw new Error("INVALID_PIN_FORMAT");
+  }
+  if (!otp || !/^\d{6}$/.test(otp)) {
+    throw new Error("INVALID_OTP_FORMAT");
+  }
+  if (!bankCode) {
+    throw new Error("MISSING_BANK_CODE");
+  }
+  if (!accountNumber || !/^\d{10}$/.test(accountNumber)) {
+    throw new Error("INVALID_ACCOUNT_NUMBER");
   }
 
-  const defaultPassword = `${normalisedMatric.replace(/\//g, "")}Driver!`;
-  const hashedPassword = await bcrypt.hash(defaultPassword, 10);
-
-  const driver = await prisma.user.create({
-    data: {
-      firstname: firstname.trim(),
-      lastname: lastname.trim(),
-      email: `-`,
-      matricNumber: normalisedMatric,
-      password: hashedPassword,
-      role: "DRIVER",
-      isVerified: true,
-      driverWallet: {
-        create: {
-          balance: 0,
-          total_earnings: 0,
-        },
-      },
-    },
-    select: {
-      id: true,
-      firstname: true,
-      lastname: true,
-      matricNumber: true,
-      createdAt: true,
-      driverWallet: {
-        select: {
-          balance: true,
-          total_earnings: true,
-        },
-      },
-    },
+  // Phone must be free before we go any further.
+  const existingPhone = await prisma.user.findUnique({
+    where: { phone },
+    select: { id: true },
   });
+  if (existingPhone) {
+    throw new Error("PHONE_ALREADY_IN_USE");
+  }
 
-  logger.info(
-    { matricNumber: driver.matricNumber },
-    "driver.registered_by_agent"
+  // Resolve + validate the card-link OTP up front (read-only check —
+  // consumption happens atomically inside the transaction below).
+  const otpRecord = await prisma.registrationOtp.findUnique({ where: { otp } });
+  if (!otpRecord) {
+    throw new Error("INVALID_OTP");
+  }
+  if (otpRecord.used) {
+    throw new Error("OTP_ALREADY_USED");
+  }
+  if (otpRecord.expires_at < new Date()) {
+    throw new Error("OTP_EXPIRED");
+  }
+  if (!otpRecord.terminal_id) {
+    throw new Error("MISSING_TERMINAL_CONTEXT");
+  }
+
+  const existingCardMapping = await prisma.cardMapping.findUnique({
+    where: { card_uid: otpRecord.card_uid },
+  });
+  if (existingCardMapping) {
+    throw new Error("CARD_ALREADY_LINKED");
+  }
+
+  // Verify the bank account BEFORE writing anything — this is a network
+  // call, and we don't want a half-created driver if Kora rejects it.
+  if (!payoutGateway.resolveBankAccount) {
+    throw new Error("BANK_VERIFICATION_NOT_SUPPORTED");
+  }
+  const resolvedBank = await payoutGateway.resolveBankAccount(
+    bankCode,
+    accountNumber
   );
 
-  return driver;
+  // One PIN, one hash, reused for both the app-login credential (User.password)
+  // and the terminal tap-in credential (DriverCardCredential.pin_hash) — they
+  // are the same secret by design, so there's no benefit to two separate hashes.
+  const pinHash = await bcrypt.hash(pin, 10);
+
+  const MAX_UID_ATTEMPTS = 5;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= MAX_UID_ATTEMPTS; attempt++) {
+    const matricNumber = generateDriverUid();
+
+    try {
+      const driver = await prisma.$transaction(async (tx) => {
+        // Re-validate the OTP inside the transaction lock — atomic consume.
+        const consumed = await tx.registrationOtp.updateMany({
+          where: { otp, used: false },
+          data: { used: true },
+        });
+        if (consumed.count === 0) {
+          throw new Error("OTP_ALREADY_USED");
+        }
+
+        const raceCheck = await tx.cardMapping.findUnique({
+          where: { card_uid: otpRecord.card_uid },
+        });
+        if (raceCheck) {
+          throw new Error("CARD_ALREADY_LINKED");
+        }
+
+        const created = await tx.user.create({
+          data: {
+            firstname,
+            lastname,
+            email: "-",
+            matricNumber,
+            phone,
+            password: pinHash,
+            role: "DRIVER",
+            isVerified: true,
+            bankCode: resolvedBank.bankCode,
+            bankName: resolvedBank.bankName || "Verified Bank",
+            accountNumber: resolvedBank.accountNumber,
+            accountName: resolvedBank.accountName,
+            bankVerified: true,
+            driverWallet: {
+              create: { balance: 0, total_earnings: 0 },
+            },
+          },
+          select: {
+            id: true,
+            firstname: true,
+            lastname: true,
+            phone: true,
+            matricNumber: true,
+            createdAt: true,
+            bankCode: true,
+            bankName: true,
+            accountNumber: true,
+            accountName: true,
+            bankVerified: true,
+            driverWallet: {
+              select: { balance: true, total_earnings: true },
+            },
+          },
+        });
+
+        await tx.cardMapping.create({
+          data: { card_uid: otpRecord.card_uid, student_uid: matricNumber },
+        });
+
+        await tx.driverCardCredential.create({
+          data: {
+            driver_uid: matricNumber,
+            card_uid: otpRecord.card_uid,
+            pin_hash: pinHash,
+          },
+        });
+
+        return created;
+      });
+
+      // Transaction committed — now tell the terminal about the new driver.
+      // Best-effort: the driver record is already correct in our DB even if
+      // this hardware push fails, so we log rather than throw.
+      try {
+        await terminalProvisioningService.provisionCredential({
+          cardUid: otpRecord.card_uid,
+          pin,
+          list: "DR",
+          originTerminalId: otpRecord.terminal_id,
+        });
+      } catch (provisionErr) {
+        logger.error(
+          {
+            matricNumber: driver.matricNumber,
+            cardUid: otpRecord.card_uid,
+            err:
+              provisionErr instanceof Error
+                ? provisionErr.message
+                : String(provisionErr),
+          },
+          "driver.terminal_provisioning_failed_after_creation"
+        );
+      }
+
+      sendNotification(
+        driver.matricNumber,
+        "Welcome to C-Transit 🚌",
+        "Your driver account has been created. Your card is linked and your bank details are verified — you're ready to start receiving ride payments."
+      ).catch(() => {});
+
+      logger.info(
+        { matricNumber: driver.matricNumber, cardUid: otpRecord.card_uid },
+        "driver.registered_by_agent_with_card"
+      );
+
+      return driver;
+    } catch (error) {
+      const prismaError = error as {
+        code?: string;
+        meta?: { target?: string[] | string };
+      };
+      const target = Array.isArray(prismaError.meta?.target)
+        ? prismaError.meta.target.join(",")
+        : prismaError.meta?.target || "";
+
+      // Driver UID collision — vanishingly unlikely, but retry with a fresh one.
+      if (prismaError.code === "P2002" && target.includes("matricNumber")) {
+        lastError = error;
+        continue;
+      }
+
+      if (prismaError.code === "P2002" && target.includes("phone")) {
+        throw new Error("PHONE_ALREADY_IN_USE", { cause: error });
+      }
+
+      throw error;
+    }
+  }
+
+  logger.error(
+    { err: String(lastError) },
+    "driver.uid_generation_exhausted_retries"
+  );
+  throw new Error("DRIVER_UID_GENERATION_FAILED");
 }
 
 async function getDriverWallet(driverUid: string) {
@@ -265,26 +472,28 @@ async function getDriverWallet(driverUid: string) {
   };
 }
 
-async function loginDriver(identifier: string, password: string) {
-  const trimmed = identifier.trim();
+// Pre-computed hash used in the dummy compare path when no driver matches
+// the given phone. bcrypt.compare is constant-time regardless of match, but
+// calling it at all — even against a fake row — is what prevents a phone
+// number's existence from leaking through response-time differences. Same
+// pattern as agent.service.ts's loginAgent.
+const DRIVER_DUMMY_HASH =
+  "$2b$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+
+async function loginDriver(phone: string, pin: string) {
+  const trimmedPhone = phone.trim();
   const driver = await prisma.user.findFirst({
-    where: {
-      OR: [
-        { email: trimmed.toLowerCase() },
-        { matricNumber: trimmed.toUpperCase() },
-      ],
-      role: "DRIVER",
-    },
+    where: { phone: trimmedPhone, role: "DRIVER" },
   });
 
-  if (!driver) {
-    logger.warn({ identifier: trimmed }, "driver.login_not_found_or_not_driver");
-    throw new Error("INVALID_CREDENTIALS");
-  }
+  // Always run bcrypt — prevents timing-based phone-number enumeration.
+  const validPin = await bcrypt.compare(
+    pin,
+    driver?.password ?? DRIVER_DUMMY_HASH
+  );
 
-  const validPassword = await bcrypt.compare(password, driver.password);
-  if (!validPassword) {
-    logger.warn({ driverId: driver.id }, "driver.login_invalid_password");
+  if (!driver || !validPin) {
+    logger.warn({ phone: trimmedPhone }, "driver.login_invalid_credentials");
     throw new Error("INVALID_CREDENTIALS");
   }
 
@@ -346,7 +555,10 @@ async function loginDriver(identifier: string, password: string) {
     bankVerified: driver.bankVerified ?? false,
   };
 
-  logger.info({ driverId: driver.id, matricNumber: driver.matricNumber }, "driver.login_successful");
+  logger.info(
+    { driverId: driver.id, matricNumber: driver.matricNumber },
+    "driver.login_successful"
+  );
 
   return {
     accessToken,
@@ -422,40 +634,45 @@ async function getDriverDashboard(userId: string) {
   }
 
   const now = new Date();
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startOfToday = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate()
+  );
 
-  const [driverWallet, todayRidesCount, todayEarningsAgg, terminal] = await Promise.all([
-    prisma.driverWallet.findUnique({
-      where: { driver_uid: driver.matricNumber },
-      select: { balance: true },
-    }),
-    prisma.transaction.count({
-      where: {
-        driver_uid: driver.matricNumber,
-        type: "RIDE",
-        synced_at: { gte: startOfToday },
-      },
-    }),
-    prisma.transaction.aggregate({
-      where: {
-        driver_uid: driver.matricNumber,
-        type: "RIDE",
-        synced_at: { gte: startOfToday },
-      },
-      _sum: {
-        driver_share: true,
-      },
-    }),
-    prisma.terminal.findFirst({
-      where: { active_driver_uid: driver.matricNumber },
-      select: {
-        terminal_id: true,
-        status: true,
-        location: true,
-        last_seen: true,
-      },
-    }),
-  ]);
+  const [driverWallet, todayRidesCount, todayEarningsAgg, terminal] =
+    await Promise.all([
+      prisma.driverWallet.findUnique({
+        where: { driver_uid: driver.matricNumber },
+        select: { balance: true },
+      }),
+      prisma.transaction.count({
+        where: {
+          driver_uid: driver.matricNumber,
+          type: "RIDE",
+          synced_at: { gte: startOfToday },
+        },
+      }),
+      prisma.transaction.aggregate({
+        where: {
+          driver_uid: driver.matricNumber,
+          type: "RIDE",
+          synced_at: { gte: startOfToday },
+        },
+        _sum: {
+          driver_share: true,
+        },
+      }),
+      prisma.terminal.findFirst({
+        where: { active_driver_uid: driver.matricNumber },
+        select: {
+          terminal_id: true,
+          status: true,
+          location: true,
+          last_seen: true,
+        },
+      }),
+    ]);
 
   const terminalInfo = terminal
     ? {
@@ -487,7 +704,11 @@ async function getDriverDashboard(userId: string) {
   };
 }
 
-async function getDriverRides(userId: string, page: number = 1, limit: number = 20) {
+async function getDriverRides(
+  userId: string,
+  page: number = 1,
+  limit: number = 20
+) {
   const driver = await prisma.user.findUnique({
     where: { id: userId },
     select: { matricNumber: true, role: true },
@@ -536,7 +757,9 @@ async function getDriverRides(userId: string, page: number = 1, limit: number = 
       ? parseFloat(tx.fare.toString())
       : parseFloat(tx.amount.toString()),
     studentMatric: tx.student_uid,
-    studentName: tx.user ? `${tx.user.firstname} ${tx.user.lastname}`.trim() : tx.student_uid,
+    studentName: tx.user
+      ? `${tx.user.firstname} ${tx.user.lastname}`.trim()
+      : tx.student_uid,
     terminalId: tx.terminal_id,
     status: "COMPLETED",
     createdAt: tx.synced_at,
@@ -581,7 +804,8 @@ async function createDriverWithdrawal(
   }
 
   // C-Transit business rule: driver bears a 4% payout fee
-  const ctransitFee = Math.round(grossAmount * CTRANSIT_PAYOUT_FEE_RATIO * 100) / 100;
+  const ctransitFee =
+    Math.round(grossAmount * CTRANSIT_PAYOUT_FEE_RATIO * 100) / 100;
   const netAmount = Math.round((grossAmount - ctransitFee) * 100) / 100;
 
   if (netAmount <= 0) {
@@ -614,7 +838,8 @@ async function createDriverWithdrawal(
     throw new Error("BANK_NOT_VERIFIED");
   }
 
-  const effectiveBankName = driver.bankName || bankName?.trim() || "Verified Bank";
+  const effectiveBankName =
+    driver.bankName || bankName?.trim() || "Verified Bank";
   const effectiveAccountNumber = driver.accountNumber.trim();
   // Server-authoritative: Account name is strictly sourced from Kora resolution stored on user record
   const effectiveAccountName = driver.accountName.trim();
@@ -658,7 +883,10 @@ async function createDriverWithdrawal(
       });
     }
 
-    const reference = `WDR-${Date.now()}-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+    const reference = `WDR-${Date.now()}-${Math.random()
+      .toString(36)
+      .substring(2, 8)
+      .toUpperCase()}`;
 
     const record = await tx.driverWithdrawal.create({
       data: {
@@ -704,7 +932,9 @@ async function createDriverWithdrawal(
     id: updated?.id || withdrawal.id,
     amount: parseFloat((updated?.amount || withdrawal.amount).toString()),
     fee: updated?.fee ? parseFloat(updated.fee.toString()) : ctransitFee,
-    netAmount: updated?.net_amount ? parseFloat(updated.net_amount.toString()) : netAmount,
+    netAmount: updated?.net_amount
+      ? parseFloat(updated.net_amount.toString())
+      : netAmount,
     status: updated?.status || withdrawal.status,
     reference: updated?.reference || withdrawal.reference,
     koraReference: updated?.kora_reference || undefined,
@@ -820,7 +1050,11 @@ async function processWithdrawalPayout(
           where: { id: withdrawalId },
         });
 
-        if (!current || current.status === "SUCCESS" || current.status === "FAILED") {
+        if (
+          !current ||
+          current.status === "SUCCESS" ||
+          current.status === "FAILED"
+        ) {
           return;
         }
 
@@ -917,7 +1151,10 @@ async function handleDriverPayoutWebhook(
   });
 
   if (!withdrawal) {
-    logger.warn({ reference, koraReference }, "driver.payout_webhook_not_found");
+    logger.warn(
+      { reference, koraReference },
+      "driver.payout_webhook_not_found"
+    );
     return { success: false, message: "Withdrawal not found" };
   }
 
@@ -966,7 +1203,11 @@ async function handleDriverPayoutWebhook(
         where: { id: withdrawal.id },
       });
 
-      if (!current || current.status === "SUCCESS" || current.status === "FAILED") {
+      if (
+        !current ||
+        current.status === "SUCCESS" ||
+        current.status === "FAILED"
+      ) {
         return;
       }
 
@@ -1005,7 +1246,11 @@ async function handleDriverPayoutWebhook(
       });
 
       // Crucial: successful payout CANNOT restore/refund balance!
-      if (!current || current.status === "SUCCESS" || current.status === "FAILED") {
+      if (
+        !current ||
+        current.status === "SUCCESS" ||
+        current.status === "FAILED"
+      ) {
         return;
       }
 
@@ -1033,7 +1278,11 @@ async function handleDriverPayoutWebhook(
     ).catch(() => {});
 
     logger.info(
-      { reference: withdrawal.reference, driverUid: withdrawal.driver_uid, amount: withdrawal.amount },
+      {
+        reference: withdrawal.reference,
+        driverUid: withdrawal.driver_uid,
+        amount: withdrawal.amount,
+      },
       "driver.payout_webhook_failed_balance_restored"
     );
 
@@ -1047,7 +1296,11 @@ async function handleDriverPayoutWebhook(
   return { success: true, message: "Unhandled webhook event" };
 }
 
-async function getDriverWithdrawals(userId: string, page: number = 1, limit: number = 20) {
+async function getDriverWithdrawals(
+  userId: string,
+  page: number = 1,
+  limit: number = 20
+) {
   const driver = await prisma.user.findUnique({
     where: { id: userId },
     select: { matricNumber: true, role: true },
@@ -1119,7 +1372,10 @@ async function linkDriverCard(userId: string, params: LinkDriverCardParams) {
   // Security: authenticated user is identified exclusively from token userId.
   // If client supplies driverId, reject if mismatched.
   if (driverId) {
-    if (driverId !== driver.id && driverId.toUpperCase() !== driver.matricNumber) {
+    if (
+      driverId !== driver.id &&
+      driverId.toUpperCase() !== driver.matricNumber
+    ) {
       throw new Error("UNAUTHORIZED_DRIVER_ID");
     }
   }
@@ -1139,7 +1395,10 @@ async function linkDriverCard(userId: string, params: LinkDriverCardParams) {
 
   // Security: Card UID is strictly resolved from the terminal-generated OTP record.
   // If client provided cardUid, reject if mismatched.
-  if (cardUid && otpRecord.card_uid.toUpperCase() !== cardUid.trim().toUpperCase()) {
+  if (
+    cardUid &&
+    otpRecord.card_uid.toUpperCase() !== cardUid.trim().toUpperCase()
+  ) {
     throw new Error("CARD_MISMATCH");
   }
 
@@ -1173,7 +1432,10 @@ async function linkDriverCard(userId: string, params: LinkDriverCardParams) {
     where: { student_uid: driver.matricNumber },
   });
 
-  if (existingDriverMapping && existingDriverMapping.card_uid !== otpRecord.card_uid) {
+  if (
+    existingDriverMapping &&
+    existingDriverMapping.card_uid !== otpRecord.card_uid
+  ) {
     throw new Error("DRIVER_ALREADY_HAS_CARD");
   }
 
@@ -1207,14 +1469,19 @@ async function linkDriverCard(userId: string, params: LinkDriverCardParams) {
       });
     });
   } catch (error) {
-    const prismaError = error as { code?: string; meta?: { target?: string[] | string } };
+    const prismaError = error as {
+      code?: string;
+      meta?: { target?: string[] | string };
+    };
     const target = Array.isArray(prismaError.meta?.target)
       ? prismaError.meta.target.join(",")
       : prismaError.meta?.target || "";
 
     if (prismaError.code === "P2002") {
-      if (target.includes("card_uid")) throw new Error("CARD_ALREADY_LINKED", { cause: error });
-      if (target.includes("student_uid")) throw new Error("DRIVER_ALREADY_HAS_CARD", { cause: error });
+      if (target.includes("card_uid"))
+        throw new Error("CARD_ALREADY_LINKED", { cause: error });
+      if (target.includes("student_uid"))
+        throw new Error("DRIVER_ALREADY_HAS_CARD", { cause: error });
     }
 
     throw error;
@@ -1227,15 +1494,16 @@ async function linkDriverCard(userId: string, params: LinkDriverCardParams) {
     "Your physical driver card has been successfully linked to your C-Transit driver account."
   ).catch(() => {});
 
-  // 5. Hardware-isolated terminal provisioning (ADD:WL delta to origin terminal and fleet broadcast)
-  await terminalProvisioningService.provisionDriverCard({
-    cardUid: otpRecord.card_uid,
-    driverUid: driver.matricNumber,
-    originTerminalId: otpRecord.terminal_id,
-  });
-
+  // 5. No terminal downlink yet — firmware's DR (driver) list requires the
+  // card UID and PIN together in one command (ADD:DR,{uid},{pin}); there is
+  // no card-only intermediate state. The actual downlink happens in
+  // setDriverCardPin() once the PIN is known.
   logger.info(
-    { cardUid: otpRecord.card_uid, driverUid: driver.matricNumber, terminalId: otpRecord.terminal_id },
+    {
+      cardUid: otpRecord.card_uid,
+      driverUid: driver.matricNumber,
+      terminalId: otpRecord.terminal_id,
+    },
     "driver.card_linked_successfully"
   );
 
@@ -1272,19 +1540,22 @@ async function setDriverCardPin(userId: string, params: SetDriverPinParams) {
     throw new Error("CARD_NOT_LINKED");
   }
 
-  // 2. Validate PIN format (numeric 4 to 6 digits)
-  if (!pin || typeof pin !== "string" || !/^\d{4,6}$/.test(pin.trim())) {
+  // 2. Validate PIN format (numeric, exactly 4 digits — matches the
+  // firmware's ADD:DR,{uid},{pin} field and the driver's app-login PIN)
+  if (!pin || typeof pin !== "string" || !/^\d{4}$/.test(pin.trim())) {
     throw new Error("INVALID_PIN_FORMAT");
   }
 
   const cleanPin = pin.trim();
 
   // 3. Hash PIN securely (cost 10) - NEVER plaintext, NEVER logged!
+  // One PIN serves both the terminal tap-in and the driver's app login, so
+  // the same hash is written to both DriverCardCredential.pin_hash and
+  // User.password — keeping this endpoint in sync with app login too.
   const pinHash = await bcrypt.hash(cleanPin, 10);
 
-  // 4. Persist in dedicated DriverCardCredential model
-  if (prisma.driverCardCredential) {
-    await prisma.driverCardCredential.upsert({
+  await prisma.$transaction([
+    prisma.driverCardCredential.upsert({
       where: { driver_uid: driver.matricNumber },
       update: {
         card_uid: cardMap.card_uid,
@@ -1295,13 +1566,19 @@ async function setDriverCardPin(userId: string, params: SetDriverPinParams) {
         card_uid: cardMap.card_uid,
         pin_hash: pinHash,
       },
-    });
-  }
+    }),
+    prisma.user.update({
+      where: { id: driver.id },
+      data: { password: pinHash },
+    }),
+  ]);
 
-  // 5. Provision / downlink to terminal via hardware abstraction service
-  await terminalProvisioningService.provisionDriverPin({
+  // 5. Provision the terminal's DR list — card UID + PIN together, per the
+  // firmware contract (ADD:DR,{uid},{pin}).
+  await terminalProvisioningService.provisionCredential({
     cardUid: cardMap.card_uid,
-    driverUid: driver.matricNumber,
+    pin: cleanPin,
+    list: "DR",
   });
 
   // 6. In-app notification
