@@ -282,17 +282,18 @@ export const linkDriverCardHandler = async (
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
-    const { otp, cardUid, driverId } = req.body;
+    const { otp, pin, cardUid, driverId } = req.body;
 
-    if (!otp) {
+    if (!otp || !pin) {
       return res.status(400).json({
         success: false,
-        message: "OTP is required",
+        message: "OTP and PIN are required",
       });
     }
 
     const result = await linkDriverCard(userId, {
       otp: String(otp).trim(),
+      pin: String(pin).trim(),
       cardUid: cardUid ? String(cardUid).trim() : undefined,
       driverId: driverId ? String(driverId).trim() : undefined,
     });
@@ -352,6 +353,16 @@ export const linkDriverCardHandler = async (
           return res.status(404).json({
             success: false,
             message: "Driver not found",
+          });
+        case "INVALID_PIN_FORMAT":
+          return res.status(400).json({
+            success: false,
+            message: "PIN must be exactly 4 digits",
+          });
+        case "INVALID_PIN":
+          return res.status(401).json({
+            success: false,
+            message: "Incorrect PIN",
           });
       }
     }

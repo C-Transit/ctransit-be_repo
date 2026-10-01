@@ -196,34 +196,23 @@ async function listDrivers() {
 // ─────────────────────────────────────────────
 // registerDriverByAgent
 //
-// One combined agent action that replaces what used to be three separate
-// steps (create driver → driver logs in → driver self-links a card):
-//
-//   1. Agent enters: firstname, lastname, phone, a 4-digit PIN, the
-//      terminal-generated card-link OTP, and bank code + account number.
-//   2. Bank account is verified against Kora — the stored accountName is
-//      always the bank's own answer, never what the agent typed in.
-//   3. The OTP (same mechanism students use) resolves a physical card UID.
-//   4. Everything — the User row, DriverWallet, CardMapping, and
-//      DriverCardCredential — is created atomically. If any step fails,
-//      nothing is half-created.
-//   5. Only once that transaction commits does the terminal get told about
-//      the new driver, via ADD:DR,{cardUid},{pin}.
+// Back to the default split: the agent only creates the bare driver account
+// here — firstname, lastname, phone, a 4-digit PIN. Card linking and bank
+// account verification are done afterwards, driver-side, with the agent
+// simply logging into the driver's account (phone + the PIN just set) to
+// help them through it — see linkDriverCard() and verifyAndSaveDriverBank().
 //
 // The driver's matricNumber is generated internally (DRV-XXXXXXXX) — agents
-// never see or type it. Login going forward is phone + PIN only; the same
-// PIN doubles as both the app-login credential and the terminal tap-in PIN
-// (see setDriverCardPin for how a later PIN change keeps both in sync).
+// never see or type it. The PIN doubles as both the app-login credential
+// (User.password) and, once a card is linked, the terminal tap-in PIN —
+// they're kept as the same secret for now (see linkDriverCard).
 // ─────────────────────────────────────────────
 
-export interface RegisterDriverWithCardData {
+export interface RegisterDriverData {
   firstname: string;
   lastname: string;
   phone: string;
   pin: string;
-  otp: string;
-  bankCode: string;
-  accountNumber: string;
 }
 
 function generateDriverUid(): string {
@@ -233,17 +222,11 @@ function generateDriverUid(): string {
   return `DRV-${suffix}`;
 }
 
-async function registerDriverByAgent(
-  data: RegisterDriverWithCardData,
-  payoutGateway: IPaymentGateway = paymentContainer
-) {
+async function registerDriverByAgent(data: RegisterDriverData) {
   const firstname = data.firstname?.trim();
   const lastname = data.lastname?.trim();
   const phone = data.phone?.trim();
   const pin = data.pin?.trim();
-  const otp = data.otp?.trim();
-  const bankCode = data.bankCode?.trim();
-  const accountNumber = data.accountNumber?.trim();
 
   if (!firstname || !lastname) {
     throw new Error("MISSING_NAME");
@@ -253,15 +236,6 @@ async function registerDriverByAgent(
   }
   if (!pin || !/^\d{4}$/.test(pin)) {
     throw new Error("INVALID_PIN_FORMAT");
-  }
-  if (!otp || !/^\d{6}$/.test(otp)) {
-    throw new Error("INVALID_OTP_FORMAT");
-  }
-  if (!bankCode) {
-    throw new Error("MISSING_BANK_CODE");
-  }
-  if (!accountNumber || !/^\d{10}$/.test(accountNumber)) {
-    throw new Error("INVALID_ACCOUNT_NUMBER");
   }
 
   // Phone must be free before we go any further.
@@ -273,42 +247,6 @@ async function registerDriverByAgent(
     throw new Error("PHONE_ALREADY_IN_USE");
   }
 
-  // Resolve + validate the card-link OTP up front (read-only check —
-  // consumption happens atomically inside the transaction below).
-  const otpRecord = await prisma.registrationOtp.findUnique({ where: { otp } });
-  if (!otpRecord) {
-    throw new Error("INVALID_OTP");
-  }
-  if (otpRecord.used) {
-    throw new Error("OTP_ALREADY_USED");
-  }
-  if (otpRecord.expires_at < new Date()) {
-    throw new Error("OTP_EXPIRED");
-  }
-  if (!otpRecord.terminal_id) {
-    throw new Error("MISSING_TERMINAL_CONTEXT");
-  }
-
-  const existingCardMapping = await prisma.cardMapping.findUnique({
-    where: { card_uid: otpRecord.card_uid },
-  });
-  if (existingCardMapping) {
-    throw new Error("CARD_ALREADY_LINKED");
-  }
-
-  // Verify the bank account BEFORE writing anything — this is a network
-  // call, and we don't want a half-created driver if Kora rejects it.
-  if (!payoutGateway.resolveBankAccount) {
-    throw new Error("BANK_VERIFICATION_NOT_SUPPORTED");
-  }
-  const resolvedBank = await payoutGateway.resolveBankAccount(
-    bankCode,
-    accountNumber
-  );
-
-  // One PIN, one hash, reused for both the app-login credential (User.password)
-  // and the terminal tap-in credential (DriverCardCredential.pin_hash) — they
-  // are the same secret by design, so there's no benefit to two separate hashes.
   const pinHash = await bcrypt.hash(pin, 10);
 
   const MAX_UID_ATTEMPTS = 5;
@@ -318,108 +256,36 @@ async function registerDriverByAgent(
     const matricNumber = generateDriverUid();
 
     try {
-      const driver = await prisma.$transaction(async (tx) => {
-        // Re-validate the OTP inside the transaction lock — atomic consume.
-        const consumed = await tx.registrationOtp.updateMany({
-          where: { otp, used: false },
-          data: { used: true },
-        });
-        if (consumed.count === 0) {
-          throw new Error("OTP_ALREADY_USED");
-        }
-
-        const raceCheck = await tx.cardMapping.findUnique({
-          where: { card_uid: otpRecord.card_uid },
-        });
-        if (raceCheck) {
-          throw new Error("CARD_ALREADY_LINKED");
-        }
-
-        const created = await tx.user.create({
-          data: {
-            firstname,
-            lastname,
-            email: "-",
-            matricNumber,
-            phone,
-            password: pinHash,
-            role: "DRIVER",
-            isVerified: true,
-            bankCode: resolvedBank.bankCode,
-            bankName: resolvedBank.bankName || "Verified Bank",
-            accountNumber: resolvedBank.accountNumber,
-            accountName: resolvedBank.accountName,
-            bankVerified: true,
-            driverWallet: {
-              create: { balance: 0, total_earnings: 0 },
-            },
+      const driver = await prisma.user.create({
+        data: {
+          firstname,
+          lastname,
+          email: "-",
+          matricNumber,
+          phone,
+          password: pinHash,
+          role: "DRIVER",
+          isVerified: true,
+          driverWallet: {
+            create: { balance: 0, total_earnings: 0 },
           },
-          select: {
-            id: true,
-            firstname: true,
-            lastname: true,
-            phone: true,
-            matricNumber: true,
-            createdAt: true,
-            bankCode: true,
-            bankName: true,
-            accountNumber: true,
-            accountName: true,
-            bankVerified: true,
-            driverWallet: {
-              select: { balance: true, total_earnings: true },
-            },
+        },
+        select: {
+          id: true,
+          firstname: true,
+          lastname: true,
+          phone: true,
+          matricNumber: true,
+          createdAt: true,
+          driverWallet: {
+            select: { balance: true, total_earnings: true },
           },
-        });
-
-        await tx.cardMapping.create({
-          data: { card_uid: otpRecord.card_uid, student_uid: matricNumber },
-        });
-
-        await tx.driverCardCredential.create({
-          data: {
-            driver_uid: matricNumber,
-            card_uid: otpRecord.card_uid,
-            pin_hash: pinHash,
-          },
-        });
-
-        return created;
+        },
       });
 
-      // Transaction committed — now tell the terminal about the new driver.
-      // Best-effort: the driver record is already correct in our DB even if
-      // this hardware push fails, so we log rather than throw.
-      try {
-        await terminalProvisioningService.provisionCredential({
-          cardUid: otpRecord.card_uid,
-          pin,
-          list: "DR",
-          originTerminalId: otpRecord.terminal_id,
-        });
-      } catch (provisionErr) {
-        logger.error(
-          {
-            matricNumber: driver.matricNumber,
-            cardUid: otpRecord.card_uid,
-            err:
-              provisionErr instanceof Error
-                ? provisionErr.message
-                : String(provisionErr),
-          },
-          "driver.terminal_provisioning_failed_after_creation"
-        );
-      }
-
-      sendNotification(
-        driver.matricNumber,
-        "Welcome to C-Transit 🚌",
-        "Your driver account has been created. Your card is linked and your bank details are verified — you're ready to start receiving ride payments."
-      ).catch(() => {});
-
       logger.info(
-        { matricNumber: driver.matricNumber, cardUid: otpRecord.card_uid },
-        "driver.registered_by_agent_with_card"
+        { matricNumber: driver.matricNumber },
+        "driver.registered_by_agent"
       );
 
       return driver;
@@ -1353,20 +1219,34 @@ async function getDriverWithdrawals(
 
 export interface LinkDriverCardParams {
   otp: string;
+  pin: string;
   cardUid?: string;
   driverId?: string;
 }
 
 async function linkDriverCard(userId: string, params: LinkDriverCardParams) {
-  const { otp, cardUid, driverId } = params;
+  const { otp, pin, cardUid, driverId } = params;
 
   const driver = await prisma.user.findUnique({
     where: { id: userId },
-    select: { id: true, matricNumber: true, role: true },
+    select: { id: true, matricNumber: true, role: true, password: true },
   });
 
   if (!driver || driver.role !== "DRIVER") {
     throw new Error("DRIVER_NOT_FOUND");
+  }
+
+  // The driver's login PIN and terminal PIN are the same secret by design —
+  // re-confirm it here rather than accepting a new one. This is also what
+  // gives us the plaintext PIN we need for the ADD:DR downlink below; it's
+  // never stored anywhere, only hashed into DriverCardCredential.pin_hash.
+  if (!pin || typeof pin !== "string" || !/^\d{4}$/.test(pin.trim())) {
+    throw new Error("INVALID_PIN_FORMAT");
+  }
+  const cleanPin = pin.trim();
+  const pinMatches = await bcrypt.compare(cleanPin, driver.password);
+  if (!pinMatches) {
+    throw new Error("INVALID_PIN");
   }
 
   // Security: authenticated user is identified exclusively from token userId.
@@ -1443,7 +1323,9 @@ async function linkDriverCard(userId: string, params: LinkDriverCardParams) {
     throw new Error("OTP_ALREADY_USED");
   }
 
-  // 3. Atomically consume OTP and create CardMapping record
+  // 3. Atomically consume OTP, create CardMapping, and store the terminal
+  // credential (card UID + this same PIN, hashed) in one go.
+  const pinHash = await bcrypt.hash(cleanPin, 10);
   try {
     await prisma.$transaction(async (tx) => {
       const consumed = await tx.registrationOtp.updateMany({
@@ -1465,6 +1347,16 @@ async function linkDriverCard(userId: string, params: LinkDriverCardParams) {
         data: {
           card_uid: otpRecord.card_uid,
           student_uid: driver.matricNumber,
+        },
+      });
+
+      await tx.driverCardCredential.upsert({
+        where: { driver_uid: driver.matricNumber },
+        update: { card_uid: otpRecord.card_uid, pin_hash: pinHash },
+        create: {
+          driver_uid: driver.matricNumber,
+          card_uid: otpRecord.card_uid,
+          pin_hash: pinHash,
         },
       });
     });
@@ -1494,10 +1386,30 @@ async function linkDriverCard(userId: string, params: LinkDriverCardParams) {
     "Your physical driver card has been successfully linked to your C-Transit driver account."
   ).catch(() => {});
 
-  // 5. No terminal downlink yet — firmware's DR (driver) list requires the
-  // card UID and PIN together in one command (ADD:DR,{uid},{pin}); there is
-  // no card-only intermediate state. The actual downlink happens in
-  // setDriverCardPin() once the PIN is known.
+  // 5. Now that both the card UID and PIN are known, provision the
+  // terminal's DR list: ADD:DR,{uid},{pin}. Best-effort — the DB is already
+  // correct even if this hardware push fails, so we log rather than throw.
+  try {
+    await terminalProvisioningService.provisionCredential({
+      cardUid: otpRecord.card_uid,
+      pin: cleanPin,
+      list: "DR",
+      originTerminalId: otpRecord.terminal_id,
+    });
+  } catch (provisionErr) {
+    logger.error(
+      {
+        driverUid: driver.matricNumber,
+        cardUid: otpRecord.card_uid,
+        err:
+          provisionErr instanceof Error
+            ? provisionErr.message
+            : String(provisionErr),
+      },
+      "driver.terminal_provisioning_failed_after_card_link"
+    );
+  }
+
   logger.info(
     {
       cardUid: otpRecord.card_uid,

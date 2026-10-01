@@ -149,28 +149,15 @@ export const registerDriverHandler = async (
       lastname: string;
       phone: string;
       pin: string;
-      otp: string;
-      bankCode: string;
-      accountNumber: string;
     };
   },
   res: Response
 ) => {
-  const { firstname, lastname, phone, pin, otp, bankCode, accountNumber } =
-    req.body;
+  const { firstname, lastname, phone, pin } = req.body;
 
-  if (
-    !firstname ||
-    !lastname ||
-    !phone ||
-    !pin ||
-    !otp ||
-    !bankCode ||
-    !accountNumber
-  ) {
+  if (!firstname || !lastname || !phone || !pin) {
     return res.status(400).json({
-      error:
-        "firstname, lastname, phone, pin, otp, bankCode, and accountNumber are all required",
+      error: "firstname, lastname, phone, and pin are all required",
     });
   }
 
@@ -180,9 +167,6 @@ export const registerDriverHandler = async (
       lastname,
       phone,
       pin,
-      otp,
-      bankCode,
-      accountNumber,
     });
     logger.info(
       { matricNumber: driver.matricNumber, agentId: req.user!.userId },
@@ -201,40 +185,9 @@ export const registerDriverHandler = async (
           status: 400,
           message: "PIN must be exactly 4 digits",
         },
-        INVALID_OTP_FORMAT: {
-          status: 400,
-          message: "OTP must be exactly 6 digits",
-        },
-        MISSING_BANK_CODE: { status: 400, message: "Bank code is required" },
-        INVALID_ACCOUNT_NUMBER: {
-          status: 400,
-          message: "Account number must be 10 digits",
-        },
         PHONE_ALREADY_IN_USE: {
           status: 409,
           message: "This phone number is already registered",
-        },
-        INVALID_OTP: { status: 400, message: "OTP is invalid or unrecognized" },
-        OTP_ALREADY_USED: {
-          status: 409,
-          message: "This OTP has already been used",
-        },
-        OTP_EXPIRED: {
-          status: 410,
-          message:
-            "This OTP has expired — ask the driver to tap the card again",
-        },
-        MISSING_TERMINAL_CONTEXT: {
-          status: 400,
-          message: "OTP is missing terminal context",
-        },
-        CARD_ALREADY_LINKED: {
-          status: 409,
-          message: "This card is already linked to another user",
-        },
-        BANK_VERIFICATION_NOT_SUPPORTED: {
-          status: 503,
-          message: "Bank verification is currently unavailable",
         },
         DRIVER_UID_GENERATION_FAILED: {
           status: 500,
