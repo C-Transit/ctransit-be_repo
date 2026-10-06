@@ -22,16 +22,16 @@ import {
 // POST /api/drivers/login
 export const loginDriverHandler = async (req: Request, res: Response) => {
   try {
-    const { identifier, password } = req.body;
+    const { phone, pin } = req.body;
 
-    if (!identifier || !password) {
+    if (!phone || !pin) {
       return res.status(400).json({
         success: false,
-        message: "Please provide identifier (email or driver ID) and password",
+        message: "Please provide phone and pin",
       });
     }
 
-    const result = await loginDriver(identifier, password);
+    const result = await loginDriver(phone, pin);
 
     return res.status(200).json({
       success: true,
@@ -44,7 +44,7 @@ export const loginDriverHandler = async (req: Request, res: Response) => {
     if (error instanceof Error && error.message === "INVALID_CREDENTIALS") {
       return res.status(401).json({
         success: false,
-        message: "Invalid email/driver ID or password",
+        message: "Invalid phone number or PIN",
       });
     }
 
@@ -55,7 +55,10 @@ export const loginDriverHandler = async (req: Request, res: Response) => {
 };
 
 // GET /api/drivers/me
-export const getDriverMeHandler = async (req: CustomAuthRequest, res: Response) => {
+export const getDriverMeHandler = async (
+  req: CustomAuthRequest,
+  res: Response
+) => {
   try {
     const userId = req.user?.userId;
     if (!userId) {
@@ -72,7 +75,9 @@ export const getDriverMeHandler = async (req: CustomAuthRequest, res: Response) 
     });
   } catch (error) {
     if (error instanceof Error && error.message === "DRIVER_NOT_FOUND") {
-      return res.status(404).json({ success: false, message: "Driver not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Driver not found" });
     }
 
     const errMessage = error instanceof Error ? error.message : "Unknown error";
@@ -101,7 +106,9 @@ export const getDriverDashboardHandler = async (
     });
   } catch (error) {
     if (error instanceof Error && error.message === "DRIVER_NOT_FOUND") {
-      return res.status(404).json({ success: false, message: "Driver not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Driver not found" });
     }
 
     const errMessage = error instanceof Error ? error.message : "Unknown error";
@@ -134,7 +141,9 @@ export const getDriverRidesHandler = async (
     });
   } catch (error) {
     if (error instanceof Error && error.message === "DRIVER_NOT_FOUND") {
-      return res.status(404).json({ success: false, message: "Driver not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Driver not found" });
     }
 
     const errMessage = error instanceof Error ? error.message : "Unknown error";
@@ -156,7 +165,8 @@ export const createDriverWithdrawalHandler = async (
 
     const { amount, bankName, accountNumber, accountName, remarks } = req.body;
 
-    const parsedAmount = typeof amount === "number" ? amount : parseFloat(amount);
+    const parsedAmount =
+      typeof amount === "number" ? amount : parseFloat(amount);
     if (isNaN(parsedAmount) || parsedAmount <= 0) {
       return res.status(400).json({
         success: false,
@@ -250,7 +260,9 @@ export const getDriverWithdrawalsHandler = async (
     });
   } catch (error) {
     if (error instanceof Error && error.message === "DRIVER_NOT_FOUND") {
-      return res.status(404).json({ success: false, message: "Driver not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Driver not found" });
     }
 
     const errMessage = error instanceof Error ? error.message : "Unknown error";
@@ -270,17 +282,18 @@ export const linkDriverCardHandler = async (
       return res.status(401).json({ success: false, message: "Unauthorized" });
     }
 
-    const { otp, cardUid, driverId } = req.body;
+    const { otp, pin, cardUid, driverId } = req.body;
 
-    if (!otp) {
+    if (!otp || !pin) {
       return res.status(400).json({
         success: false,
-        message: "OTP is required",
+        message: "OTP and PIN are required",
       });
     }
 
     const result = await linkDriverCard(userId, {
       otp: String(otp).trim(),
+      pin: String(pin).trim(),
       cardUid: cardUid ? String(cardUid).trim() : undefined,
       driverId: driverId ? String(driverId).trim() : undefined,
     });
@@ -340,6 +353,16 @@ export const linkDriverCardHandler = async (
           return res.status(404).json({
             success: false,
             message: "Driver not found",
+          });
+        case "INVALID_PIN_FORMAT":
+          return res.status(400).json({
+            success: false,
+            message: "PIN must be exactly 4 digits",
+          });
+        case "INVALID_PIN":
+          return res.status(401).json({
+            success: false,
+            message: "Incorrect PIN",
           });
       }
     }
@@ -434,7 +457,10 @@ export const markAllDriverNotificationsReadHandler = async (
     );
     return res
       .status(500)
-      .json({ success: false, message: "Failed to mark notifications as read" });
+      .json({
+        success: false,
+        message: "Failed to mark notifications as read",
+      });
   }
 };
 
@@ -505,7 +531,9 @@ export const getDriverPinStatusHandler = async (
     return res.status(200).json(result);
   } catch (error) {
     if (error instanceof Error && error.message === "DRIVER_NOT_FOUND") {
-      return res.status(404).json({ success: false, message: "Driver not found" });
+      return res
+        .status(404)
+        .json({ success: false, message: "Driver not found" });
     }
 
     const errMessage = error instanceof Error ? error.message : "Unknown error";
@@ -560,7 +588,8 @@ export const verifyDriverBankHandler = async (
         case "BANK_VERIFICATION_NOT_SUPPORTED":
           return res.status(501).json({
             success: false,
-            message: "Bank account resolution is not supported by payment provider",
+            message:
+              "Bank account resolution is not supported by payment provider",
           });
         default:
           return res.status(400).json({
@@ -575,4 +604,3 @@ export const verifyDriverBankHandler = async (
     return res.status(500).json({ success: false, message: "Server error" });
   }
 };
-

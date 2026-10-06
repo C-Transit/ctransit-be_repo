@@ -4,6 +4,7 @@ import prisma from "../lib/prisma.js";
 import { getRedisClient, cacheKeys } from "../config/redis.js";
 import logger from "../config/logger.js";
 import { sendNotification } from "./notification.service.js";
+import { terminalProvisioningService } from "./terminal-provisioning.service.js";
 
 export interface CreateAgentInput {
   firstname: string;
@@ -129,7 +130,6 @@ async function updateAgentStatus(
     },
   });
 
-  
   try {
     const redis = redisClient;
     await redis.del(cacheKeys.agentStatus(agentId));
@@ -156,7 +156,6 @@ async function listAgents(
   const { status, page, limit } = filters;
   const skip = (page - 1) * limit;
 
- 
   const where = status ? { status } : {};
 
   const [agents, total] = await prisma.$transaction([
@@ -285,7 +284,6 @@ async function getAdminOverview() {
     topTerminals,
     topDrivers,
   ] = await Promise.all([
-
     // Headcounts
     prisma.user.count({ where: { role: "STUDENT" } }),
     prisma.agent.count({ where: { status: "ACTIVE" } }),
@@ -460,7 +458,6 @@ async function getIncomeStats(filters: IncomeStatsFilter) {
   };
 }
 
-
 export interface ListDisputesFilter {
   status?: DisputeStatus;
   page: number;
@@ -600,7 +597,7 @@ async function updateDisputeStatus(
     },
   });
 
-  // Notify student of dispute status change 
+  // Notify student of dispute status change
   const studentMatric = existing.student_uid;
 
   if (newStatus === "UNDER_REVIEW") {
@@ -629,12 +626,145 @@ async function updateDisputeStatus(
   return updated;
 }
 
+// ─────────────────────────────────────────────
+// linkAdminCard
+//
+// Same mechanism as student/driver card linking (a terminal-generated OTP
+// resolves a physical card UID), but for an admin's own account — an admin
+// taps their card at any terminal, gets a 6-digit OTP, picks a 4-digit PIN,
+// and submits both here. On success the terminal's AD list is provisioned
+// via ADD:AD,{uid},{pin}, exactly mirroring how driver cards are linked.
+// ─────────────────────────────────────────────
+
+export interface LinkAdminCardParams {
+  otp: string;
+  pin: string;
+}
+
+async function linkAdminCard(adminUserId: string, params: LinkAdminCardParams) {
+  const { otp, pin } = params;
+
+  const admin = await prisma.user.findUnique({
+    where: { id: adminUserId },
+    select: { id: true, matricNumber: true, role: true },
+  });
+
+  if (!admin || admin.role !== "ADMIN") {
+    throw new Error("ADMIN_NOT_FOUND");
+  }
+
+  const cleanOtp = otp?.trim();
+  if (!cleanOtp || !/^\d{6}$/.test(cleanOtp)) {
+    throw new Error("INVALID_OTP_FORMAT");
+  }
+
+  const cleanPin = pin?.trim();
+  if (!cleanPin || !/^\d{4}$/.test(cleanPin)) {
+    throw new Error("INVALID_PIN_FORMAT");
+  }
+
+  const otpRecord = await prisma.registrationOtp.findUnique({
+    where: { otp: cleanOtp },
+  });
+  if (!otpRecord) {
+    throw new Error("INVALID_OTP");
+  }
+  if (otpRecord.used) {
+    throw new Error("OTP_ALREADY_USED");
+  }
+  if (otpRecord.expires_at < new Date()) {
+    throw new Error("OTP_EXPIRED");
+  }
+  if (!otpRecord.terminal_id) {
+    throw new Error("MISSING_TERMINAL_CONTEXT");
+  }
+
+  const existingCardMapping = await prisma.cardMapping.findUnique({
+    where: { card_uid: otpRecord.card_uid },
+  });
+  if (existingCardMapping) {
+    throw new Error("CARD_ALREADY_LINKED");
+  }
+
+  const existingAdminMapping = await prisma.cardMapping.findUnique({
+    where: { student_uid: admin.matricNumber },
+  });
+  if (existingAdminMapping) {
+    throw new Error("ADMIN_ALREADY_HAS_CARD");
+  }
+
+  const pinHash = await bcrypt.hash(cleanPin, 10);
+
+  await prisma.$transaction(async (tx) => {
+    const consumed = await tx.registrationOtp.updateMany({
+      where: { otp: cleanOtp, used: false },
+      data: { used: true },
+    });
+    if (consumed.count === 0) {
+      throw new Error("OTP_ALREADY_USED");
+    }
+
+    const raceCheck = await tx.cardMapping.findUnique({
+      where: { card_uid: otpRecord.card_uid },
+    });
+    if (raceCheck) {
+      throw new Error("CARD_ALREADY_LINKED");
+    }
+
+    await tx.cardMapping.create({
+      data: { card_uid: otpRecord.card_uid, student_uid: admin.matricNumber },
+    });
+
+    await tx.adminCardCredential.create({
+      data: {
+        admin_uid: admin.matricNumber,
+        card_uid: otpRecord.card_uid,
+        pin_hash: pinHash,
+      },
+    });
+  });
+
+  try {
+    await terminalProvisioningService.provisionCredential({
+      cardUid: otpRecord.card_uid,
+      pin: cleanPin,
+      list: "AD",
+      originTerminalId: otpRecord.terminal_id,
+    });
+  } catch (provisionErr) {
+    logger.error(
+      {
+        adminUid: admin.matricNumber,
+        cardUid: otpRecord.card_uid,
+        err:
+          provisionErr instanceof Error
+            ? provisionErr.message
+            : String(provisionErr),
+      },
+      "admin.terminal_provisioning_failed_after_link"
+    );
+  }
+
+  logger.info(
+    { adminUid: admin.matricNumber, cardUid: otpRecord.card_uid },
+    "admin.card_linked_successfully"
+  );
+
+  return {
+    success: true,
+    message: "Admin card linked successfully",
+    cardUid: otpRecord.card_uid,
+    adminUid: admin.matricNumber,
+  };
+}
+
 export {
   getAdminOverview,
   getIncomeStats,
   listDisputes,
   getDisputeById,
   updateDisputeStatus,
+  linkAdminCard,
 };
 
 export { sendNotification } from "../services/notification.service.js";
