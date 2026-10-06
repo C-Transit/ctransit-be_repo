@@ -18,9 +18,7 @@ import {
 import { buildDeltaCommand } from "../utils/parser.js";
 import { getRedisClient, redisKeys } from "../config/redis.js";
 import { approveKyc, rejectKyc } from "../services/kyc.service.js";
-import {
-  type CustomAuthRequest,
-} from "../middleware/auth.middleware.js";
+import { type CustomAuthRequest } from "../middleware/auth.middleware.js";
 import { type AgentStatus } from "@prisma/client";
 import {
   createAgent,
@@ -34,6 +32,7 @@ import {
   getDisputeById,
   updateDisputeStatus,
   sendNotification,
+  linkAdminCard,
 } from "../services/admin.service.js";
 import { unlinkCard } from "../services/card.service.js";
 
@@ -63,7 +62,11 @@ function isAllowedFirmwareUrl(value: unknown): value is string {
   }
 }
 
-function requireCriticalApproval(req: Request, res: Response, next: NextFunction) {
+function requireCriticalApproval(
+  req: Request,
+  res: Response,
+  next: NextFunction
+) {
   const suppliedToken = req.headers["x-critical-approval-token"];
   const expectedToken = env.admin.criticalApprovalToken;
 
@@ -71,10 +74,18 @@ function requireCriticalApproval(req: Request, res: Response, next: NextFunction
     !expectedToken ||
     typeof suppliedToken !== "string" ||
     suppliedToken.length !== expectedToken.length ||
-    !crypto.timingSafeEqual(Buffer.from(suppliedToken), Buffer.from(expectedToken))
+    !crypto.timingSafeEqual(
+      Buffer.from(suppliedToken),
+      Buffer.from(expectedToken)
+    )
   ) {
-    logger.warn({ ip: req.ip, path: req.path }, "admin.critical_approval_rejected");
-    return res.status(403).json({ error: "Critical-operation approval required" });
+    logger.warn(
+      { ip: req.ip, path: req.path },
+      "admin.critical_approval_rejected"
+    );
+    return res
+      .status(403)
+      .json({ error: "Critical-operation approval required" });
   }
 
   next();
@@ -82,7 +93,9 @@ function requireCriticalApproval(req: Request, res: Response, next: NextFunction
 
 function getAuditAdminId(req: Pick<Request, "headers">): string {
   const adminId = req.headers["x-admin-id"];
-  return typeof adminId === "string" && adminId.trim() ? adminId.trim() : "unknown";
+  return typeof adminId === "string" && adminId.trim()
+    ? adminId.trim()
+    : "unknown";
 }
 
 function auditCriticalOperation(
@@ -127,12 +140,18 @@ function requireAdminSecret(req: Request, res: Response, next: NextFunction) {
     typeof backendSecret === "string" &&
     expectedSecret &&
     backendSecret.length === expectedSecret.length &&
-    crypto.timingSafeEqual(Buffer.from(backendSecret), Buffer.from(expectedSecret))
+    crypto.timingSafeEqual(
+      Buffer.from(backendSecret),
+      Buffer.from(expectedSecret)
+    )
   ) {
     return next();
   }
 
-  logger.warn({ ip: req.ip, path: req.path }, "admin.session_required_for_production");
+  logger.warn(
+    { ip: req.ip, path: req.path },
+    "admin.session_required_for_production"
+  );
   return res.status(403).json({ error: "Admin session required" });
 }
 
@@ -151,8 +170,7 @@ const approveKycHandler = async (
     logger.info({ userId }, "admin.kyc_approved");
     res.json({ success: true, kyc });
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.kyc_approve_error");
 
     if (error instanceof Error) {
@@ -185,8 +203,7 @@ const rejectKycHandler = async (
     logger.info({ userId, reason }, "admin.kyc_rejected");
     res.json({ success: true, kyc });
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.kyc_reject_error");
 
     if (error instanceof Error) {
@@ -387,7 +404,11 @@ router.post(
 router.post(
   "/terminal/register",
   async (
-    req: Request<object, object, { terminalId: string; secretKey: string; location?: string }>,
+    req: Request<
+      object,
+      object,
+      { terminalId: string; secretKey: string; location?: string }
+    >,
     res: Response
   ) => {
     const { terminalId, secretKey, location } = req.body;
@@ -442,7 +463,10 @@ const VALID_DISPUTE_STATUSES = [
 ] as const;
 type ValidDisputeStatus = (typeof VALID_DISPUTE_STATUSES)[number];
 
-function getAdminUserId(req: CustomAuthRequest, res: Response): string | undefined {
+function getAdminUserId(
+  req: CustomAuthRequest,
+  res: Response
+): string | undefined {
   if (!req.user || req.user.role !== "ADMIN") {
     res.status(403).json({ error: "Admin access required" });
     return undefined;
@@ -491,8 +515,7 @@ export const createAgentHandler = async (
         .json({ error: "An agent with this email already exists" });
     }
 
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.route_create_agent_error");
     return res.status(500).json({ error: "Failed to create agent" });
   }
@@ -526,8 +549,7 @@ export const listAgentsHandler = async (
 
     return res.status(200).json({ success: true, ...result });
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.route_list_agents_error");
     return res.status(500).json({ error: "Failed to fetch agents" });
   }
@@ -547,9 +569,11 @@ export const getAgentByIdHandler = async (
       return res.status(404).json({ error: "Agent not found" });
     }
 
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage, agentId: id }, "admin.route_get_agent_error");
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
+    logger.error(
+      { err: errMessage, agentId: id },
+      "admin.route_get_agent_error"
+    );
     return res.status(500).json({ error: "Failed to fetch agent" });
   }
 };
@@ -595,16 +619,18 @@ export const updateAgentStatusHandler = async (
         case "AGENT_NOT_FOUND":
           return res.status(404).json({ error: "Agent not found" });
         case "AGENT_ALREADY_IN_STATUS":
-          return res.status(409).json({ error: "Agent is already in that status" });
+          return res
+            .status(409)
+            .json({ error: "Agent is already in that status" });
         case "CANNOT_TRANSITION_FROM_DEACTIVATED":
           return res.status(409).json({
-            error: "A deactivated agent can only be set to ACTIVE, not SUSPENDED",
+            error:
+              "A deactivated agent can only be set to ACTIVE, not SUSPENDED",
           });
       }
     }
 
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error(
       { err: errMessage, agentId: id },
       "admin.route_update_agent_status_error"
@@ -621,8 +647,7 @@ export const getAdminOverviewHandler = async (
     const overview = await getAdminOverview();
     return res.status(200).json({ success: true, overview });
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.route_overview_error");
     return res.status(500).json({ error: "Failed to fetch overview" });
   }
@@ -651,8 +676,7 @@ export const getIncomeStatsHandler = async (
     const stats = await getIncomeStats({ from, to, terminalId, driverUid });
     return res.status(200).json({ success: true, stats });
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.route_income_error");
     return res.status(500).json({ error: "Failed to fetch income stats" });
   }
@@ -666,8 +690,7 @@ export const listTerminalsHandler = async (
     const terminals = await listTerminals();
     return res.status(200).json({ success: true, terminals });
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.route_terminals_error");
     return res.status(500).json({ error: "Failed to fetch terminals" });
   }
@@ -703,8 +726,7 @@ export const listDisputesHandler = async (
     });
     return res.status(200).json({ success: true, ...result });
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.route_list_disputes_error");
     return res.status(500).json({ error: "Failed to fetch disputes" });
   }
@@ -722,9 +744,11 @@ export const getDisputeByIdHandler = async (
     if (error instanceof Error && error.message === "DISPUTE_NOT_FOUND") {
       return res.status(404).json({ error: "Dispute not found" });
     }
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage, disputeId: id }, "admin.route_get_dispute_error");
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
+    logger.error(
+      { err: errMessage, disputeId: id },
+      "admin.route_get_dispute_error"
+    );
     return res.status(500).json({ error: "Failed to fetch dispute" });
   }
 };
@@ -774,16 +798,20 @@ export const updateDisputeStatusHandler = async (
         case "DISPUTE_NOT_FOUND":
           return res.status(404).json({ error: "Dispute not found" });
         case "DISPUTE_ALREADY_CLOSED":
-          return res.status(409).json({ error: "Dispute is already resolved or rejected" });
+          return res
+            .status(409)
+            .json({ error: "Dispute is already resolved or rejected" });
         case "RESOLUTION_REQUIRED":
           return res.status(400).json({
             error: "resolution text is required when closing a dispute",
           });
       }
     }
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage, disputeId: id }, "admin.route_update_dispute_error");
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
+    logger.error(
+      { err: errMessage, disputeId: id },
+      "admin.route_update_dispute_error"
+    );
     return res.status(500).json({ error: "Failed to update dispute" });
   }
 };
@@ -809,17 +837,13 @@ export const sendNotificationHandler = async (
 
   try {
     const notification = await sendNotification(studentMatric, title, body);
-    logger.info(
-      { studentMatric, adminId },
-      "admin.route_notification_sent"
-    );
+    logger.info({ studentMatric, adminId }, "admin.route_notification_sent");
     return res.status(201).json({ success: true, notification });
   } catch (error) {
     if (error instanceof Error && error.message === "STUDENT_NOT_FOUND") {
       return res.status(404).json({ error: "Student not found" });
     }
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.route_send_notification_error");
     return res.status(500).json({ error: "Failed to send notification" });
   }
@@ -885,8 +909,7 @@ export const syncWhitelistHandler = async (req: Request, res: Response) => {
       message: `Whitelist sync queued for fleet. ${whitelistUids.length} card(s), ${wlChunks.length} chunk(s).`,
     });
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.sync_whitelist_error");
     return res.status(500).json({ error: "Failed to queue whitelist sync" });
   }
@@ -910,7 +933,7 @@ export const issuePoisonPillHandler = async (
     });
 
     const poisonCmd = "CMD:POISON_PILL";
-  auditCriticalOperation("POISON_PILL", getAuditAdminId(req), terminalId);
+    auditCriticalOperation("POISON_PILL", getAuditAdminId(req), terminalId);
     // Delegate queuing & offline delivery exclusively to MQTT service bridge
     await enqueueRoute(terminalId, poisonCmd);
 
@@ -920,8 +943,7 @@ export const issuePoisonPillHandler = async (
       message: `Poison pill queued for ${terminalId}`,
     });
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     log.error({ err: errMessage }, "admin.poison_pill_error");
     res.status(500).json({ error: "Failed to issue poison pill" });
   }
@@ -967,8 +989,7 @@ export const broadcastOtaHandler = async (
       ...broadcastResult,
     });
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.ota_broadcast_error");
     res.status(500).json({ error: "OTA broadcast failed" });
   }
@@ -983,8 +1004,7 @@ export const confirmRegistrationHandler = async (
   if (!otp || !studentId) {
     return res.status(400).json({
       success: false,
-      message:
-        "Both otp and studentId are required for agent-assisted linking",
+      message: "Both otp and studentId are required for agent-assisted linking",
     });
   }
 
@@ -1001,10 +1021,11 @@ export const confirmRegistrationHandler = async (
 
     return res.status(400).json(result);
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.agent_link_error");
-    return res.status(500).json({ success: false, message: "Internal server error" });
+    return res
+      .status(500)
+      .json({ success: false, message: "Internal server error" });
   }
 };
 
@@ -1012,7 +1033,12 @@ export const monnifyWebhookHandler = async (
   req: Request<
     object,
     object,
-    { studentUid: string; amount: string | number; reference?: string; transactionReference?: string }
+    {
+      studentUid: string;
+      amount: string | number;
+      reference?: string;
+      transactionReference?: string;
+    }
   >,
   res: Response
 ) => {
@@ -1021,8 +1047,7 @@ export const monnifyWebhookHandler = async (
   const { studentUid, amount, reference, transactionReference } = req.body;
   const txRef = reference || transactionReference;
   const log = logger.child({ studentUid, amount, txRef });
-  const parsedAmount =
-    typeof amount === "string" ? parseFloat(amount) : amount;
+  const parsedAmount = typeof amount === "string" ? parseFloat(amount) : amount;
 
   if (!studentUid || !amount || isNaN(parsedAmount)) {
     log.warn("admin.monnify_webhook_invalid_payload");
@@ -1048,20 +1073,25 @@ export const monnifyWebhookHandler = async (
       await enqueueBroadcast(removeBlCmd);
     }
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     log.error({ err: errMessage }, "admin.monnify_webhook_processing_error");
   }
 };
 
 export const registerTerminalHandler = async (
-  req: Request<object, object, { terminalId: string; secretKey: string; location?: string }>,
+  req: Request<
+    object,
+    object,
+    { terminalId: string; secretKey: string; location?: string }
+  >,
   res: Response
 ) => {
   const { terminalId, secretKey, location } = req.body;
 
   if (!terminalId || !secretKey) {
-    return res.status(400).json({ error: "terminalId and secretKey are required" });
+    return res
+      .status(400)
+      .json({ error: "terminalId and secretKey are required" });
   }
 
   try {
@@ -1079,8 +1109,7 @@ export const registerTerminalHandler = async (
     logger.info({ terminalId, location }, "admin.terminal_registered");
     res.json({ success: true, terminal });
   } catch (error) {
-    const errMessage =
-      error instanceof Error ? error.message : "Unknown error";
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.terminal_registration_error");
     res.status(500).json({ error: "Failed to register terminal" });
   }
@@ -1092,7 +1121,9 @@ export const unlinkCardAdminHandler = async (
 ) => {
   try {
     if (!req.user || req.user.role !== "ADMIN") {
-      return res.status(403).json({ success: false, message: "Admin access required" });
+      return res
+        .status(403)
+        .json({ success: false, message: "Admin access required" });
     }
 
     const { cardUid, userIdentifier } = req.body;
@@ -1105,7 +1136,9 @@ export const unlinkCardAdminHandler = async (
 
     const result = await unlinkCard({
       cardUid: cardUid ? String(cardUid).trim() : undefined,
-      userIdentifier: userIdentifier ? String(userIdentifier).trim() : undefined,
+      userIdentifier: userIdentifier
+        ? String(userIdentifier).trim()
+        : undefined,
       callerId: req.user.userId,
       callerRole: req.user.role,
     });
@@ -1115,21 +1148,110 @@ export const unlinkCardAdminHandler = async (
     if (error instanceof Error) {
       switch (error.message) {
         case "CARD_NOT_FOUND":
-          return res.status(404).json({ success: false, message: "Card mapping not found" });
+          return res
+            .status(404)
+            .json({ success: false, message: "Card mapping not found" });
         case "USER_NOT_FOUND":
-          return res.status(404).json({ success: false, message: "User not found" });
+          return res
+            .status(404)
+            .json({ success: false, message: "User not found" });
         case "CARD_ALREADY_UNLINKED":
-          return res.status(400).json({ success: false, message: "No active card is linked to this user" });
+          return res
+            .status(400)
+            .json({
+              success: false,
+              message: "No active card is linked to this user",
+            });
         case "CARD_USER_MISMATCH":
         case "CARD_BELONGS_TO_ANOTHER_USER":
-          return res.status(400).json({ success: false, message: "Card does not belong to the specified user" });
+          return res
+            .status(400)
+            .json({
+              success: false,
+              message: "Card does not belong to the specified user",
+            });
         case "UNAUTHORIZED_CALLER":
-          return res.status(403).json({ success: false, message: "Unauthorized to unlink card" });
+          return res
+            .status(403)
+            .json({ success: false, message: "Unauthorized to unlink card" });
       }
     }
 
     const errMessage = error instanceof Error ? error.message : "Unknown error";
     logger.error({ err: errMessage }, "admin.unlink_card_controller_error");
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+export const linkAdminCardHandler = async (
+  req: CustomAuthRequest,
+  res: Response
+) => {
+  try {
+    if (!req.user || req.user.role !== "ADMIN") {
+      return res
+        .status(403)
+        .json({ success: false, message: "Admin access required" });
+    }
+
+    const { otp, pin } = req.body;
+    if (!otp || !pin) {
+      return res
+        .status(400)
+        .json({ success: false, message: "otp and pin are required" });
+    }
+
+    const result = await linkAdminCard(req.user.userId, {
+      otp: String(otp).trim(),
+      pin: String(pin).trim(),
+    });
+
+    return res.status(200).json(result);
+  } catch (error) {
+    if (error instanceof Error) {
+      const knownErrors: Record<string, { status: number; message: string }> = {
+        ADMIN_NOT_FOUND: { status: 404, message: "Admin account not found" },
+        INVALID_OTP_FORMAT: {
+          status: 400,
+          message: "OTP must be exactly 6 digits",
+        },
+        INVALID_PIN_FORMAT: {
+          status: 400,
+          message: "PIN must be exactly 4 digits",
+        },
+        INVALID_OTP: { status: 400, message: "OTP is invalid or unrecognized" },
+        OTP_ALREADY_USED: {
+          status: 409,
+          message: "This OTP has already been used",
+        },
+        OTP_EXPIRED: {
+          status: 410,
+          message: "This OTP has expired — tap your card again",
+        },
+        MISSING_TERMINAL_CONTEXT: {
+          status: 400,
+          message: "OTP is missing terminal context",
+        },
+        CARD_ALREADY_LINKED: {
+          status: 409,
+          message: "This card is already linked to another user",
+        },
+        ADMIN_ALREADY_HAS_CARD: {
+          status: 409,
+          message: "Your account already has a different card linked",
+        },
+      };
+
+      const known = knownErrors[error.message];
+      if (known) {
+        return res
+          .status(known.status)
+          .json({ success: false, message: known.message });
+      }
+    }
+
+    const errMessage = error instanceof Error ? error.message : "Unknown error";
+    logger.error({ err: errMessage }, "admin.link_card_controller_error");
     return res.status(500).json({ success: false, message: "Server error" });
   }
 };
