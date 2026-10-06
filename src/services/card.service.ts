@@ -1,6 +1,9 @@
 import prisma from "../lib/prisma.js";
 import { getRedisClient, cacheKeys } from "../config/redis.js";
-import { terminalProvisioningService } from "./terminal-provisioning.service.js";
+import {
+  terminalProvisioningService,
+  type TerminalList,
+} from "./terminal-provisioning.service.js";
 import logger from "../config/logger.js";
 
 export interface UnlinkCardParams {
@@ -42,7 +45,9 @@ export async function unlinkCard(
   }
 
   const cleanCardUid = cardUid ? cardUid.trim().toUpperCase() : undefined;
-  const cleanUserIdentifier = userIdentifier ? userIdentifier.trim() : undefined;
+  const cleanUserIdentifier = userIdentifier
+    ? userIdentifier.trim()
+    : undefined;
 
   if (!cleanCardUid && !cleanUserIdentifier) {
     throw new Error("MISSING_IDENTIFIER");
@@ -101,7 +106,8 @@ export async function unlinkCard(
 
   if (
     resolvedUser &&
-    mapping.student_uid.toUpperCase() !== resolvedUser.matricNumber.toUpperCase()
+    mapping.student_uid.toUpperCase() !==
+      resolvedUser.matricNumber.toUpperCase()
   ) {
     throw new Error("CARD_BELONGS_TO_ANOTHER_USER");
   }
@@ -142,10 +148,16 @@ export async function unlinkCard(
     if (tx.driverCardCredential) {
       await tx.driverCardCredential.deleteMany({
         where: {
-          OR: [
-            { card_uid: targetCardUid },
-            { driver_uid: targetStudentUid },
-          ],
+          OR: [{ card_uid: targetCardUid }, { driver_uid: targetStudentUid }],
+        },
+      });
+    }
+
+    // If user is ADMIN or has admin credentials, remove terminal card credential
+    if (tx.adminCardCredential) {
+      await tx.adminCardCredential.deleteMany({
+        where: {
+          OR: [{ card_uid: targetCardUid }, { admin_uid: targetStudentUid }],
         },
       });
     }
@@ -156,24 +168,44 @@ export async function unlinkCard(
     const redis = getRedisClient();
     if (redis) {
       await redis.del(cacheKeys.cardMap(targetCardUid));
-      logger.info({ cardUid: targetCardUid }, "card_service.redis_cache_invalidated");
+      logger.info(
+        { cardUid: targetCardUid },
+        "card_service.redis_cache_invalidated"
+      );
     }
   } catch (redisErr) {
     logger.warn(
-      { cardUid: targetCardUid, err: redisErr instanceof Error ? redisErr.message : String(redisErr) },
+      {
+        cardUid: targetCardUid,
+        err: redisErr instanceof Error ? redisErr.message : String(redisErr),
+      },
       "card_service.redis_cache_invalidation_error_ignored"
     );
   }
 
-  // 5. Terminal Whitelist Synchronization (DEL:WL)
+  // 5. Terminal list synchronization (REM:WL / REM:DR / REM:AD) —
+  // which list to clear depends on the role the card belonged to.
+  const targetList: TerminalList =
+    resolvedUser?.role === "DRIVER"
+      ? "DR"
+      : resolvedUser?.role === "ADMIN"
+      ? "AD"
+      : "WL";
+
   let terminalSyncSuccess: boolean;
   try {
-    const deprovResult = await terminalProvisioningService.deprovisionCard(targetCardUid);
+    const deprovResult = await terminalProvisioningService.deprovisionCard(
+      targetCardUid,
+      targetList
+    );
     terminalSyncSuccess = deprovResult.success;
   } catch (termErr) {
     terminalSyncSuccess = false;
     logger.error(
-      { cardUid: targetCardUid, err: termErr instanceof Error ? termErr.message : String(termErr) },
+      {
+        cardUid: targetCardUid,
+        err: termErr instanceof Error ? termErr.message : String(termErr),
+      },
       "card_service.terminal_deprovision_failed"
     );
   }
@@ -196,7 +228,9 @@ export async function unlinkCard(
       cardUid: targetCardUid,
       studentUid: targetStudentUid,
       userRole: resolvedUser?.role || "STUDENT",
-      userName: resolvedUser ? `${resolvedUser.firstname} ${resolvedUser.lastname}` : targetStudentUid,
+      userName: resolvedUser
+        ? `${resolvedUser.firstname} ${resolvedUser.lastname}`
+        : targetStudentUid,
       unlinkedAt: new Date().toISOString(),
       terminalSyncSuccess,
     },

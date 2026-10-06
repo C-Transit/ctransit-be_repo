@@ -81,7 +81,7 @@ model User {
   password     String
   role         Role     @default(STUDENT)
   isVerified   Boolean  @default(false)
-  phone        String?  @db.VarChar(20)
+  phone        String?  @unique @db.VarChar(20)
   vehicleType  String?  @db.VarChar(50)
   vehiclePlate String?  @db.VarChar(50)
   bankCode     String?  @db.VarChar(20)
@@ -95,6 +95,7 @@ model User {
   wallet            Wallet?
   driverWallet      DriverWallet?
   driverCredential  DriverCardCredential?
+  adminCredential   AdminCardCredential?
   transactions      Transaction[]      @relation("StudentTransactions")
   driverTransactions Transaction[]     @relation("DriverTransactions")
   driverWithdrawals DriverWithdrawal[] @relation("DriverWithdrawals")
@@ -301,6 +302,25 @@ model DriverCardCredential {
   @@index([driver_uid])
   @@index([card_uid])
   @@map("driver_card_credentials")
+}
+
+// Mirrors DriverCardCredential — admin's physical card UID + hashed terminal
+// login PIN, used to provision the terminal's AD (admin) list via
+// ADD:AD,{uid},{pin}. Linked via the DB directly for now (no self-service
+// admin flow yet).
+model AdminCardCredential {
+  id          String   @id @default(uuid())
+  admin_uid   String   @unique @db.VarChar(20)
+  card_uid    String   @unique @db.VarChar(20)
+  pin_hash    String   @db.VarChar(255)
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+  updated_at  DateTime @updatedAt @db.Timestamptz(6)
+
+  admin       User     @relation(fields: [admin_uid], references: [matricNumber], onDelete: Cascade)
+
+  @@index([admin_uid])
+  @@index([card_uid])
+  @@map("admin_card_credentials")
 }
 
 model Agent {

@@ -1,77 +1,109 @@
 // src/services/terminal-provisioning.service.ts
 //
-// Hardware-isolated provisioning service for C-Transit terminals.
+// Hardware-facing provisioning service for C-Transit terminals.
 //
-// NOTE ON HARDWARE DEPENDENCY:
-// The hardware developer will provide the exact downlink/broadcast payload type
-// for driver-card + PIN provisioning to physical terminals.
-// DO NOT invent a fake protocol or pretend it is final.
+// Terminal firmware maintains four independent lists, confirmed against the
+// firmware command reference (2026-09-28):
+//   WL  — student payment cards            ADD:WL,{uid}          REM:WL,{uid}
+//   BL  — blacklisted (low-balance) cards   ADD:BL,{uid}          REM:BL,{uid}
+//   DR  — driver cards (card + login PIN)   ADD:DR,{uid},{pin}    REM:DR,{uid}
+//   AD  — admin cards (card + login PIN)    ADD:AD,{uid},{pin}    REM:AD,{uid}
 //
-// This service cleanly encapsulates:
-// 1. Physical card whitelist delta distribution (ADD:WL, DEL:WL).
-// 2. Terminal-specific and fleet broadcast routing.
-// 3. Driver PIN provisioning placeholder pending final hardware downlink contract.
+// DR/AD entries require BOTH the card UID and the PIN in the same command —
+// the firmware has no concept of a "card without a PIN yet" for those two
+// lists, so we only ever call provisionCredential() once both pieces are
+// known. There is no AGENT list; agents authenticate through the web/app
+// portal, not by tapping a card at a terminal.
 
-import { enqueueRoute, enqueueBroadcast, BroadcastResult } from "../utils/bridge.js";
+import {
+  enqueueRoute,
+  enqueueBroadcast,
+  BroadcastResult,
+} from "../utils/bridge.js";
 import { buildDeltaCommand } from "../utils/parser.js";
 import logger from "../config/logger.js";
 
-export interface ProvisionDriverCardParams {
+export type TerminalList = "WL" | "BL" | "DR" | "AD";
+
+export interface ProvisionCardParams {
   cardUid: string;
-  driverUid: string;
+  list: TerminalList;
   originTerminalId?: string | null;
 }
 
-export interface ProvisionDriverPinParams {
+export interface ProvisionCredentialParams {
   cardUid: string;
-  driverUid: string;
-  terminalId?: string | null;
+  pin: string;
+  list: "DR" | "AD";
+  originTerminalId?: string | null;
 }
 
 export interface ITerminalProvisioningService {
-  provisionDriverCard(params: ProvisionDriverCardParams): Promise<{ success: boolean; broadcastResult?: BroadcastResult }>;
-  provisionDriverPin(params: ProvisionDriverPinParams): Promise<{ success: boolean; pendingHardwareContract: boolean }>;
-  deprovisionCard(cardUid: string): Promise<{ success: boolean; broadcastResult?: BroadcastResult }>;
+  provisionCard(
+    params: ProvisionCardParams
+  ): Promise<{ success: boolean; broadcastResult?: BroadcastResult }>;
+  provisionCredential(
+    params: ProvisionCredentialParams
+  ): Promise<{ success: boolean; broadcastResult?: BroadcastResult }>;
+  deprovisionCard(
+    cardUid: string,
+    list: TerminalList
+  ): Promise<{ success: boolean; broadcastResult?: BroadcastResult }>;
 }
 
-export class TerminalProvisioningService implements ITerminalProvisioningService {
+export class TerminalProvisioningService
+  implements ITerminalProvisioningService
+{
   /**
-   * Provisions a driver physical card to the origin terminal and fleet whitelist.
-   * Sends ADD:WL delta command to the origin terminal first (if available) and
-   * broadcasts to all fleet terminals.
+   * Adds a card to a UID-only list (currently just WL — student payment
+   * cards). Sends the delta to the origin terminal first (if known), then
+   * broadcasts to the fleet so every terminal converges on the same list.
    */
-  async provisionDriverCard(params: ProvisionDriverCardParams): Promise<{ success: boolean; broadcastResult?: BroadcastResult }> {
-    const { cardUid, driverUid, originTerminalId } = params;
-    const addWlCommand = buildDeltaCommand("ADD", "WL", cardUid);
+  async provisionCard(
+    params: ProvisionCardParams
+  ): Promise<{ success: boolean; broadcastResult?: BroadcastResult }> {
+    const { cardUid, list, originTerminalId } = params;
+    const addCommand = buildDeltaCommand("ADD", list, cardUid);
 
     logger.info(
-      { cardUid, driverUid, originTerminalId, command: addWlCommand },
-      "terminal_provisioning.provision_driver_card"
+      { cardUid, list, originTerminalId, command: addCommand },
+      "terminal_provisioning.provision_card"
     );
 
-    // 1. Targeted downlink to origin terminal if available
     if (originTerminalId) {
       try {
-        await enqueueRoute(originTerminalId, addWlCommand);
+        await enqueueRoute(originTerminalId, addCommand);
         logger.info(
-          { originTerminalId, cardUid },
+          { originTerminalId, cardUid, list },
           "terminal_provisioning.origin_terminal_routed"
         );
       } catch (routeErr) {
         logger.warn(
-          { originTerminalId, cardUid, err: routeErr instanceof Error ? routeErr.message : String(routeErr) },
+          {
+            originTerminalId,
+            cardUid,
+            list,
+            err:
+              routeErr instanceof Error ? routeErr.message : String(routeErr),
+          },
           "terminal_provisioning.origin_terminal_route_failed_continuing_broadcast"
         );
       }
     }
 
-    // 2. Fleet-wide broadcast for card whitelist synchronization
     let broadcastResult: BroadcastResult | undefined;
     try {
-      broadcastResult = await enqueueBroadcast(addWlCommand);
+      broadcastResult = await enqueueBroadcast(addCommand);
     } catch (broadcastErr) {
       logger.warn(
-        { cardUid, err: broadcastErr instanceof Error ? broadcastErr.message : String(broadcastErr) },
+        {
+          cardUid,
+          list,
+          err:
+            broadcastErr instanceof Error
+              ? broadcastErr.message
+              : String(broadcastErr),
+        },
         "terminal_provisioning.fleet_broadcast_failed"
       );
     }
@@ -80,49 +112,94 @@ export class TerminalProvisioningService implements ITerminalProvisioningService
   }
 
   /**
-   * Provisions driver PIN credentials to the active terminal.
-   *
-   * ARCHITECTURAL BOUNDARY:
-   * The exact downlink payload specification (e.g., DRV:PIN_PROV,<cardUid>,<encrypted_pin>)
-   * is pending confirmation from the terminal hardware engineering team.
-   * The backend domain logic securely hashes and persists the PIN, and this method
-   * isolates the terminal downlink operation until that hardware protocol is finalized.
+   * Provisions a driver or admin card + terminal login PIN in one downlink
+   * command (ADD:DR,{uid},{pin} or ADD:AD,{uid},{pin}). Only call this once
+   * both the card UID and PIN are known — the firmware list has no
+   * card-only intermediate state for DR/AD.
    */
-  async provisionDriverPin(params: ProvisionDriverPinParams): Promise<{ success: boolean; pendingHardwareContract: boolean }> {
-    const { cardUid, driverUid, terminalId } = params;
+  async provisionCredential(
+    params: ProvisionCredentialParams
+  ): Promise<{ success: boolean; broadcastResult?: BroadcastResult }> {
+    const { cardUid, pin, list, originTerminalId } = params;
+    const addCommand = buildDeltaCommand("ADD", list, cardUid, pin);
 
     logger.info(
       {
         cardUid,
-        driverUid,
-        terminalId: terminalId || "all",
-        pendingContract: "DRIVER_PIN_DOWNLINK_PROTOCOL",
+        list,
+        originTerminalId,
+        command: `ADD:${list},${cardUid},****`,
       },
-      "terminal_provisioning.pin_provisioning_dispatched_awaiting_hardware_payload_spec"
+      "terminal_provisioning.provision_credential"
     );
 
-    // Hardware payload stub: When hardware team defines downlink format (e.g. `CMD:DRV_PIN`),
-    // it will be routed here via enqueueRoute(terminalId, cmd) or enqueueBroadcast(cmd).
-    return {
-      success: true,
-      pendingHardwareContract: true,
-    };
+    if (originTerminalId) {
+      try {
+        await enqueueRoute(originTerminalId, addCommand);
+        logger.info(
+          { originTerminalId, cardUid, list },
+          "terminal_provisioning.origin_terminal_routed"
+        );
+      } catch (routeErr) {
+        logger.warn(
+          {
+            originTerminalId,
+            cardUid,
+            list,
+            err:
+              routeErr instanceof Error ? routeErr.message : String(routeErr),
+          },
+          "terminal_provisioning.origin_terminal_route_failed_continuing_broadcast"
+        );
+      }
+    }
+
+    let broadcastResult: BroadcastResult | undefined;
+    try {
+      broadcastResult = await enqueueBroadcast(addCommand);
+    } catch (broadcastErr) {
+      logger.warn(
+        {
+          cardUid,
+          list,
+          err:
+            broadcastErr instanceof Error
+              ? broadcastErr.message
+              : String(broadcastErr),
+        },
+        "terminal_provisioning.fleet_broadcast_failed"
+      );
+    }
+
+    return { success: true, broadcastResult };
   }
 
   /**
-   * Deprovisions a card from all terminals by broadcasting DEL:WL.
+   * Removes a card from the given list by broadcasting REM:{list},{uid} to
+   * the fleet. Which list to target depends on the card owner's role —
+   * callers must resolve that before calling this (see card.service.ts).
    */
-  async deprovisionCard(cardUid: string): Promise<{ success: boolean; broadcastResult?: BroadcastResult }> {
-    const delWlCommand = buildDeltaCommand("DEL", "WL", cardUid);
+  async deprovisionCard(
+    cardUid: string,
+    list: TerminalList
+  ): Promise<{ success: boolean; broadcastResult?: BroadcastResult }> {
+    const remCommand = buildDeltaCommand("REM", list, cardUid);
 
-    logger.info({ cardUid, command: delWlCommand }, "terminal_provisioning.deprovision_card");
+    logger.info(
+      { cardUid, list, command: remCommand },
+      "terminal_provisioning.deprovision_card"
+    );
 
     try {
-      const broadcastResult = await enqueueBroadcast(delWlCommand);
+      const broadcastResult = await enqueueBroadcast(remCommand);
       return { success: true, broadcastResult };
     } catch (err) {
       logger.warn(
-        { cardUid, err: err instanceof Error ? err.message : String(err) },
+        {
+          cardUid,
+          list,
+          err: err instanceof Error ? err.message : String(err),
+        },
         "terminal_provisioning.deprovision_broadcast_failed"
       );
       return { success: false };

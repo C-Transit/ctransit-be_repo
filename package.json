@@ -5,11 +5,11 @@
   "main": "index.js",
   "scripts": {
     "postinstall": "prisma generate",
-    "build": "tsc",
+    "build": "node init && tsc",
     "lint": "eslint src --ext .ts,.tsx",
     "test": "tsx --test tests/**/*.test.ts",
-    "start": "node dist/server.js",
-    "dev": "tsx watch server.ts"
+    "start": "node init && node dist/server.js",
+    "dev": "node init && tsx watch server.ts"
   },
   "keywords": [],
   "author": "",

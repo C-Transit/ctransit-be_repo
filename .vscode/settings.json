@@ -19,6 +19,5 @@
     "type": "shell",
     "command": "npm run lint",
     "runOn": "folderOpen"
-  },
-  "prisma.pinToPrisma6": true
+  }
 }
