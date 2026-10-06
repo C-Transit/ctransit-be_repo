@@ -15,7 +15,8 @@ export const INITIAL_FARE_CONFIGS: Record<string, LocationFareDefinition> = {
   C: { code: "C", locationName: "Hostel/Clinic", amount: 300 },
 };
 
-export const INITIAL_FARES_LIST: LocationFareDefinition[] = Object.values(INITIAL_FARE_CONFIGS);
+export const INITIAL_FARES_LIST: LocationFareDefinition[] =
+  Object.values(INITIAL_FARE_CONFIGS);
 
 export interface FareConfigRecord {
   id: string;
@@ -30,7 +31,9 @@ export interface FareConfigRecord {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type DbClient = any;
 
-export async function getFareConfigs(dbClient: DbClient = prisma): Promise<FareConfigRecord[]> {
+export async function getFareConfigs(
+  dbClient: DbClient = prisma
+): Promise<FareConfigRecord[]> {
   const configs = await dbClient.fareConfig.findMany({
     orderBy: { code: "asc" },
   });
@@ -38,7 +41,7 @@ export async function getFareConfigs(dbClient: DbClient = prisma): Promise<FareC
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return configs.map((c: any) => ({
     id: c.id,
-    code: c.code || c.location_code,
+    code: c.code,
     location_name: c.location_name,
     amount: parseFloat(c.amount.toString()),
     updated_by: c.updated_by,
@@ -47,20 +50,19 @@ export async function getFareConfigs(dbClient: DbClient = prisma): Promise<FareC
   }));
 }
 
-
 export async function getFareByCode(
   code: string,
   dbClient: DbClient = prisma
 ): Promise<FareConfigRecord | null> {
   const upperCode = code.toUpperCase();
   const config = await dbClient.fareConfig.findUnique({
-    where: { code: upperCode, location_code: upperCode },
+    where: { code: upperCode },
   });
 
   if (config) {
     return {
       id: config.id,
-      code: config.code || config.location_code,
+      code: config.code,
       location_name: config.location_name,
       amount: parseFloat(config.amount.toString()),
       updated_by: config.updated_by,
@@ -85,7 +87,6 @@ export async function getFareByCode(
 
   return null;
 }
-
 
 export async function getEffectiveFareAmount(
   location?: string | null,
@@ -119,7 +120,7 @@ export async function upsertFareConfig(
   const decimalAmount = new Prisma.Decimal(params.amount);
 
   const saved = await dbClient.fareConfig.upsert({
-    where: { code: upperCode, location_code: upperCode },
+    where: { code: upperCode },
     update: {
       location_name: params.locationName,
       amount: decimalAmount,
@@ -134,13 +135,18 @@ export async function upsertFareConfig(
   });
 
   logger.info(
-    { code: upperCode, amount: params.amount, locationName: params.locationName, updatedBy: params.updatedBy },
+    {
+      code: upperCode,
+      amount: params.amount,
+      locationName: params.locationName,
+      updatedBy: params.updatedBy,
+    },
     "fare_config.upserted"
   );
 
   return {
     id: saved.id,
-    code: saved.code || saved.location_code || upperCode,
+    code: saved.code || upperCode,
     location_name: saved.location_name,
     amount: parseFloat(saved.amount.toString()),
     updated_by: saved.updated_by,
@@ -149,13 +155,14 @@ export async function upsertFareConfig(
   };
 }
 
-
-export async function seedInitialFares(dbClient: DbClient = prisma): Promise<number> {
+export async function seedInitialFares(
+  dbClient: DbClient = prisma
+): Promise<number> {
   let count = 0;
   for (const def of Object.values(INITIAL_FARE_CONFIGS)) {
     if (dbClient.fareConfig.upsert) {
       await dbClient.fareConfig.upsert({
-        where: { code: def.code, location_code: def.code },
+        where: { code: def.code },
         update: {
           location_name: def.locationName,
           amount: new Prisma.Decimal(def.amount),
@@ -170,7 +177,7 @@ export async function seedInitialFares(dbClient: DbClient = prisma): Promise<num
       count++;
     } else {
       const existing = await dbClient.fareConfig.findUnique({
-        where: { code: def.code, location_code: def.code },
+        where: { code: def.code },
       });
       if (!existing) {
         await dbClient.fareConfig.create({
@@ -182,7 +189,10 @@ export async function seedInitialFares(dbClient: DbClient = prisma): Promise<num
           },
         });
         count++;
-        logger.info({ code: def.code, amount: def.amount }, "fare_config.seeded");
+        logger.info(
+          { code: def.code, amount: def.amount },
+          "fare_config.seeded"
+        );
       }
     }
   }

@@ -91,7 +91,6 @@ export interface SettleRideResult {
   fareSplit?: FareSplit;
 }
 
-
 function generateTransactionFingerprint(params: {
   protocolVersion?: string | null;
   terminalId: string;
@@ -159,17 +158,26 @@ async function deductFare(
   // Idempotency check: verify transaction doesn't already exist to prevent double-charging
   const checkClient = dbClient as unknown as {
     transaction?: {
-      findUnique?: (args: { where: { transaction_id: string } }) => Promise<unknown>;
+      findUnique?: (args: {
+        where: { transaction_id: string };
+      }) => Promise<unknown>;
     };
   };
-  if (checkClient.transaction && typeof checkClient.transaction.findUnique === "function") {
+  if (
+    checkClient.transaction &&
+    typeof checkClient.transaction.findUnique === "function"
+  ) {
     const existing = await checkClient.transaction.findUnique({
       where: { transaction_id: transactionId },
     });
     if (existing) {
       const currentBalance = parseFloat(wallet.balance.toString());
       childLogger.info("ledger.deduct_already_processed — idempotent skip");
-      return { newBalance: currentBalance, walletFound: true, alreadyProcessed: true };
+      return {
+        newBalance: currentBalance,
+        walletFound: true,
+        alreadyProcessed: true,
+      };
     }
   }
 
@@ -179,7 +187,11 @@ async function deductFare(
       { currentBalance, amount },
       "ledger.insufficient_funds — skipping deduction to prevent negative balance"
     );
-    return { newBalance: currentBalance, walletFound: true, insufficientFunds: true };
+    return {
+      newBalance: currentBalance,
+      walletFound: true,
+      insufficientFunds: true,
+    };
   }
 
   let newBalance: number;
@@ -195,7 +207,9 @@ async function deductFare(
       const refreshed = await dbClient.wallet.findUnique({
         where: { student_uid: studentUid },
       });
-      const bal = refreshed ? parseFloat(refreshed.balance.toString()) : currentBalance;
+      const bal = refreshed
+        ? parseFloat(refreshed.balance.toString())
+        : currentBalance;
       childLogger.warn(
         { currentBalance: bal, amount },
         "ledger.insufficient_funds — skipping deduction to prevent negative balance"
@@ -206,7 +220,9 @@ async function deductFare(
       where: { student_uid: studentUid },
       select: { balance: true },
     });
-    newBalance = refreshed ? parseFloat(refreshed.balance.toString()) : currentBalance - amount;
+    newBalance = refreshed
+      ? parseFloat(refreshed.balance.toString())
+      : currentBalance - amount;
   } else {
     const updatedWallet = await dbClient.wallet.update({
       where: { student_uid: studentUid },
@@ -272,9 +288,7 @@ async function settleRideTransaction(
     };
   }
 
-  const isV110L = Boolean(
-    cardUid || location || protocolVersion === "v1.1.0L"
-  );
+  const isV110L = Boolean(cardUid || location || protocolVersion === "v1.1.0L");
 
   // Parse tapped_at from timestamp or tappedAt
   const syncedAtDate = syncedAt || new Date();
@@ -406,8 +420,8 @@ async function settleRideTransaction(
       };
     }
 
-        // 1. Location Validation
-        let normLocation: string | null = null;
+    // 1. Location Validation
+    let normLocation: string | null = null;
     if (location !== undefined && location !== null && location !== "") {
       normLocation = location.trim().toUpperCase();
       const VALID_LOCATIONS = ["A", "B", "C"];
@@ -431,13 +445,13 @@ async function settleRideTransaction(
       };
     }
 
-        // 2. Fare Validation (FareConfig is source of truth, fail closed)
-        if (normLocation) {
+    // 2. Fare Validation (FareConfig is source of truth, fail closed)
+    if (normLocation) {
       let expectedFare: number;
       const fareTable = tx.fareConfig || dbClient.fareConfig;
       if (fareTable && typeof fareTable.findUnique === "function") {
         const fareRecord = await fareTable.findUnique({
-          where: { code: normLocation, location_code: normLocation },
+          where: { code: normLocation },
         });
         if (!fareRecord) {
           childLogger.warn(
@@ -481,8 +495,8 @@ async function settleRideTransaction(
       }
     }
 
-        // 3. Terminal & Driver Authorization Validation
-        const terminalTable = tx.terminal || dbClient.terminal;
+    // 3. Terminal & Driver Authorization Validation
+    const terminalTable = tx.terminal || dbClient.terminal;
     const normalisedDriverUid = driverUid
       ? driverUid.trim().toUpperCase()
       : null;
@@ -608,18 +622,17 @@ async function settleRideTransaction(
       }
     }
 
-        // 4. Card UID -> Student Resolution
-        const rawCardUid = cardUid || (isV110L ? effectiveStudentUid : null);
+    // 4. Card UID -> Student Resolution
+    const rawCardUid = cardUid || (isV110L ? effectiveStudentUid : null);
 
     let resolvedStudentMatric = effectiveStudentUid;
     let resolvedCardUid: string | null = rawCardUid;
 
     const cardMappingTable = tx.cardMapping || dbClient.cardMapping;
-    if (
-      cardMappingTable &&
-      typeof cardMappingTable.findUnique === "function"
-    ) {
-      const lookupUid = (rawCardUid || effectiveStudentUid || "").trim().toUpperCase();
+    if (cardMappingTable && typeof cardMappingTable.findUnique === "function") {
+      const lookupUid = (rawCardUid || effectiveStudentUid || "")
+        .trim()
+        .toUpperCase();
       const mapping = await cardMappingTable.findUnique({
         where: { card_uid: lookupUid },
         select: { student_uid: true },
@@ -651,8 +664,8 @@ async function settleRideTransaction(
       };
     }
 
-        // 5. Student Wallet Balance Check & Debit
-        const studentWallet = await tx.wallet.findUnique({
+    // 5. Student Wallet Balance Check & Debit
+    const studentWallet = await tx.wallet.findUnique({
       where: { student_uid: resolvedStudentMatric },
       select: { balance: true },
     });
@@ -732,8 +745,8 @@ async function settleRideTransaction(
       newStudentBalance = parseFloat(updatedStudentWallet.balance.toString());
     }
 
-        // 6. Driver Credit (96% share)
-        let driverBalance = 0;
+    // 6. Driver Credit (96% share)
+    let driverBalance = 0;
     if (normalisedDriverUid && tx.driverWallet) {
       const updatedDriverWallet = await tx.driverWallet.upsert({
         where: { driver_uid: normalisedDriverUid },
@@ -751,8 +764,8 @@ async function settleRideTransaction(
       driverBalance = parseFloat(updatedDriverWallet.balance.toString());
     }
 
-        // 7. C-Transit Platform Credit (4% share)
-        let ctransitBalance = 0;
+    // 7. C-Transit Platform Credit (4% share)
+    let ctransitBalance = 0;
     if (tx.systemWallet) {
       const updatedSystemWallet = await tx.systemWallet.upsert({
         where: { id: "CTRANSIT_SYSTEM" },
@@ -771,8 +784,8 @@ async function settleRideTransaction(
       ctransitBalance = parseFloat(updatedSystemWallet.balance.toString());
     }
 
-        // 8. Create Transaction Record
-        const transaction = await tx.transaction.create({
+    // 8. Create Transaction Record
+    const transaction = await tx.transaction.create({
       data: {
         transaction_id: transactionId,
         idempotency_key: idempotencyKey,
@@ -906,10 +919,15 @@ async function creditWallet(
   // Idempotency check: if transaction reference already exists, do not double-credit!
   const txCheckClient = dbClient as unknown as {
     transaction?: {
-      findUnique?: (args: { where: { transaction_id: string } }) => Promise<unknown>;
+      findUnique?: (args: {
+        where: { transaction_id: string };
+      }) => Promise<unknown>;
     };
   };
-  if (txCheckClient.transaction && typeof txCheckClient.transaction.findUnique === "function") {
+  if (
+    txCheckClient.transaction &&
+    typeof txCheckClient.transaction.findUnique === "function"
+  ) {
     const existing = await txCheckClient.transaction.findUnique({
       where: { transaction_id: txRef },
     });
