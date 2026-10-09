@@ -895,7 +895,7 @@ async function activateWallet(studentUid: string): Promise<void> {
 async function creditWallet(
   studentUid: string,
   amount: number,
-  reference?: string, // <-- new: optional transaction reference
+  reference?: string,
   dbClient = prisma
 ): Promise<CreditResult | null> {
   const wallet = await dbClient.wallet.findUnique({
@@ -984,5 +984,4 @@ export {
   hasCrossedAboveThreshold,
   activateWallet,
   creditWallet,
-  prisma,
 };

@@ -1,10 +1,8 @@
-"use strict";
-
+// app.ts
 import { randomUUID } from "node:crypto";
-import express, { Request, Response, NextFunction } from "express";
-import morgan from "morgan";
+import express from "express";
 import cors from "cors";
-import "dotenv/config";
+import env from "./src/config/env.js";
 import logger from "./src/config/logger.js";
 
 import healthRouter from "./src/routes/health.routes.js";
@@ -34,7 +32,15 @@ import {
   notificationLimiter,
 } from "./src/middleware/rate-limit.middleware.js";
 
-type RequestWithId = Request & { id?: string; rawBody?: string };
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace Express {
+    interface Request {
+      id?: string;
+      rawBody?: string;
+    }
+  }
+}
 
 const app = express();
 
@@ -42,44 +48,42 @@ app.set("trust proxy", 1);
 
 app.use(
   cors({
-    origin: [
-      "https://www.ctransit.me",
-      "https://admin.ctransit.me",
-      "https://agent.ctransit.me",
-      "https://driver.ctransit.me",
-      "http://localhost:3000",
-      "http://localhost:3001",
-      "http://localhost:3002",
-      "http://localhost:3003",
-      "https://c-transit-pink.vercel.app",
-      "https://ctransit-driver.vercel.app",
-    ],
+    origin:
+      env.NODE_ENV === "production"
+        ? [
+            "https://www.ctransit.me",
+            "https://admin.ctransit.me",
+            "https://agent.ctransit.me",
+            "https://driver.ctransit.me",
+          ]
+        : [
+            "http://localhost:3000",
+            "http://localhost:3001",
+            "http://localhost:3002",
+            "http://localhost:3003",
+            "https://c-transit-pink.vercel.app",
+            "https://ctransit-driver.vercel.app",
+          ],
     credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
   })
 );
 
-app.use((req: RequestWithId, _res: Response, next: NextFunction) => {
-  const requestId =
-    (req.headers["x-request-id"] as string | undefined) || randomUUID();
-  req.headers["x-request-id"] = requestId;
-  req.id = requestId;
-  next();
-});
+app.use((req, res, next) => {
+  req.id = (req.headers["x-request-id"] as string) || randomUUID();
+  res.setHeader("x-request-id", req.id);
 
-app.use((req: Request, res: Response, next: NextFunction) => {
-  const isHttps =
-    req.secure || req.headers["x-forwarded-proto"] === "https";
+  res.set({
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    "x-dns-prefetch-control": "off",
+    "referrer-policy": "no-referrer",
+    "cross-origin-opener-policy": "same-origin",
+    "cross-origin-resource-policy": "same-origin",
+    "permissions-policy": "geolocation=(), microphone=(), camera=()",
+  });
 
-  res.setHeader("x-content-type-options", "nosniff");
-  res.setHeader("x-frame-options", "DENY");
-  res.setHeader("x-dns-prefetch-control", "off");
-  res.setHeader("referrer-policy", "no-referrer");
-  res.setHeader("cross-origin-opener-policy", "same-origin");
-  res.setHeader("cross-origin-resource-policy", "same-origin");
-  res.setHeader("permissions-policy", "geolocation=(), microphone=(), camera=()");
-
-  if (isHttps && process.env.NODE_ENV === "production") {
+  if (env.NODE_ENV === "production") {
     res.setHeader(
       "strict-transport-security",
       "max-age=31536000; includeSubDomains"
@@ -89,59 +93,50 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-if (process.env.NODE_ENV === "development") {
-  app.use(morgan("dev"));
-}
 app.use(
   express.json({
     limit: "10kb",
     verify: (req, _res, buffer) => {
-      (req as RequestWithId).rawBody = buffer.toString("utf8");
+      (req as express.Request).rawBody = buffer.toString("utf8");
     },
   })
 );
 app.use(express.urlencoded({ extended: false }));
 
-app.use((req: Request, res: Response, next: NextFunction) => {
+app.use((req, res, next) => {
   const start = Date.now();
-  const requestId =
-    (req.headers["x-request-id"] as string | undefined) || randomUUID();
 
   res.on("finish", () => {
-    const durationMs = Date.now() - start;
     const logData = {
-      requestId,
+      requestId: req.id,
       method: req.method,
       path: req.path,
       statusCode: res.statusCode,
-      durationMs,
+      durationMs: Date.now() - start,
       ip: req.ip,
     };
 
-    if (res.statusCode >= 500) {
-      logger.error(logData, "http.server_error");
-    } else if (res.statusCode >= 400) {
-      logger.warn(logData, "http.client_error");
-    } else {
-      logger.info(logData, "http.request");
-    }
+    const level =
+      res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    const eventName =
+      level === "info"
+        ? "http.request"
+        : `http.${level === "error" ? "server_error" : "client_error"}`;
+    logger[level](logData, eventName);
   });
 
-  res.setHeader("x-request-id", requestId);
   next();
 });
 
-// Global rate limiter
 app.use(globalLimiter);
 
-app.get("/", (req: Request, res: Response) => {
+app.get("/", (_req, res) => {
   res.send("C-transit server is running");
 });
 
 app.use(["/health", "/api/health"], healthRouter);
 app.use(["/admin", "/api/admin"], adminRouter);
 
-// Authentication & user management
 app.use("/api/auth/register", registerLimiter);
 app.use("/api/auth/login", loginLimiter);
 app.use("/api/auth/admin/login", adminLoginLimiter);
@@ -151,44 +146,29 @@ app.use("/api/auth", authRoutes);
 
 app.use("/api/users", userRoutes);
 
-// KYC 
 app.use("/api/kyc/submit", kycSubmitLimiter);
 app.use("/api/kyc/status", kycStatusLimiter);
 app.use("/api/kyc", kycRoutes);
 
-// Wallets 
 app.use("/api/wallets", walletLimiter, authenticateToken, walletsRouter);
-
 app.use("/api/payments", paymentRoutes);
-
-// Transactions 
 app.use(
   "/api/transactions",
   transactionLimiter,
   authenticateToken,
   transactionRoutes
 );
-
-// Agents 
 app.use("/api/agents", agentRoutes);
-
-// Disputes 
 app.use("/api/disputes", disputeLimiter, disputeRoutes);
-
-// Notifications 
 app.use("/api/notifications", notificationLimiter, notificationRoutes);
-
-// Drivers
 app.use("/api/drivers", driverRoutes);
 
-// 404
-app.use((req: Request, res: Response) => {
+app.use((_req, res) => {
   res.status(404).json({ error: "Not found" });
 });
 
-// Global error handler
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
+app.use((err: Error, req: express.Request, res: express.Response, _next: express.NextFunction) => {
   logger.error({ err: err.message, path: req.path }, "http.unhandled_error");
   res.status(500).json({ error: "Internal server error" });
 });

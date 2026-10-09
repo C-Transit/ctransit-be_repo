@@ -3,7 +3,7 @@
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
-import { prisma } from "./ledger.service.js";
+import { prisma } from "../lib/prisma.js";
 import env from "../config/env.js";
 import logger from "../config/logger.js";
 import { issueRefreshToken } from "./token.service.js";

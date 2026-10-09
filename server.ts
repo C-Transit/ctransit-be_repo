@@ -1,166 +1,120 @@
-"use strict";
-
-// Validate and load environment variables
-import "./src/config/env.js";
-
+// server.ts
+import env from "./src/config/env.js";
 import http from "http";
 import app from "./app.js";
 import { getRedisClient } from "./src/config/redis.js";
-import { prisma } from "./src/services/ledger.service.js";
+import { prisma } from "./src/lib/prisma.js";
 import logger from "./src/config/logger.js";
-import env from "./src/config/env.js";
 
-// HTTP server with boot/shutdown sequence for Redis, PostgreSQL, and MQTT
+const TIMEOUT_MS = 15_000;
 const server = http.createServer(app);
 let isShuttingDown = false;
-let databaseMonitor: NodeJS.Timeout | undefined;
+let databaseMonitor: NodeJS.Timeout;
 
-function formatError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
+const formatError = (err: unknown) =>
+  err instanceof Error ? err.message : String(err);
 
-async function withTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
-  let timeout: NodeJS.Timeout | undefined;
+async function withTimeout<T>(
+  operation: Promise<T>,
+  label: string
+): Promise<T> {
+  let timeout: NodeJS.Timeout;
   const deadline = new Promise<never>((_, reject) => {
-    timeout = setTimeout(() => {
-      reject(new Error(`${label} timed out after 15 seconds`));
-    }, 15_000);
+    timeout = setTimeout(
+      () => reject(new Error(`${label} connection timed out`)),
+      TIMEOUT_MS
+    );
   });
 
   try {
     return await Promise.race([operation, deadline]);
   } finally {
-    if (timeout) clearTimeout(timeout);
+    clearTimeout(timeout!);
   }
 }
 
-async function boot(): Promise<void> {
-  logger.info(
-    { version: process.version, env: env.NODE_ENV },
-    "server.boot_start"
-  );
-
+async function boot() {
   try {
-    const redis = getRedisClient() as {
-      connect: () => Promise<unknown>;
-      ping: () => Promise<string>;
-    };
-    await withTimeout(redis.connect(), "Redis connection");
-    await withTimeout(redis.ping(), "Redis health check");
-    logger.info("server.redis_ready");
-    logger.info("server.postgres_connecting");
-    await withTimeout(prisma.$connect(), "PostgreSQL connection");
-    await withTimeout(prisma.$queryRaw`SELECT 1`, "PostgreSQL health check");
-    logger.info(
-      { database: "postgresql" },
-      "server.postgres_connection_established"
-    );
+    const redis = getRedisClient();
+    await withTimeout(redis.ping(), "Redis");
+    await withTimeout(prisma.$queryRaw`SELECT 1`, "PostgreSQL");
   } catch (err) {
     logger.fatal(
-      { err: formatError(err) },
-      "server.boot_failed — critical dependency unavailable"
+      { err: formatError(err), reason: "critical dependency unavailable" },
+      "server.boot_failed"
     );
-    await shutdown("boot_failure", 1);
-    return;
+    return shutdown("boot_failure", 1);
   }
 
   server.on("error", (err: Error) => {
     logger.fatal({ err: err.message }, "server.http_error");
-    void shutdown("http_error", 1);
+    shutdown("http_error", 1);
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.listen(env.PORT, "0.0.0.0", () => {
-      logger.info({ port: env.PORT, host: "0.0.0.0" }, "server.http_listening");
-      resolve();
-    });
-    server.once("error", reject);
-  }).catch(async (err: unknown) => {
-    logger.fatal({ err: formatError(err) }, "server.boot_failed — HTTP server unavailable");
-    await shutdown("http_boot_failure", 1);
-  });
+  server.listen(env.PORT, () => {
+    logger.info(
+      { port: env.PORT, version: process.version, env: env.NODE_ENV },
+      "server.boot_complete"
+    );
 
-  if (!server.listening) return;
-
-  databaseMonitor = setInterval(() => {
-    void Promise.all([
-      prisma.$queryRaw`SELECT 1`,
-      (getRedisClient() as { ping: () => Promise<string> }).ping(),
-    ]).catch(async (err: unknown) => {
-      logger.fatal(
-        { err: formatError(err) },
-        "server.critical_dependency_connection_lost — shutting down"
+    databaseMonitor = setInterval(() => {
+      Promise.all([prisma.$queryRaw`SELECT 1`, getRedisClient().ping()]).catch(
+        (err) => {
+          logger.error(
+            { err: formatError(err) },
+            "server.dependency_connection_lost"
+          );
+        }
       );
-      await shutdown("critical_dependency_connection_lost", 1);
-    });
-  }, 15_000);
-
-  logger.info("server.boot_complete — all systems operational");
+    }, TIMEOUT_MS);
+  });
 }
 
-// Graceful shutdown handler
-async function shutdown(signal: string, exitCode = 0): Promise<void> {
+async function shutdown(signal: string, exitCode = 0) {
   if (isShuttingDown) return;
   isShuttingDown = true;
 
   logger.info({ signal }, "server.shutdown_initiated");
-
-  if (databaseMonitor) {
-    clearInterval(databaseMonitor);
-    databaseMonitor = undefined;
-  }
+  clearInterval(databaseMonitor);
 
   if (server.listening) {
-    await new Promise<void>((resolve) => {
-      server.close(() => {
-        logger.info("server.http_closed");
-        resolve();
-      });
-    });
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 
-  try {
-    const redis = getRedisClient() as { quit: () => Promise<unknown> };
-    await redis.quit();
-    logger.info("server.redis_disconnected");
-  } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    logger.error({ err: errMsg }, "server.redis_disconnect_error");
-  }
+  const disconnects = await Promise.allSettled([
+    getRedisClient().quit(),
+    prisma.$disconnect(),
+  ]);
 
-  try {
-    await prisma.$disconnect();
-    logger.info("server.postgres_disconnected");
-  } catch (err) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    logger.error({ err: errMsg }, "server.postgres_disconnect_error");
-  }
+  disconnects.forEach((result, index) => {
+    if (result.status === "rejected") {
+      const db = index === 0 ? "redis" : "postgres";
+      logger.error(
+        { err: formatError(result.reason) },
+        `server.${db}_disconnect_error`
+      );
+    }
+  });
 
   logger.info("server.shutdown_complete");
   process.exit(exitCode);
 }
 
-// Handle termination signals and unhandled errors
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("SIGINT", () => shutdown("SIGINT"));
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.on(signal, () => shutdown(signal));
+}
 
-process.on(
-  "unhandledRejection",
-  (reason: unknown, promise: Promise<unknown>) => {
-    logger.fatal(
-      { reason: String(reason), promise: String(promise) },
-      "server.unhandled_promise_rejection"
-    );
-    void shutdown("unhandled_rejection", 1);
-  }
-);
+process.on("unhandledRejection", (reason: unknown) => {
+  logger.fatal({ reason: String(reason) }, "server.unhandled_rejection");
+  shutdown("unhandled_rejection", 1);
+});
 
 process.on("uncaughtException", (err: Error) => {
   logger.fatal(
     { err: err.message, stack: err.stack },
-    "server.uncaught_exception — shutting down safely"
+    "server.uncaught_exception"
   );
-  shutdown("uncaughtException");
+  shutdown("uncaught_exception", 1);
 });
 
 boot();

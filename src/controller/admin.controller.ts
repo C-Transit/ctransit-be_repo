@@ -13,8 +13,8 @@ import { confirmRegistration } from "../services/registration.service.js";
 import {
   creditWallet,
   hasCrossedAboveThreshold,
-  prisma,
 } from "../services/ledger.service.js";
+import { prisma } from "../lib/prisma.js";
 import { buildDeltaCommand } from "../utils/parser.js";
 import { getRedisClient, redisKeys } from "../config/redis.js";
 import { approveKyc, rejectKyc } from "../services/kyc.service.js";

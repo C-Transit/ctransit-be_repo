@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import { getRedisClient } from "../config/redis.js";
-import { prisma } from "../services/ledger.service.js";
+import { prisma } from "../lib/prisma.js";
 import logger from "../config/logger.js";
 import env from "../config/env.js";
 

@@ -1,15 +1,19 @@
-"use strict";
-
-import type { Request, Response } from "express";
+import { timingSafeEqual } from "node:crypto";
+import type { NextFunction, Request, Response } from "express";
 import logger from "../config/logger.js";
 import env from "../config/env.js";
 import { settleRide } from "../services/settlement.service.js";
 
-// requireInternalSecret
-export function requireInternalSecret(req: Request, res: Response, next: () => void): void {
-  const provided = req.headers["x-internal-secret"] as string | undefined;
+const safeEqual = (a: string, b: string): boolean => {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && timingSafeEqual(x, y);
+};
 
-  if (!provided || provided !== env.mqtt.internalSecret) {
+export function requireInternalSecret(req: Request, res: Response, next: NextFunction): void {
+  const provided = req.headers["x-internal-secret"];
+
+  if (typeof provided !== "string" || !safeEqual(provided, env.mqtt.internalSecret)) {
     logger.warn({ ip: req.ip, path: req.path }, "internal.unauthorized — bad or missing secret");
     res.status(401).json({ success: false, message: "Unauthorized" });
     return;
@@ -18,136 +22,92 @@ export function requireInternalSecret(req: Request, res: Response, next: () => v
   next();
 }
 
-// handleSettle
+const clean = (v: unknown, max: number): string | null => {
+  if (typeof v !== "string") return null;
+  const t = v.trim();
+  return t && t.length <= max ? t : null;
+};
+
+const FAILURES = {
+  TERMINAL_NOT_FOUND: [404, "Terminal not found"],
+  STUDENT_NOT_FOUND: [404, "Student wallet not found"],
+  NO_ACTIVE_DRIVER: [409, "No driver is currently logged into this terminal"],
+  DRIVER_NOT_FOUND: [404, "Terminal active driver not found or has incorrect role"],
+} as const;
+
 export const handleSettle = async (req: Request, res: Response): Promise<void> => {
-  const { transaction_id, terminal_id, student_uid, amount } = req.body as {
-    transaction_id?: unknown;
-    terminal_id?: unknown;
-    student_uid?: unknown;
-    amount?: unknown;
-  };
+  const { transaction_id, terminal_id, student_uid, amount } = req.body ?? {};
 
-  const log = logger.child({ transaction_id, terminal_id, student_uid, amount });
+  const txId = clean(transaction_id, 64);
+  const terminalId = clean(terminal_id, 20);
+  const studentUid = clean(student_uid, 20);
+  const parsedAmount = typeof amount === "number" || typeof amount === "string" ? Number(amount) : NaN;
 
-  // Field validation
-  if (
-    typeof transaction_id !== "string" || transaction_id.trim().length === 0 || transaction_id.length > 64
-  ) {
-    res.status(400).json({ success: false, message: "transaction_id must be a non-empty string (max 64 chars)" });
+  if (!txId || !terminalId || !studentUid) {
+    res.status(400).json({
+      success: false,
+      message: "transaction_id (max 64), terminal_id (max 20) and student_uid (max 20) must be non-empty strings",
+    });
     return;
   }
 
-  if (typeof terminal_id !== "string" || terminal_id.trim().length === 0 || terminal_id.length > 20) {
-    res.status(400).json({ success: false, message: "terminal_id must be a non-empty string (max 20 chars)" });
-    return;
-  }
-
-  if (typeof student_uid !== "string" || student_uid.trim().length === 0 || student_uid.length > 20) {
-    res.status(400).json({ success: false, message: "student_uid must be a non-empty string (max 20 chars)" });
-    return;
-  }
-
-  const parsedAmount = typeof amount === "number" ? amount : parseFloat(String(amount));
-  if (isNaN(parsedAmount) || parsedAmount <= 0) {
+  if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
     res.status(400).json({ success: false, message: "amount must be a positive number" });
     return;
   }
 
-  log.info("settlement.request_received");
+  const log = logger.child({ transaction_id: txId, terminal_id: terminalId, student_uid: studentUid, amount: parsedAmount });
 
-  // Delegate to settlement service
   try {
     const result = await settleRide({
-      transaction_id: transaction_id.trim(),
-      terminal_id: terminal_id.trim(),
-      student_uid: student_uid.trim(),
+      transaction_id: txId,
+      terminal_id: terminalId,
+      student_uid: studentUid,
       amount: parsedAmount,
     });
 
-    switch (result.status) {
-      case "SETTLED":
-        log.info(result, "settlement.http_response_settled");
-        res.status(200).json({
-          success: true,
-          status: "SETTLED",
-          data: {
-            studentNewBalance: result.studentNewBalance,
-            driverEarned: result.driverEarned,
-            platformEarned: result.platformEarned,
-          },
-        });
-        return;
-
-      case "ALREADY_SETTLED":
-        log.info("settlement.http_response_already_settled");
-        res.status(200).json({
-          success: true,
-          status: "ALREADY_SETTLED",
-          message: "Ride already settled — no action taken",
-        });
-        return;
-
-      case "INSUFFICIENT_BALANCE":
-        log.warn(result, "settlement.http_response_insufficient_balance");
-        res.status(402).json({
-          success: false,
-          status: "INSUFFICIENT_BALANCE",
-          message: "Student wallet balance is insufficient for this fare",
-          data: {
-            availableBalance: result.availableBalance,
-            required: result.required,
-          },
-        });
-        return;
-
-      case "STUDENT_NOT_FOUND":
-        log.warn("settlement.http_response_student_not_found");
-        res.status(404).json({
-          success: false,
-          status: "STUDENT_NOT_FOUND",
-          message: "Student wallet not found",
-        });
-        return;
-
-      case "TERMINAL_NOT_FOUND":
-        log.warn("settlement.http_response_terminal_not_found");
-        res.status(404).json({
-          success: false,
-          status: "TERMINAL_NOT_FOUND",
-          message: "Terminal not found",
-        });
-        return;
-
-      case "NO_ACTIVE_DRIVER":
-        log.warn("settlement.http_response_no_active_driver");
-        res.status(409).json({
-          success: false,
-          status: "NO_ACTIVE_DRIVER",
-          message: "No driver is currently logged into this terminal",
-        });
-        return;
-
-      case "DRIVER_NOT_FOUND":
-        log.warn("settlement.http_response_driver_not_found");
-        res.status(404).json({
-          success: false,
-          status: "DRIVER_NOT_FOUND",
-          message: "Terminal active driver not found or has incorrect role",
-        });
-        return;
-
-      default: {
-        
-        // TypeScript exhaustiveness guard
-        const _exhaustive: never = result;
-        log.error({ result: _exhaustive }, "settlement.unknown_result_status");
-        res.status(500).json({ success: false, message: "Internal server error" });
-        return;
-      }
+    if (result.status === "SETTLED" || result.status === "ALREADY_SETTLED") {
+      log.info(result, "settlement.result");
+    } else {
+      log.warn(result, "settlement.result");
     }
+
+    if (result.status === "SETTLED") {
+      res.status(200).json({
+        success: true,
+        status: "SETTLED",
+        data: {
+          studentNewBalance: result.studentNewBalance,
+          driverEarned: result.driverEarned,
+          platformEarned: result.platformEarned,
+        },
+      });
+      return;
+    }
+
+    if (result.status === "ALREADY_SETTLED") {
+      res.status(200).json({
+        success: true,
+        status: "ALREADY_SETTLED",
+        message: "Ride already settled — no action taken",
+      });
+      return;
+    }
+
+    if (result.status === "INSUFFICIENT_BALANCE") {
+      res.status(402).json({
+        success: false,
+        status: "INSUFFICIENT_BALANCE",
+        message: "Student wallet balance is insufficient for this fare",
+        data: { availableBalance: result.availableBalance, required: result.required },
+      });
+      return;
+    }
+
+    const [code, message] = FAILURES[result.status];
+    res.status(code).json({ success: false, status: result.status, message });
   } catch (err: unknown) {
-    const errMsg = err instanceof Error ? err.message : String(err);
-    log.error({ err: errMsg }, "settlement.http_unhandled_error");
+    log.error({ err: err instanceof Error ? err.message : String(err) }, "settlement.http_unhandled_error");
     res.status(500).json({ success: false, message: "Internal server error during settlement" });
   }
 };

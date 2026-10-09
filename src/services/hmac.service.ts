@@ -15,7 +15,7 @@
 // by measuring response time differences.
 
 import crypto from "crypto";
-import { prisma } from "./ledger.service.js";
+import { prisma } from "../lib/prisma.js";
 import logger from "../config/logger.js";
 
 // Returned by verifyAndUnwrap — caller gets the clean payload
