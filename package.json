@@ -16,6 +16,9 @@
   },
   "dependencies": {
     "@prisma/client": "^6.19.2",
+    "@types/express": "^5.0.6",
+    "@types/multer": "^2.1.0",
+    "@types/node": "^26.0.1",
     "bcryptjs": "^3.0.3",
     "cloudinary": "^2.10.0",
     "cors": "^2.8.6",
@@ -33,10 +36,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/cors": "^2.8.19",
-    "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
-    "@types/multer": "^2.1.0",
-    "@types/node": "^26.0.1",
     "@types/nodemailer": "^8.0.0",
     "@types/speakeasy": "^2.0.10",
     "@typescript-eslint/eslint-plugin": "^8.61.0",
