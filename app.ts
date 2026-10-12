@@ -49,7 +49,7 @@ app.use(
     origin:
       env.NODE_ENV === "production"
         ? [
-          "https://ctransit.me",
+          "https://www.ctransit.me",
           "https://admin.ctransit.me",
           "https://agent.ctransit.me",
           "https://driver.ctransit.me",
