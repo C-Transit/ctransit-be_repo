@@ -107,7 +107,7 @@ export async function unlinkCard(
   if (
     resolvedUser &&
     mapping.student_uid.toUpperCase() !==
-      resolvedUser.matricNumber.toUpperCase()
+    resolvedUser.matricNumber.toUpperCase()
   ) {
     throw new Error("CARD_BELONGS_TO_ANOTHER_USER");
   }
@@ -124,6 +124,11 @@ export async function unlinkCard(
         lastname: true,
       },
     });
+  }
+
+  if (callerRole === "AGENT" && resolvedUser && resolvedUser.role !== "STUDENT") {
+    logger.warn({ callerId, targetRole: resolvedUser.role }, "card_service.agent_unlink_non_student_blocked");
+    throw new Error("UNAUTHORIZED_CALLER");
   }
 
   const targetCardUid = mapping.card_uid;
@@ -189,8 +194,8 @@ export async function unlinkCard(
     resolvedUser?.role === "DRIVER"
       ? "DR"
       : resolvedUser?.role === "ADMIN"
-      ? "AD"
-      : "WL";
+        ? "AD"
+        : "WL";
 
   let terminalSyncSuccess: boolean;
   try {

@@ -5,6 +5,7 @@ import { getRedisClient, cacheKeys } from "../config/redis.js";
 import logger from "../config/logger.js";
 import { sendNotification } from "./notification.service.js";
 import { terminalProvisioningService } from "./terminal-provisioning.service.js";
+import { revokeAllRefreshTokens } from "./token.service.js";
 
 export interface CreateAgentInput {
   firstname: string;
@@ -129,6 +130,8 @@ async function updateAgentStatus(
       createdBy: true,
     },
   });
+
+  if (newStatus !== "ACTIVE") await revokeAllRefreshTokens(agentId);
 
   try {
     const redis = redisClient;

@@ -23,6 +23,7 @@ import {
   getDriverNotificationsHandler,
   markDriverNotificationReadHandler,
   markAllDriverNotificationsReadHandler,
+  unlinkDriverCardHandler,
 } from "../controller/driver.controller.js";
 import { handlePaymentWebhook } from "../controller/webhook.controller.js";
 
@@ -58,6 +59,9 @@ router.post("/card/link", driverCardLinkLimiter, linkDriverCardHandler);
 
 // 8. POST /api/drivers/card/pin
 router.post("/card/pin", driverPinLimiter, setDriverCardPinHandler);
+
+// 8a. POST /api/drivers/card/unlink
+router.post("/card/unlink", driverPinLimiter, unlinkDriverCardHandler);
 
 // 9. GET /api/drivers/card/pin/status
 router.get("/card/pin/status", getDriverPinStatusHandler);

@@ -1,4 +1,3 @@
-// src/routes/auth.routes.ts
 import { Router } from "express";
 import {
   registerStudent,
@@ -11,27 +10,23 @@ import {
   refreshAccessToken,
   getCardLinkStatus,
 } from "../controller/auth.controller.js";
-import agentRouter from "./agent.routes.js";
-import { authenticateToken } from "../middleware/auth.middleware.js";
+import { authenticateToken, requireStudent } from "../middleware/auth.middleware.js";
 
 const router = Router();
 
-// ── Student auth ───────────────────────────────────────────────────────────
+// Student auth
 router.post("/register", registerStudent);
 router.post("/verify-otp", verifyOTP);
 router.post("/resend-otp", resendOTP);
 router.post("/login", loginStudent);
 router.post("/logout", logoutStudent);
-router.post("/refresh", refreshAccessToken); // No auth required — token is self-validating
-router.post("/confirm-card", authenticateToken, confirmCard);
-router.get("/card-link-status", authenticateToken, getCardLinkStatus);
+router.post("/refresh", refreshAccessToken); // no auth: the refresh token is self-validating
+router.post("/confirm-card", authenticateToken, requireStudent, confirmCard);
+router.get("/card-link-status", authenticateToken, requireStudent, getCardLinkStatus);
 
-// ── Admin auth ─────────────────────────────────────────────────────────────
-// Separate route — bypasses institution email check, role-guards at DB level
+// Admin auth (role is enforced against the DB in loginAdmin)
 router.post("/admin/login", loginAdmin);
 
-// ── Agent auth ─────────────────────────────────────────────────────────────
-// Agents do not self-register — accounts are created by admin only
-router.use("/agent", agentRouter);
+// Agents log in at /api/agents/login (see agent.routes.ts)
 
 export default router;

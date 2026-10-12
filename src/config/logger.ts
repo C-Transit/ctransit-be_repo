@@ -3,63 +3,56 @@ import env from "./env.js";
 
 const isDev = env.NODE_ENV === "development";
 
+// Field names that must never reach the logs. Each is redacted at the top level and one level deep.
+const SENSITIVE_FIELDS = [
+  "password",
+  "newPassword",
+  "currentPassword",
+  "adminPassword",
+  "pin",
+  "otp",
+  "secret",
+  "secret_key",
+  "secretKey",
+  "apiKey",
+  "api_key",
+  "token",
+  "accessToken",
+  "refreshToken",
+  "refresh_token",
+  "jwt",
+  "signature",
+  "authorization",
+  "Authorization",
+  "accountNumber",
+];
+
+const SENSITIVE_HEADERS = [
+  "authorization",
+  "cookie",
+  "x-api-key",
+  "x-internal-secret",
+  "x-critical-approval-token",
+  "x-korapay-signature",
+];
+
 const loggerOptions: LoggerOptions = {
   level: isDev ? "debug" : "info",
-  base: {
-    service: "ctransit-backend-hardware-link",
-    env: env.NODE_ENV,
-  },
+  base: { service: "ctransit-backend-hardware-link", env: env.NODE_ENV },
   timestamp: pino.stdTimeFunctions.isoTime,
   formatters: {
-    level(label) {
-      return { level: label };
-    },
+    level: (label) => ({ level: label }),
   },
   redact: {
     paths: [
       "mqtt.password",
       "redis.password",
-      "*.secret_key",
-      "*.secretKey",
-      "*.apiKey",
-      "*.api_key",
-      "*.password",
-      "password",
-      "newPassword",
-      "currentPassword",
-      "adminPassword",
-      "*.authorization",
-      "authorization",
-      "Authorization",
-      "headers.authorization",
-      "headers.Authorization",
-      "headers['authorization']",
-      "headers['Authorization']",
-      "headers['x-admin-secret']",
-      "headers['x-korapay-signature']",
-      "headers['fincra-signature']",
-      "*.kora_secret",
-      "*.koraSecret",
-      "kora_secret",
-      "koraSecret",
-      "*.secret",
-      "secret",
-      "token",
-      "*.token",
-      "accessToken",
-      "*.accessToken",
-      "refreshToken",
-      "*.refreshToken",
-      "jwt",
-      "*.jwt",
-      "signature",
-      "*.signature",
-      "otp",
-      "*.otp",
+      ...SENSITIVE_FIELDS,
+      ...SENSITIVE_FIELDS.map((f) => `*.${f}`),
+      ...SENSITIVE_HEADERS.flatMap((h) => [`headers['${h}']`, `req.headers['${h}']`]),
     ],
     censor: "[REDACTED]",
   },
-  
   ...(isDev && {
     transport: {
       target: "pino-pretty",
@@ -73,6 +66,4 @@ const loggerOptions: LoggerOptions = {
   }),
 };
 
-const logger = pino(loggerOptions);
-
-export default logger;
+export default pino(loggerOptions);

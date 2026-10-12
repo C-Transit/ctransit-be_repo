@@ -1,484 +1,289 @@
-// src/controller/auth.controller.ts
-import { Request, Response } from "express";
-import prisma from "../lib/prisma.js";
+import type { Request, Response } from "express";
 import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
+import prisma from "../lib/prisma.js";
 import logger from "../config/logger.js";
 import env from "../config/env.js";
-import {
-  generateOTP,
-  verifyOTPToken,
-  sendOTPEmail,
-} from "../services/otp.service.js";
+import { generateOTP, verifyOTPToken, sendOTPEmail } from "../services/otp.service.js";
 import { confirmRegistration } from "../services/registration.service.js";
 import {
   issueRefreshToken,
   verifyRefreshToken,
   revokeRefreshToken,
+  signAccessToken,
 } from "../services/token.service.js";
+import { isLocked, recordFailure, clearFailures } from "../services/lockout.service.js";
+import { isValidPassword, PASSWORD_RULE_MESSAGE } from "../utils/password.js";
 
-// Interface to handle routes protected by auth middleware
 export interface AuthenticatedRequest extends Request {
-  user?: {
-    userId: string;
-    role?: string;
-  };
+  user?: { userId: string; role?: string };
 }
 
-const isValidInstitutionEmail = (email: string): boolean => {
-  return email.toLowerCase().endsWith(env.auth.allowedEmailDomain);
+const errMsg = (e: unknown) => (e instanceof Error ? e.message : "Unknown error");
+const LOCKED_MESSAGE = "Too many failed attempts. Try again in 15 minutes.";
+// Real hash so a login for an unknown email costs the same as a real one.
+const DUMMY_HASH = bcrypt.hashSync("dummy-password", 10);
+
+const isValidInstitutionEmail = (email: string) => email.endsWith(env.auth.allowedEmailDomain);
+
+const serverError = (res: Response, err: unknown, event: string) => {
+  logger.error({ err: errMsg(err) }, event);
+  return res.status(500).json({ message: "Server error" });
 };
 
-const isValidPassword = (password: string): boolean => {
-  const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d).{8,}$/;
-  return passwordRegex.test(password);
-};
-
-// registerStudent
 export const registerStudent = async (req: Request, res: Response) => {
   try {
-    const { firstname, lastname, email, matricNumber, password } = req.body;
-
+    const { firstname, lastname, email, matricNumber, password } = req.body ?? {};
     if (!firstname || !lastname || !email || !matricNumber || !password) {
       return res.status(400).json({ message: "All fields are required" });
     }
+
+    const mail = String(email).toLowerCase();
+    const matric = String(matricNumber).toUpperCase();
+
     if (!isValidPassword(password)) {
-      return res.status(400).json({
-        message:
-          "Password must be at least 8 characters and contain uppercase, lowercase, and numbers",
-      });
+      return res.status(400).json({ message: PASSWORD_RULE_MESSAGE });
     }
-    if (!isValidInstitutionEmail(email)) {
-      return res.status(400).json({
-        message: `Only ${env.auth.allowedEmailDomain} email addresses are accepted`,
-      });
+    if (!isValidInstitutionEmail(mail)) {
+      return res.status(400).json({ message: `Only ${env.auth.allowedEmailDomain} email addresses are accepted` });
     }
 
-    const existingUser = await prisma.user.findFirst({
-      where: {
-        OR: [{ email: email.toLowerCase() }, { matricNumber }],
-      },
+    const existing = await prisma.user.findFirst({
+      where: { OR: [{ email: mail }, { matricNumber: matric }] },
+      select: { id: true },
     });
+    if (existing) return res.status(400).json({ message: "User already exists" });
 
-    if (existingUser) {
-      return res.status(400).json({ message: "User already exists" });
-    }
-
-    const hashedPassword = await bcrypt.hash(password, 10);
     await prisma.user.create({
       data: {
         firstname,
         lastname,
-        email: email.toLowerCase(),
-        matricNumber: matricNumber.toUpperCase(),
-        password: hashedPassword,
+        email: mail,
+        matricNumber: matric,
+        password: await bcrypt.hash(password, 10),
         role: "STUDENT",
         isVerified: false,
       },
     });
 
-    const otp = generateOTP(email.toLowerCase());
-    await sendOTPEmail(email.toLowerCase(), otp);
-
-    logger.info(
-      { email: email.toLowerCase() },
-      "auth.registration_successful_otp_sent"
-    );
-    return res.status(201).json({
-      message: "Registration successful. Check your email for the OTP.",
-    });
+    await sendOTPEmail(mail, generateOTP(mail));
+    logger.info({ email: mail }, "auth.registration_successful_otp_sent");
+    return res.status(201).json({ message: "Registration successful. Check your email for the OTP." });
   } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "auth.registration_error");
-    return res.status(500).json({ message: "Server error" });
+    return serverError(res, error, "auth.registration_error");
   }
 };
 
-// verifyOTP
 export const verifyOTP = async (req: Request, res: Response) => {
   try {
-    const { email, otp } = req.body;
-    if (!email || !otp) {
-      return res.status(400).json({ message: "Email and OTP are required" });
+    const { email, otp } = req.body ?? {};
+    if (!email || !otp) return res.status(400).json({ message: "Email and OTP are required" });
+
+    const mail = String(email).toLowerCase();
+    const lockKey = `verify:${mail}`;
+    if (await isLocked(lockKey)) {
+      logger.warn({ email: mail }, "auth.verify_otp_locked");
+      return res.status(429).json({ message: LOCKED_MESSAGE });
     }
 
-    const user = await prisma.user.findUnique({
-      where: { email: email.toLowerCase() },
-    });
-
+    const user = await prisma.user.findUnique({ where: { email: mail }, select: { isVerified: true } });
     if (!user) {
-      logger.warn(
-        { email: email.toLowerCase() },
-        "auth.verify_otp_user_not_found"
-      );
+      logger.warn({ email: mail }, "auth.verify_otp_user_not_found");
       return res.status(404).json({ message: "User not found" });
     }
-    if (user.isVerified) {
-      return res.status(400).json({ message: "Email already verified" });
+    if (user.isVerified) return res.status(400).json({ message: "Email already verified" });
+
+    if (!verifyOTPToken(mail, String(otp))) {
+      recordFailure(lockKey);
+      logger.warn({ email: mail }, "auth.verify_otp_invalid_or_expired");
+      return res.status(400).json({ message: "Invalid or expired OTP. Please request a new one." });
     }
+    clearFailures(lockKey);
 
-    const isValid = verifyOTPToken(email.toLowerCase(), otp);
-    if (!isValid) {
-      logger.warn(
-        { email: email.toLowerCase() },
-        "auth.verify_otp_invalid_or_expired"
-      );
-      return res.status(400).json({
-        message: "Invalid or expired OTP. Please request a new one.",
-      });
-    }
-
-    await prisma.user.update({
-      where: { email: email.toLowerCase() },
-      data: { isVerified: true },
-    });
-
-    logger.info(
-      { email: email.toLowerCase() },
-      "auth.otp_verified_successfully"
-    );
-    return res.status(200).json({
-      message: "Email verified successfully. You can now log in.",
-    });
+    await prisma.user.update({ where: { email: mail }, data: { isVerified: true } });
+    logger.info({ email: mail }, "auth.otp_verified_successfully");
+    return res.status(200).json({ message: "Email verified successfully. You can now log in." });
   } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "auth.verify_otp_error");
-    return res.status(500).json({ message: "Server error" });
+    return serverError(res, error, "auth.verify_otp_error");
   }
 };
 
-// resendOTP
 export const resendOTP = async (req: Request, res: Response) => {
   try {
-    const { email } = req.body;
-    if (!email) {
-      return res.status(400).json({ message: "Email is required" });
-    }
+    const { email } = req.body ?? {};
+    if (!email) return res.status(400).json({ message: "Email is required" });
 
-    const user = await prisma.user.findUnique({
-      where: { email: email.toLowerCase() },
-    });
+    const mail = String(email).toLowerCase();
+    const user = await prisma.user.findUnique({ where: { email: mail }, select: { isVerified: true } });
 
     if (!user) {
-      logger.warn(
-        { email: email.toLowerCase() },
-        "auth.resend_otp_user_not_found"
-      );
+      logger.warn({ email: mail }, "auth.resend_otp_user_not_found");
       return res.status(404).json({ message: "User not found" });
     }
-    if (user.isVerified) {
-      return res.status(400).json({ message: "Email is already verified" });
-    }
+    if (user.isVerified) return res.status(400).json({ message: "Email is already verified" });
 
-    const otp = generateOTP(email.toLowerCase());
-    await sendOTPEmail(email.toLowerCase(), otp);
-
-    logger.info({ email: email.toLowerCase() }, "auth.otp_resent");
-    return res.status(200).json({
-      message: "A new OTP has been sent to your email",
-    });
+    await sendOTPEmail(mail, generateOTP(mail));
+    logger.info({ email: mail }, "auth.otp_resent");
+    return res.status(200).json({ message: "A new OTP has been sent to your email" });
   } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "auth.resend_otp_error");
-    return res.status(500).json({ message: "Server error" });
+    return serverError(res, error, "auth.resend_otp_error");
   }
 };
 
-// loginStudent
 export const loginStudent = async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res
-        .status(400)
-        .json({ message: "Please provide email and password" });
-    }
-    if (!isValidInstitutionEmail(email)) {
-      return res.status(400).json({
-        message: `Only ${env.auth.allowedEmailDomain} email addresses are accepted`,
-      });
+    const { email, password } = req.body ?? {};
+    if (!email || !password) return res.status(400).json({ message: "Please provide email and password" });
+
+    const mail = String(email).toLowerCase();
+    if (!isValidInstitutionEmail(mail)) {
+      return res.status(400).json({ message: `Only ${env.auth.allowedEmailDomain} email addresses are accepted` });
     }
 
-    const user = await prisma.user.findUnique({
-      where: { email: email.toLowerCase() },
-    });
+    const lockKey = `student:${mail}`;
+    if (await isLocked(lockKey)) {
+      logger.warn({ email: mail }, "auth.login_locked");
+      return res.status(429).json({ message: LOCKED_MESSAGE });
+    }
 
-    if (!user) {
-      logger.warn({ email: email.toLowerCase() }, "auth.login_user_not_found");
+    const user = await prisma.user.findUnique({ where: { email: mail } });
+    const validPassword = await bcrypt.compare(String(password), user?.password ?? DUMMY_HASH);
+
+    if (!user || user.role !== "STUDENT" || !validPassword) {
+      recordFailure(lockKey);
+      logger.warn({ email: mail }, "auth.login_invalid_credentials");
       return res.status(400).json({ message: "Invalid email or password" });
     }
+    clearFailures(lockKey);
+
+    // Only reveal "not verified" to someone who proved they know the password.
     if (!user.isVerified) {
-      logger.warn(
-        { email: email.toLowerCase() },
-        "auth.login_email_not_verified"
-      );
-      return res.status(403).json({
-        message: "Email not verified. Please check your email for the OTP.",
-      });
+      logger.warn({ email: mail }, "auth.login_email_not_verified");
+      return res.status(403).json({ message: "Email not verified. Please check your email for the OTP." });
     }
 
-    const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) {
-      logger.warn(
-        { email: email.toLowerCase() },
-        "auth.login_invalid_password"
-      );
-      return res.status(400).json({ message: "Invalid email or password" });
-    }
+    const payload = { userId: user.id, role: user.role, email: user.email };
+    const accessToken = signAccessToken(payload);
+    const refreshToken = await issueRefreshToken(payload);
 
-    const accessToken = jwt.sign(
-      { userId: user.id, role: user.role, email: user.email },
-      env.jwt.secret,
-      { expiresIn: "1h" }
-    );
-
-    const refreshToken = await issueRefreshToken({
-      userId: user.id,
-      role: user.role,
-      email: user.email,
-    });
-
-    logger.info(
-      { email: email.toLowerCase(), userId: user.id },
-      "auth.login_successful"
-    );
-    return res.status(200).json({
-      accessToken,
-      refreshToken,
-      message: "Login successful",
-    });
+    logger.info({ userId: user.id }, "auth.login_successful");
+    return res.status(200).json({ accessToken, refreshToken, message: "Login successful" });
   } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "auth.login_error");
-    return res.status(500).json({ message: "Server error" });
+    return serverError(res, error, "auth.login_error");
   }
 };
 
-// loginAdmin
 export const loginAdmin = async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body;
+    const { email, password } = req.body ?? {};
+    if (!email || !password) return res.status(400).json({ message: "Please provide email and password" });
 
-    if (!email || !password) {
-      return res
-        .status(400)
-        .json({ message: "Please provide email and password" });
+    const mail = String(email).toLowerCase();
+    const lockKey = `admin:${mail}`;
+    if (await isLocked(lockKey)) {
+      logger.warn({ email: mail }, "auth.admin_login_locked");
+      return res.status(429).json({ message: LOCKED_MESSAGE });
     }
 
-    const user = await prisma.user.findUnique({
-      where: { email: email.toLowerCase() },
-    });
+    const user = await prisma.user.findUnique({ where: { email: mail } });
+    const validPassword = await bcrypt.compare(String(password), user?.password ?? DUMMY_HASH);
 
-    if (!user || user.role !== "ADMIN") {
-      logger.warn({ email: email.toLowerCase() }, "auth.admin_login_failed");
+    if (!user || user.role !== "ADMIN" || !validPassword) {
+      recordFailure(lockKey);
+      logger.warn({ email: mail }, "auth.admin_login_failed");
       return res.status(401).json({ message: "Invalid email or password" });
     }
+    clearFailures(lockKey);
 
-    const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) {
-      logger.warn(
-        { email: email.toLowerCase() },
-        "auth.admin_login_invalid_password"
-      );
-      return res.status(401).json({ message: "Invalid email or password" });
-    }
+    const payload = { userId: user.id, role: user.role, email: user.email };
+    const accessToken = signAccessToken(payload);
+    const refreshToken = await issueRefreshToken(payload);
 
-    const accessToken = jwt.sign(
-      { userId: user.id, role: user.role, email: user.email },
-      env.jwt.secret,
-      { expiresIn: "8h" }
-    );
-
-    const refreshToken = await issueRefreshToken({
-      userId: user.id,
-      role: user.role,
-      email: user.email,
-    });
-
-    logger.info(
-      { email: email.toLowerCase(), userId: user.id },
-      "auth.admin_login_successful"
-    );
-    return res.status(200).json({
-      accessToken,
-      refreshToken,
-      message: "Login successful",
-    });
+    logger.info({ userId: user.id }, "auth.admin_login_successful");
+    return res.status(200).json({ accessToken, refreshToken, message: "Login successful" });
   } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "auth.admin_login_error");
-    return res.status(500).json({ message: "Server error" });
+    return serverError(res, error, "auth.admin_login_error");
   }
 };
 
-// logoutStudent
 export const logoutStudent = async (req: Request, res: Response) => {
   try {
-    const { refreshToken } = req.body;
-
+    const { refreshToken } = req.body ?? {};
     if (refreshToken) {
-      // Extract tokenId from the JWT, then delete from Redis.
       const payload = await verifyRefreshToken(refreshToken);
-      if (payload) {
-        await revokeRefreshToken(payload.tokenId);
-      }
+      if (payload) await revokeRefreshToken(payload.tokenId);
     }
-
     logger.info("auth.logout_successful");
-    return res.status(200).json({
-      success: true,
-      message: "Logged out successfully",
-    });
+    return res.status(200).json({ success: true, message: "Logged out successfully" });
   } catch (err) {
-    logger.error({ err }, "auth.logout_failed");
-    return res.status(500).json({
-      success: false,
-      message: "Internal server error during logout",
-    });
+    logger.error({ err: errMsg(err) }, "auth.logout_failed");
+    return res.status(500).json({ success: false, message: "Internal server error during logout" });
   }
 };
 
-// refreshAccessToken
 export const refreshAccessToken = async (req: Request, res: Response) => {
   try {
-    const { refreshToken } = req.body;
-
-    if (!refreshToken) {
-      return res.status(400).json({ message: "Refresh token is required" });
-    }
+    const { refreshToken } = req.body ?? {};
+    if (!refreshToken) return res.status(400).json({ message: "Refresh token is required" });
 
     const payload = await verifyRefreshToken(refreshToken);
+    if (!payload) return res.status(401).json({ message: "Invalid or expired refresh token" });
 
-    if (!payload) {
-      return res
-        .status(401)
-        .json({ message: "Invalid or expired refresh token" });
+    // Suspended or deactivated agents must not be able to keep refreshing.
+    if (payload.role === "AGENT") {
+      const agent = await prisma.agent.findUnique({ where: { id: payload.userId }, select: { status: true } });
+      if (agent?.status !== "ACTIVE") return res.status(401).json({ message: "Invalid or expired refresh token" });
     }
 
-    // Admin and Driver get 8h access tokens
-    const expiresIn =
-      payload.role === "ADMIN" || payload.role === "DRIVER" ? "8h" : "1h";
-
-    const accessToken = jwt.sign(
-      { userId: payload.userId, role: payload.role, email: payload.email },
-      env.jwt.secret,
-      { expiresIn }
-    );
-
+    const accessToken = signAccessToken(payload);
     logger.info({ userId: payload.userId, role: payload.role }, "auth.token_refreshed");
     return res.status(200).json({ accessToken, token: accessToken });
   } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "auth.refresh_error");
-    return res.status(500).json({ message: "Server error" });
+    return serverError(res, error, "auth.refresh_error");
   }
 };
 
-// confirmCard
 export const confirmCard = async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const userId = req.user?.userId;
-    if (!userId) {
-      return res.status(401).json({ success: false, message: "Unauthorized" });
+    const otp = req.body?.otp;
+    if (!otp) return res.status(400).json({ success: false, message: "OTP is required" });
+    if (!/^\d{6}$/.test(String(otp))) {
+      return res.status(400).json({ success: false, message: "OTP must be exactly 6 digits" });
     }
 
-    const { otp } = req.body;
-
-    if (!otp) {
-      return res
-        .status(400)
-        .json({ success: false, message: "OTP is required" });
-    }
-
-    // OTP must be exactly 6 digits
-    if (!/^\d{6}$/.test(otp)) {
-      return res.status(400).json({
-        success: false,
-        message: "OTP must be exactly 6 digits",
-      });
-    }
-
-    const result = await confirmRegistration(otp, userId);
+    const userId = req.user!.userId;
+    const result = await confirmRegistration(String(otp), userId);
     logger.info({ userId, success: result.success }, "auth.confirm_card_result");
 
-    if (!result.success) {
-      return res.status(400).json(result);
-    }
-
-
-    return res.status(200).json(result);
+    return res.status(result.success ? 200 : 400).json(result);
   } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "auth.confirm_card_error");
-    return res
-      .status(500)
-      .json({ success: false, message: "Internal server error" });
+    logger.error({ err: errMsg(error) }, "auth.confirm_card_error");
+    return res.status(500).json({ success: false, message: "Internal server error" });
   }
 };
 
-export const getCardLinkStatus = async (
-  req: AuthenticatedRequest,
-  res: Response
-) => {
+export const getCardLinkStatus = async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const userId = req.user?.userId;
-    if (!userId) {
-      return res.status(401).json({ success: false, message: 'Unauthorized' });
-    }
-
-    // Get student's matric number
     const user = await prisma.user.findUnique({
-      where: { id: userId },
+      where: { id: req.user!.userId },
       select: { matricNumber: true },
     });
+    if (!user) return res.status(404).json({ success: false, message: "User not found" });
 
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-
-    // Check if card is already linked
-    const cardMap = await prisma.cardMapping.findUnique({
+    const card = await prisma.cardMapping.findUnique({
       where: { student_uid: user.matricNumber },
       select: { card_uid: true },
     });
 
-    if (cardMap) {
-      return res.status(200).json({
-        success: true,
-        status: 'LINKED',
-        cardUid: cardMap.card_uid,
-        expiresAt: null,
-      });
-    }
-
-    // Check if there's a pending OTP for this student
-    const pendingOtp = await prisma.registrationOtp.findFirst({
-      where: {
-        used: false,
-        expires_at: { gt: new Date() },
-      },
-      orderBy: { created_at: 'desc' },
-      select: { otp: true, expires_at: true, card_uid: true },
-    });
-
-    if (pendingOtp) {
-      return res.status(200).json({
-        success: true,
-        status: 'PENDING',
-        cardUid: pendingOtp.card_uid,
-        expiresAt: pendingOtp.expires_at,
-      });
-    }
-
+    // Registration OTPs aren't tied to a student until confirmed, so there is no per-student
+    // "pending" state to report. The student types the OTP shown on the terminal.
     return res.status(200).json({
       success: true,
-      status: 'NO_ACTIVE_OTP',
-      cardUid: null,
+      status: card ? "LINKED" : "NO_ACTIVE_OTP",
+      cardUid: card?.card_uid ?? null,
       expiresAt: null,
     });
   } catch (error) {
-    const errMessage = error instanceof Error ? error.message : 'Unknown error';
-    logger.error({ err: errMessage }, 'auth.card_link_status_error');
-    return res.status(500).json({ success: false, message: 'Failed to fetch card link status' });
+    logger.error({ err: errMsg(error) }, "auth.card_link_status_error");
+    return res.status(500).json({ success: false, message: "Failed to fetch card link status" });
   }
 };

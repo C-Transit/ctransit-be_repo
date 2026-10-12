@@ -2,11 +2,11 @@ import { Router } from "express";
 import {
   initializeCheckout,
   getCheckoutStatus,
-  requestVirtualAccount,
-  getVirtualAccountDetails,
-  mockTopup,
 } from "../controller/payment.controller.js";
-import { handlePaymentWebhook } from "../controller/webhook.controller.js";
+import {
+  handlePaymentWebhook,
+  handlePayoutWebhook,
+} from "../controller/webhook.controller.js";
 import {
   authenticateToken,
   requireStudent,
@@ -14,9 +14,8 @@ import {
 
 const router = Router();
 
-router.post("/fund", handlePaymentWebhook);
-router.post("/webhook", handlePaymentWebhook);
-router.post("/payout-webhook", handlePaymentWebhook);
+router.post("/webhook", handlePaymentWebhook); // student checkout credits
+router.post("/payout-webhook", handlePayoutWebhook); // driver payout confirmations
 
 router.post(
   "/initialize",
@@ -30,20 +29,5 @@ router.get(
   requireStudent,
   getCheckoutStatus
 );
-
-router.post(
-  "/create",
-  authenticateToken,
-  requireStudent,
-  requestVirtualAccount
-);
-router.get(
-  "/fetch",
-  authenticateToken,
-  requireStudent,
-  getVirtualAccountDetails
-);
-
-router.post("/topup", authenticateToken, requireStudent, mockTopup);
 
 export default router;

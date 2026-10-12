@@ -1,11 +1,21 @@
 import prisma from "../lib/prisma.js";
 import env from "../config/env.js";
-import logger from "../config/logger.js";
 
-interface CreditResult {
-  previousBalance: number;
-  newBalance: number;
-}
+export type CreditOutcome =
+  | {
+      status: "CREDITED";
+      matric: string;
+      previousBalance: number;
+      newBalance: number;
+    }
+  | {
+      status:
+        | "DUPLICATE"
+        | "NOT_FOUND"
+        | "AMOUNT_MISMATCH"
+        | "CURRENCY_MISMATCH"
+        | "NO_WALLET";
+    };
 
 function hasCrossedAboveThreshold(
   previousBalance: number,
@@ -16,75 +26,69 @@ function hasCrossedAboveThreshold(
   );
 }
 
-async function activateWallet(studentUid: string): Promise<void> {
-  await prisma.wallet.upsert({
-    where: { student_uid: studentUid },
-    update: { is_linked: true },
-    create: { student_uid: studentUid, balance: 0, is_linked: true },
-  });
-  logger.info({ studentUid }, "ledger.wallet_activated");
-}
+// Credits the wallet for a checkout payment and finalizes its PaymentAttempt in ONE transaction.
+async function creditPaymentAttempt(
+  reference: string,
+  paidAmount: number,
+  currency?: string
+): Promise<CreditOutcome> {
+  return prisma.$transaction(async (tx): Promise<CreditOutcome> => {
+    const attempt = await tx.paymentAttempt.findUnique({
+      where: { reference },
+      select: {
+        amount: true,
+        currency: true,
+        user: { select: { matricNumber: true } },
+      },
+    });
+    if (!attempt) return { status: "NOT_FOUND" };
+    if (!attempt.amount.equals(paidAmount))
+      return { status: "AMOUNT_MISMATCH" };
+    if (currency && currency.toUpperCase() !== attempt.currency.toUpperCase()) {
+      return { status: "CURRENCY_MISMATCH" };
+    }
 
-async function creditWallet(
-  studentUid: string,
-  amount: number,
-  reference?: string
-): Promise<CreditResult | null> {
-  const wallet = await prisma.wallet.findUnique({
-    where: { student_uid: studentUid },
-    select: { balance: true },
-  });
+    const matric = attempt.user.matricNumber;
+    const wallet = await tx.wallet.findUnique({
+      where: { student_uid: matric },
+      select: { student_uid: true },
+    });
+    if (!wallet) return { status: "NO_WALLET" };
 
-  if (!wallet) {
-    logger.warn({ studentUid }, "ledger.credit_wallet_not_found");
-    return null;
-  }
-
-  const txRef =
-    reference ??
-    `TOPUP-${Date.now()}-${Math.random()
-      .toString(36)
-      .slice(2, 8)
-      .toUpperCase()}`;
-  const previousBalance = wallet.balance.toNumber();
-
-  // Idempotency: a reference that already exists must never be credited twice.
-  const existing = await prisma.transaction.findUnique({
-    where: { transaction_id: txRef },
-    select: { transaction_id: true },
-  });
-  if (existing) {
-    logger.info(
-      { studentUid, txRef },
-      "ledger.credit_wallet_already_processed — idempotent skip"
-    );
-    return { previousBalance, newBalance: previousBalance };
-  }
-
-  const [updatedWallet] = await prisma.$transaction([
-    prisma.wallet.update({
-      where: { student_uid: studentUid },
-      data: { balance: { increment: amount } },
-      select: { balance: true },
-    }),
-    prisma.transaction.create({
+    // Claim the attempt. A concurrent or repeated webhook finds count 0.
+    const claimed = await tx.paymentAttempt.updateMany({
+      where: { reference, status: { not: "SUCCESS" } },
       data: {
-        transaction_id: txRef,
+        status: "SUCCESS",
+        completedAt: new Date(),
+        providerReference: reference,
+        failureReason: null,
+      },
+    });
+    if (claimed.count === 0) return { status: "DUPLICATE" };
+
+    const updated = await tx.wallet.update({
+      where: { student_uid: matric },
+      data: { balance: { increment: paidAmount } },
+      select: { balance: true },
+    });
+    await tx.transaction.create({
+      data: {
+        transaction_id: reference,
         type: "TOPUP",
         terminal_id: "SYSTEM_TERMINAL",
-        student_uid: studentUid,
-        amount,
+        student_uid: matric,
+        amount: paidAmount,
       },
-    }),
-  ]);
+    });
 
-  const newBalance = updatedWallet.balance.toNumber();
-  logger.info(
-    { studentUid, previousBalance, newBalance, amount, reference: txRef },
-    "ledger.wallet_credited"
-  );
-
-  return { previousBalance, newBalance };
+    return {
+      status: "CREDITED",
+      matric,
+      newBalance: updated.balance.toNumber(),
+      previousBalance: updated.balance.minus(paidAmount).toNumber(),
+    };
+  });
 }
 
-export { hasCrossedAboveThreshold, activateWallet, creditWallet };
+export { hasCrossedAboveThreshold, creditPaymentAttempt };

@@ -11,15 +11,13 @@ const REQUIRED = [
   "MAIL_USER",
   "MAIL_PASSWORD",
   "ALLOWED_EMAIL_DOMAIN",
-  "ALLOW_MOCK_PAYMENTS",
   "CLOUDINARY_CLOUD_NAME",
   "CLOUDINARY_API_KEY",
   "CLOUDINARY_API_SECRET",
   "PAYMENT_PROVIDER",
   "PAYMENT_SECRET_KEY",
-  "KORA_PUBLIC_KEY",
   "KORA_SECRET_KEY",
-  "KORA_ENCRYPTION_KEY",
+  "KORA_PUBLIC_KEY",
   "MQTT_INTERNAL_URL",
   "MQTT_INTERNAL_SECRET",
 ] as const;
@@ -51,8 +49,6 @@ const env = {
   NODE_ENV: nodeEnv,
   isLive,
   PORT: num(process.env.PORT, 3000),
-  // Mock payments can never be enabled in a live environment.
-  allowMockPayments: !isLive && process.env.ALLOW_MOCK_PAYMENTS === "false",
   db: {
     url: req("DATABASE_URL"),
     pooledUrl: req("DATABASE_URL_POOLED"),
@@ -79,7 +75,6 @@ const env = {
     provider: req("PAYMENT_PROVIDER").toUpperCase(),
     publicKey: req("KORA_PUBLIC_KEY"),
     secretKey: req("PAYMENT_SECRET_KEY"),
-    encryptionKey: req("KORA_ENCRYPTION_KEY"),
   },
   mqtt: {
     internalUrl: req("MQTT_INTERNAL_URL"),
@@ -87,8 +82,8 @@ const env = {
   },
   rateLimit: {
     global: limit(100),
-    login: limit(5),
-    adminLogin: limit(3),
+    login: limit(40),
+    adminLogin: limit(8),
     register: limit(5, 60),
     otp: limit(3),
     kyc: limit(3, 60),

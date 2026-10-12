@@ -1,15 +1,4 @@
 // src/payments/payment.interface.ts
-//
-// System-wide contract all payment providers must implement.
-// The application logic only ever talks to this interface —
-// never to a concrete provider directly.
-
-export interface VirtualAccountResponse {
-  accountNumber: string;
-  bankName: string;
-  reference: string;
-}
-
 export interface PayoutDestination {
   type: "bank_account";
   amount: number;
@@ -74,17 +63,13 @@ export interface CheckoutInitializationResponse {
   checkoutUrl: string;
 }
 
-export interface IPaymentGateway {
-  // Creates a dedicated virtual bank account for a student.
-  // Called once after KYC approval — account details persisted to Wallet.
-  createVirtualAccount(
-    name: string,
-    email: string,
-    reference: string
-  ): Promise<VirtualAccountResponse>;
+export interface BankInfo {
+  name: string;
+  code: string;
+}
 
-  // Verifies the authenticity of an incoming webhook from the provider.
-  // Mock always returns true — live providers verify HMAC signatures.
+export interface IPaymentGateway {
+  // Verifies the HMAC signature of an incoming provider webhook.
   verifyWebhook(rawBody: string, signature: string): boolean;
 
   // Initiates an outbound bank payout
@@ -102,4 +87,7 @@ export interface IPaymentGateway {
   initializeCheckout?(
     params: CheckoutInitializationParams
   ): Promise<CheckoutInitializationResponse>;
+
+  // Lists supported banks with the provider's own bank codes.
+  listBanks?(): Promise<BankInfo[]>;
 }

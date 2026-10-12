@@ -1,54 +1,24 @@
-import { Router, type Request, type Response } from "express";
+import { Router } from "express";
 import { getRedisClient } from "../config/redis.js";
 import { prisma } from "../lib/prisma.js";
 import logger from "../config/logger.js";
-import env from "../config/env.js";
 
 const router = Router();
 
-type CheckStatus = "UNKNOWN" | "OK" | "FAIL";
+const errMsg = (e: unknown) => (e instanceof Error ? e.message : "Unknown error");
 
-interface HealthChecks {
-  postgres: CheckStatus;
-  redis: CheckStatus;
-}
+// Public liveness/readiness check. Details go to the logs, not the response.
+router.get("/", async (_req, res) => {
+  const [postgres, redis] = await Promise.allSettled([
+    prisma.$queryRaw`SELECT 1`,
+    getRedisClient().ping(),
+  ]);
 
-router.get("/", async (req: Request, res: Response) => {
-  const checks: HealthChecks = {
-    postgres: "UNKNOWN",
-    redis: "UNKNOWN",
-  };
+  if (postgres.status === "rejected") logger.error({ err: errMsg(postgres.reason) }, "health.postgres_check_failed");
+  if (redis.status === "rejected") logger.error({ err: errMsg(redis.reason) }, "health.redis_check_failed");
 
-  try {
-    await prisma.$queryRaw`SELECT 1`;
-    checks.postgres = "OK";
-  } catch (error) {
-    checks.postgres = "FAIL";
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "health.postgres_check_failed");
-  }
-
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const redis = getRedisClient() as any;
-    await redis.ping();
-    checks.redis = "OK";
-  } catch (error) {
-    checks.redis = "FAIL";
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "health.redis_check_failed");
-  }
-
-  const allHealthy = Object.values(checks).every((v) => v === "OK");
-  const statusCode = allHealthy ? 200 : 503;
-
-  res.status(statusCode).json({
-    status: allHealthy ? "healthy" : "degraded",
-    environment: env.NODE_ENV,
-    uptimeSeconds: Math.floor(process.uptime()),
-    timestamp: new Date().toISOString(),
-    checks,
-  });
+  const healthy = postgres.status === "fulfilled" && redis.status === "fulfilled";
+  res.status(healthy ? 200 : 503).json({ status: healthy ? "healthy" : "degraded", timestamp: new Date().toISOString() });
 });
 
 export default router;

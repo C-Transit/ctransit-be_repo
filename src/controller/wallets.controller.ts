@@ -1,33 +1,20 @@
 import type { Response, NextFunction } from "express";
 import { confirmRegistration } from "../services/registration.service.js";
-import { getVirtualAccount } from "../services/payment.service.js";
+import prisma from "../lib/prisma.js";
 import logger from "../config/logger.js";
 import { type CustomAuthRequest } from "../middleware/auth.middleware.js";
 
 export const requireStudentAuth = (req: CustomAuthRequest, res: Response, next: NextFunction) => {
-  if (!req.user) {
-    logger.warn({ ip: req.ip }, "wallets.unauthenticated_access");
-    return res.status(401).json({ success: false, message: "Authentication required" });
-  }
-  if (req.user.role !== "STUDENT") {
-    logger.warn({ userId: req.user.userId, role: req.user.role, ip: req.ip }, "wallets.unauthorized_role_access");
+  if (req.user?.role !== "STUDENT") {
+    logger.warn({ userId: req.user?.userId, role: req.user?.role, ip: req.ip }, "wallets.unauthorized_role_access");
     return res.status(403).json({ success: false, message: "Student access required" });
   }
   next();
 };
 
-interface LinkBody {
-  otp?: string;
-}
-
 export const linkWallet = async (req: CustomAuthRequest, res: Response) => {
-  const { otp } = req.body as LinkBody;
-  const studentId = req.user?.userId;
-
-  if (!studentId) {
-    logger.warn({ ip: req.ip }, "wallets.link_failed_missing_auth");
-    return res.status(401).json({ success: false, message: "Unauthorized: Student ID missing from token" });
-  }
+  const otp = req.body?.otp;
+  const studentId = req.user!.userId;
 
   if (!otp) {
     return res.status(400).json({ success: false, message: "OTP is required" });
@@ -41,40 +28,29 @@ export const linkWallet = async (req: CustomAuthRequest, res: Response) => {
     }
     return res.status(400).json(result);
   } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage, studentId }, "wallets.link_error");
+    logger.error({ err: error instanceof Error ? error.message : "Unknown error", studentId }, "wallets.link_error");
     return res.status(500).json({ success: false, message: "Internal server error" });
   }
 };
 
 export const getWalletDetails = async (req: CustomAuthRequest, res: Response) => {
-  const userId = req.user?.userId;
+  const wallet = await prisma.wallet.findFirst({
+    where: { user: { id: req.user!.userId } },
+    select: { balance: true },
+  });
 
-  if (!userId) {
-    logger.warn({ ip: req.ip }, "wallets.details_failed_missing_auth");
-    return res.status(401).json({ success: false, message: "Unauthorized: Student ID missing from token" });
+  if (!wallet) {
+    return res.status(404).json({ success: false, message: "Wallet not found" });
   }
 
-  try {
-    const details = await getVirtualAccount(userId);
-
-    return res.status(200).json({
-      success: true,
-      data: {
-        balance: details.balance,
-        accountNumber: details.accountNumber,
-        bank: details.bankName,
-        bankName: details.bankName,
-      },
-    });
-  } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage, userId }, "wallets.details_error");
-
-    if (error instanceof Error && error.message === "WALLET_NOT_FOUND") {
-      return res.status(404).json({ success: false, message: "Wallet not found" });
-    }
-
-    return res.status(500).json({ success: false, message: "Failed to fetch wallet details" });
-  }
+  return res.status(200).json({
+    success: true,
+    data: {
+      balance: wallet.balance.toNumber(),
+      // Virtual accounts were removed. Kept as null so older clients don't break.
+      accountNumber: null,
+      bank: null,
+      bankName: null,
+    },
+  });
 };

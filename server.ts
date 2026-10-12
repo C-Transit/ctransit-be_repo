@@ -5,11 +5,13 @@ import app from "./app.js";
 import { getRedisClient } from "./src/config/redis.js";
 import { prisma } from "./src/lib/prisma.js";
 import logger from "./src/config/logger.js";
+import { purgeOldRegistrationOtps } from "./src/services/registration.service.js";
 
 const TIMEOUT_MS = 15_000;
 const server = http.createServer(app);
 let isShuttingDown = false;
 let databaseMonitor: NodeJS.Timeout;
+let otpPurge: NodeJS.Timeout;
 
 const formatError = (err: unknown) =>
   err instanceof Error ? err.message : String(err);
@@ -34,17 +36,18 @@ async function withTimeout<T>(
 }
 
 async function boot() {
-  try {
-    const redis = getRedisClient();
-    await withTimeout(redis.ping(), "Redis");
-    await withTimeout(prisma.$queryRaw`SELECT 1`, "PostgreSQL");
-  } catch (err) {
-    logger.fatal(
-      { err: formatError(err), reason: "critical dependency unavailable" },
-      "server.boot_failed"
-    );
-    return shutdown("boot_failure", 1);
-  }
+   try {
+     const redis = getRedisClient();
+     await withTimeout(redis.connect(), "Redis");
+     await withTimeout(redis.ping(), "Redis");
+     await withTimeout(prisma.$queryRaw`SELECT 1`, "PostgreSQL");
+   } catch (err) {
+     logger.fatal(
+       { err: formatError(err), reason: "critical dependency unavailable" },
+       "server.boot_failed"
+     );
+     return shutdown("boot_failure", 1);
+   }
 
   server.on("error", (err: Error) => {
     logger.fatal({ err: err.message }, "server.http_error");
@@ -67,6 +70,12 @@ async function boot() {
         }
       );
     }, TIMEOUT_MS);
+
+    otpPurge = setInterval(() => {
+      purgeOldRegistrationOtps()
+        .then((n) => n > 0 && logger.info({ deleted: n }, "registration.otps_purged"))
+        .catch((err) => logger.warn({ err: formatError(err) }, "registration.otp_purge_failed"));
+    }, 5 * 60 * 1000);
   });
 }
 
@@ -76,6 +85,7 @@ async function shutdown(signal: string, exitCode = 0) {
 
   logger.info({ signal }, "server.shutdown_initiated");
   clearInterval(databaseMonitor);
+  clearInterval(otpPurge);
 
   if (server.listening) {
     await new Promise<void>((resolve) => server.close(() => resolve()));

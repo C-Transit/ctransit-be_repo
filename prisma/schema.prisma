@@ -171,7 +171,6 @@ model Transaction {
   @@index([location])
   @@index([card_uid])
   @@index([tapped_at])
-  @@index([idempotency_key])
 
   @@map("transactions")
 }
@@ -186,7 +185,6 @@ model DriverWallet {
 
   driver         User     @relation(fields: [driver_uid], references: [matricNumber], onDelete: Cascade)
 
-  @@index([driver_uid])
   @@map("driver_wallets")
 }
 
@@ -212,7 +210,6 @@ model DriverWithdrawal {
 
   @@index([driver_uid, created_at(sort: Desc)])
   @@index([status])
-  @@index([reference])
   @@index([kora_reference])
   @@map("driver_withdrawals")
 }
@@ -261,7 +258,6 @@ model Kyc {
   userId String @unique
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([status])
   @@index([status, submittedAt(sort: Asc)])
 
   @@map("kyc_records")
@@ -299,8 +295,6 @@ model DriverCardCredential {
 
   driver      User     @relation(fields: [driver_uid], references: [matricNumber], onDelete: Cascade)
 
-  @@index([driver_uid])
-  @@index([card_uid])
   @@map("driver_card_credentials")
 }
 
@@ -318,8 +312,6 @@ model AdminCardCredential {
 
   admin       User     @relation(fields: [admin_uid], references: [matricNumber], onDelete: Cascade)
 
-  @@index([admin_uid])
-  @@index([card_uid])
   @@map("admin_card_credentials")
 }
 
@@ -401,7 +393,6 @@ model RegistrationOtp {
   used        Boolean  @default(false)
   created_at  DateTime @default(now())
 
-  @@index([otp])
   @@index([expires_at])
   @@index([agent_uid])
   @@map("registration_otps")
@@ -429,7 +420,6 @@ model RefreshToken {
   revoked    Boolean  @default(false)
   created_at DateTime @default(now())
 
-  @@index([token_id])
   @@index([expires_at])
   @@map("refresh_tokens")
 }

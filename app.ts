@@ -1,12 +1,11 @@
-// app.ts
 import { randomUUID } from "node:crypto";
 import express from "express";
 import cors from "cors";
 import env from "./src/config/env.js";
 import logger from "./src/config/logger.js";
 
-import healthRouter from "./src/routes/health.routes.js";
-import adminRouter from "./src/routes/admin.routes.js";
+import healthRouter from "./src/controller/health.controller.js";
+import adminOpsRouter from "./src/routes/admin.ops.routes.js";
 import authRoutes from "./src/routes/auth.routes.js";
 import userRoutes from "./src/routes/user.routes.js";
 import kycRoutes from "./src/routes/kyc.routes.js";
@@ -37,7 +36,6 @@ declare global {
   namespace Express {
     interface Request {
       id?: string;
-      rawBody?: string;
     }
   }
 }
@@ -51,23 +49,30 @@ app.use(
     origin:
       env.NODE_ENV === "production"
         ? [
-            "https://www.ctransit.me",
-            "https://admin.ctransit.me",
-            "https://agent.ctransit.me",
-            "https://driver.ctransit.me",
-          ]
+          "https://ctransit.me",
+          "https://admin.ctransit.me",
+          "https://agent.ctransit.me",
+          "https://driver.ctransit.me",
+        ]
         : [
-            "http://localhost:3000",
-            "http://localhost:3001",
-            "http://localhost:3002",
-            "http://localhost:3003",
-            "https://c-transit-pink.vercel.app",
-            "https://ctransit-driver.vercel.app",
-          ],
+          "http://localhost:3000",
+          "http://localhost:3001",
+          "http://localhost:3002",
+          "http://localhost:3003",
+          "https://c-transit-pink.vercel.app",
+          "https://ctransit-driver.vercel.app",
+        ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
   })
 );
+
+// Provider callbacks: signature-verified, so never throttled by the global limiter.
+const WEBHOOK_PATHS = new Set([
+  "/api/payments/webhook",
+  "/api/payments/payout-webhook",
+  "/api/drivers/payout-webhook",
+]);
 
 app.use((req, res, next) => {
   req.id = (req.headers["x-request-id"] as string) || randomUUID();
@@ -84,58 +89,47 @@ app.use((req, res, next) => {
   });
 
   if (env.NODE_ENV === "production") {
-    res.setHeader(
-      "strict-transport-security",
-      "max-age=31536000; includeSubDomains"
-    );
+    res.setHeader("strict-transport-security", "max-age=31536000; includeSubDomains");
   }
 
   next();
 });
 
-app.use(
-  express.json({
-    limit: "10kb",
-    verify: (req, _res, buffer) => {
-      (req as express.Request).rawBody = buffer.toString("utf8");
-    },
-  })
-);
+app.use(express.json({ limit: "10kb" }));
 app.use(express.urlencoded({ extended: false }));
 
 app.use((req, res, next) => {
   const start = Date.now();
 
   res.on("finish", () => {
-    const logData = {
-      requestId: req.id,
-      method: req.method,
-      path: req.path,
-      statusCode: res.statusCode,
-      durationMs: Date.now() - start,
-      ip: req.ip,
-    };
-
-    const level =
-      res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+    const level = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
     const eventName =
-      level === "info"
-        ? "http.request"
-        : `http.${level === "error" ? "server_error" : "client_error"}`;
-    logger[level](logData, eventName);
+      level === "info" ? "http.request" : `http.${level === "error" ? "server_error" : "client_error"}`;
+
+    logger[level](
+      {
+        requestId: req.id,
+        method: req.method,
+        path: req.path,
+        statusCode: res.statusCode,
+        durationMs: Date.now() - start,
+        ip: req.ip,
+      },
+      eventName
+    );
   });
 
   next();
 });
 
-app.use(globalLimiter);
+app.use((req, res, next) => (WEBHOOK_PATHS.has(req.path) ? next() : globalLimiter(req, res, next)));
 
 app.get("/", (_req, res) => {
   res.send("C-transit server is running");
 });
 
 app.use(["/health", "/api/health"], healthRouter);
-app.use(["/admin", "/api/admin"], adminRouter);
+app.use(["/admin", "/api/admin"], adminOpsRouter);
 
 app.use("/api/auth/register", registerLimiter);
 app.use("/api/auth/login", loginLimiter);
@@ -144,6 +138,8 @@ app.use("/api/auth/verify-otp", otpLimiter);
 app.use("/api/auth/resend-otp", otpLimiter);
 app.use("/api/auth", authRoutes);
 
+app.use("/api/users/forgot-password", otpLimiter);
+app.use("/api/users/reset-password", otpLimiter);
 app.use("/api/users", userRoutes);
 
 app.use("/api/kyc/submit", kycSubmitLimiter);
@@ -152,12 +148,7 @@ app.use("/api/kyc", kycRoutes);
 
 app.use("/api/wallets", walletLimiter, authenticateToken, walletsRouter);
 app.use("/api/payments", paymentRoutes);
-app.use(
-  "/api/transactions",
-  transactionLimiter,
-  authenticateToken,
-  transactionRoutes
-);
+app.use("/api/transactions", transactionLimiter, authenticateToken, transactionRoutes);
 app.use("/api/agents", agentRoutes);
 app.use("/api/disputes", disputeLimiter, disputeRoutes);
 app.use("/api/notifications", notificationLimiter, notificationRoutes);
@@ -168,7 +159,13 @@ app.use((_req, res) => {
 });
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
-app.use((err: Error, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+app.use((err: Error & { type?: string }, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  // Body-parser failures are the client's fault, not a server error.
+  if (err.name === "MulterError") return res.status(400).json({ error: err.message });
+  if (err.message === "Only JPEG, PNG, and WEBP images are allowed") return res.status(400).json({ error: err.message });
+  if (err.type === "entity.parse.failed") return res.status(400).json({ error: "Invalid JSON body" });
+  if (err.type === "entity.too.large") return res.status(413).json({ error: "Request body too large" });
+
   logger.error({ err: err.message, path: req.path }, "http.unhandled_error");
   res.status(500).json({ error: "Internal server error" });
 });

@@ -1,25 +1,10 @@
-import express from "express";
-import crypto from "node:crypto";
-import { type Request, type Response, type NextFunction } from "express";
+import type { Request, Response } from "express";
+import type { AgentStatus } from "@prisma/client";
 import logger from "../config/logger.js";
-import env from "../config/env.js";
-import {
-  enqueueRoute,
-  enqueueBroadcast,
-  enqueueSyncWhitelist,
-  detectPartialBroadcastFailure,
-} from "../utils/bridge.js";
-import { confirmRegistration } from "../services/registration.service.js";
-import {
-  creditWallet,
-  hasCrossedAboveThreshold,
-} from "../services/ledger.service.js";
+import { enqueueSyncWhitelist } from "../utils/bridge.js";
+import { buildChunks } from "../utils/parser.js";
 import { prisma } from "../lib/prisma.js";
-import { buildDeltaCommand } from "../utils/parser.js";
-import { getRedisClient, redisKeys } from "../config/redis.js";
-import { approveKyc, rejectKyc } from "../services/kyc.service.js";
 import { type CustomAuthRequest } from "../middleware/auth.middleware.js";
-import { type AgentStatus } from "@prisma/client";
 import {
   createAgent,
   updateAgentStatus,
@@ -36,411 +21,28 @@ import {
 } from "../services/admin.service.js";
 import { unlinkCard } from "../services/card.service.js";
 
-const router = express.Router();
+type ErrorTable = Record<string, [status: number, message: string]>;
 
-const firmwareAllowedHosts = new Set(
-  (process.env.FIRMWARE_ALLOWED_HOSTS || "")
-    .split(",")
-    .map((host) => host.trim().toLowerCase())
-    .filter(Boolean)
-);
-
-function isAllowedFirmwareUrl(value: unknown): value is string {
-  if (typeof value !== "string" || value.length > 2048) return false;
-
-  try {
-    const url = new URL(value);
-    return (
-      url.protocol === "https:" &&
-      url.username === "" &&
-      url.password === "" &&
-      url.port === "" &&
-      firmwareAllowedHosts.has(url.hostname.toLowerCase())
-    );
-  } catch {
-    return false;
-  }
-}
-
-function requireCriticalApproval(
-  req: Request,
+// Maps a known service error to its response, otherwise logs and returns a generic 500.
+// `wrap` selects the body shape: { error } (default) or { success: false, message }.
+function fail(
   res: Response,
-  next: NextFunction
+  error: unknown,
+  table: ErrorTable,
+  event: string,
+  fallback: string,
+  wrap: "error" | "message" = "error",
+  ctx: object = {}
 ) {
-  const suppliedToken = req.headers["x-critical-approval-token"];
-  const expectedToken = env.admin.criticalApprovalToken;
+  const code = error instanceof Error ? error.message : "";
+  const body = (msg: string) => (wrap === "error" ? { error: msg } : { success: false, message: msg });
 
-  if (
-    !expectedToken ||
-    typeof suppliedToken !== "string" ||
-    suppliedToken.length !== expectedToken.length ||
-    !crypto.timingSafeEqual(
-      Buffer.from(suppliedToken),
-      Buffer.from(expectedToken)
-    )
-  ) {
-    logger.warn(
-      { ip: req.ip, path: req.path },
-      "admin.critical_approval_rejected"
-    );
-    return res
-      .status(403)
-      .json({ error: "Critical-operation approval required" });
-  }
+  const known = table[code];
+  if (known) return res.status(known[0]).json(body(known[1]));
 
-  next();
+  logger.error({ err: code || "Unknown error", ...ctx }, event);
+  return res.status(500).json(body(fallback));
 }
-
-function getAuditAdminId(req: Pick<Request, "headers">): string {
-  const adminId = req.headers["x-admin-id"];
-  return typeof adminId === "string" && adminId.trim()
-    ? adminId.trim()
-    : "unknown";
-}
-
-function auditCriticalOperation(
-  operation: string,
-  adminId: string,
-  terminalId: string
-): void {
-  logger.warn(
-    { operation, adminId, terminalId, timestamp: new Date().toISOString() },
-    "admin.critical_operation_audit"
-  );
-}
-
-function requireAdminSecret(req: Request, res: Response, next: NextFunction) {
-  const isDevelopment = env.NODE_ENV === "development";
-  const secret = req.headers["x-admin-secret"];
-  const backendSecret = req.headers["x-backend-secret"];
-  const expectedSecret = env.admin.secret;
-
-  if (isDevelopment) {
-    if (!secret || typeof secret !== "string" || !expectedSecret) {
-      logger.warn({ ip: req.ip, path: req.path }, "admin.unauthorized_request");
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-
-    const secretBuf = Buffer.from(secret);
-    const expectedBuf = Buffer.from(expectedSecret);
-
-    if (
-      secretBuf.length !== expectedBuf.length ||
-      !crypto.timingSafeEqual(secretBuf, expectedBuf)
-    ) {
-      logger.warn({ ip: req.ip, path: req.path }, "admin.unauthorized_request");
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-
-    return next();
-  }
-
-  if (
-    backendSecret &&
-    typeof backendSecret === "string" &&
-    expectedSecret &&
-    backendSecret.length === expectedSecret.length &&
-    crypto.timingSafeEqual(
-      Buffer.from(backendSecret),
-      Buffer.from(expectedSecret)
-    )
-  ) {
-    return next();
-  }
-
-  logger.warn(
-    { ip: req.ip, path: req.path },
-    "admin.session_required_for_production"
-  );
-  return res.status(403).json({ error: "Admin session required" });
-}
-
-const approveKycHandler = async (
-  req: Request<object, object, { userId: string }>,
-  res: Response
-) => {
-  const { userId } = req.body;
-
-  if (!userId) {
-    return res.status(400).json({ error: "userId is required" });
-  }
-
-  try {
-    const kyc = await approveKyc(userId);
-    logger.info({ userId }, "admin.kyc_approved");
-    res.json({ success: true, kyc });
-  } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "admin.kyc_approve_error");
-
-    if (error instanceof Error) {
-      if (error.message === "USER_NOT_FOUND") {
-        return res.status(404).json({ error: "User not found" });
-      }
-      if (error.message === "KYC_NOT_FOUND") {
-        return res.status(404).json({
-          error: "No KYC record found for this user. Submit KYC first.",
-        });
-      }
-    }
-
-    res.status(500).json({ error: "Failed to approve KYC" });
-  }
-};
-
-const rejectKycHandler = async (
-  req: Request<object, object, { userId: string; reason: string }>,
-  res: Response
-) => {
-  const { userId, reason } = req.body;
-
-  if (!userId || !reason) {
-    return res.status(400).json({ error: "userId and reason are required" });
-  }
-
-  try {
-    const kyc = await rejectKyc(userId, reason);
-    logger.info({ userId, reason }, "admin.kyc_rejected");
-    res.json({ success: true, kyc });
-  } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "admin.kyc_reject_error");
-
-    if (error instanceof Error) {
-      if (error.message === "USER_NOT_FOUND") {
-        return res.status(404).json({ error: "User not found" });
-      }
-      if (error.message === "KYC_NOT_FOUND") {
-        return res.status(404).json({
-          error: "No KYC record found for this user. Submit KYC first.",
-        });
-      }
-    }
-
-    res.status(500).json({ error: "Failed to reject KYC" });
-  }
-};
-
-router.use(requireAdminSecret);
-
-router.post(
-  "/poison-pill",
-  requireCriticalApproval,
-  async (
-    req: Request<object, object, { terminalId: string }>,
-    res: Response
-  ) => {
-    const { terminalId } = req.body;
-    if (!terminalId) {
-      return res.status(400).json({ error: "terminalId is required" });
-    }
-
-    const log = logger.child({ terminalId });
-
-    try {
-      await prisma.terminal.update({
-        where: { terminal_id: terminalId },
-        data: { status: "LOCKED" },
-      });
-
-      const poisonCmd = "CMD:POISON_PILL";
-      auditCriticalOperation("POISON_PILL", getAuditAdminId(req), terminalId);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const redis = getRedisClient() as any;
-      await redis.lpush(redisKeys.terminalQueue(terminalId), poisonCmd);
-      await enqueueRoute(terminalId, poisonCmd);
-
-      log.warn({ poisonCmd }, "admin.poison_pill_queued");
-      res.json({
-        success: true,
-        message: `Poison pill queued for ${terminalId}`,
-      });
-    } catch (error) {
-      const errMessage =
-        error instanceof Error ? error.message : "Unknown error";
-      log.error({ err: errMessage }, "admin.poison_pill_error");
-      res.status(500).json({ error: "Failed to issue poison pill" });
-    }
-  }
-);
-
-router.post(
-  "/ota",
-  async (
-    req: Request<object, object, { firmwareUrl: string }>,
-    res: Response
-  ) => {
-    const { firmwareUrl } = req.body;
-
-    if (!isAllowedFirmwareUrl(firmwareUrl)) {
-      return res
-        .status(403)
-        .json({ error: "firmwareUrl is not an approved firmware host" });
-    }
-
-    const otaCmd = `CMD:OTA,${firmwareUrl}`;
-    logger.info({ firmwareUrl }, "admin.ota_broadcast_initiated");
-
-    try {
-      const broadcastResult = await enqueueBroadcast(otaCmd);
-      const partialCheck = detectPartialBroadcastFailure(broadcastResult);
-
-      if (partialCheck.isPartial) {
-        logger.warn(
-          { firmwareUrl, ...partialCheck },
-          "admin.ota_broadcast_partial_terminal_failures"
-        );
-        return res.status(207).json({
-          success: false,
-          partial: true,
-          message: `OTA broadcast partially delivered; ${partialCheck.failedCount} terminal(s) failed`,
-          failedCount: partialCheck.failedCount,
-          deliveredCount: partialCheck.deliveredCount,
-          failedTerminals: partialCheck.failedTerminals,
-        });
-      }
-
-      res.json({
-        success: true,
-        message: "OTA command broadcast to fleet",
-        ...broadcastResult,
-      });
-    } catch (error) {
-      const errMessage =
-        error instanceof Error ? error.message : "Unknown error";
-      logger.error({ err: errMessage }, "admin.ota_broadcast_error");
-      res.status(500).json({ error: "OTA broadcast failed" });
-    }
-  }
-);
-
-router.post(
-  "/confirm-registration",
-  async (
-    req: Request<object, object, { otp: string; studentId: string }>,
-    res: Response
-  ) => {
-    const { otp, studentId } = req.body;
-
-    if (!otp || !studentId) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Both otp and studentId are required for agent-assisted linking",
-      });
-    }
-
-    try {
-      const result = await confirmRegistration(otp, studentId);
-
-      if (result.success) {
-        logger.info(
-          { agentIp: req.ip, studentId },
-          "admin.agent_linked_card_success"
-        );
-        return res.status(200).json(result);
-      }
-
-      return res.status(400).json(result);
-    } catch (error) {
-      const errMessage =
-        error instanceof Error ? error.message : "Unknown error";
-      logger.error({ err: errMessage }, "admin.agent_link_error");
-      return res
-        .status(500)
-        .json({ success: false, message: "Internal server error" });
-    }
-  }
-);
-
-router.post(
-  "/monnify-webhook",
-  async (
-    req: Request<
-      object,
-      object,
-      { studentUid: string; amount: string | number }
-    >,
-    res: Response
-  ) => {
-    res.status(200).json({ received: true });
-
-    const { studentUid, amount } = req.body;
-    const log = logger.child({ studentUid, amount });
-    const parsedAmount =
-      typeof amount === "string" ? parseFloat(amount) : amount;
-
-    if (!studentUid || !amount || isNaN(parsedAmount)) {
-      log.warn("admin.monnify_webhook_invalid_payload");
-      return;
-    }
-
-    try {
-      const result = await creditWallet(studentUid, parsedAmount);
-
-      if (!result) {
-        log.warn("admin.monnify_webhook_wallet_not_found");
-        return;
-      }
-
-      const { previousBalance, newBalance } = result;
-
-      if (hasCrossedAboveThreshold(previousBalance, newBalance)) {
-        const removeBlCmd = buildDeltaCommand("REM", "BL", studentUid);
-        log.info(
-          { removeBlCmd, previousBalance, newBalance },
-          "admin.monnify_threshold_crossed"
-        );
-        await enqueueBroadcast(removeBlCmd);
-      }
-    } catch (error) {
-      const errMessage =
-        error instanceof Error ? error.message : "Unknown error";
-      log.error({ err: errMessage }, "admin.monnify_webhook_processing_error");
-    }
-  }
-);
-
-router.post(
-  "/terminal/register",
-  async (
-    req: Request<
-      object,
-      object,
-      { terminalId: string; secretKey: string; location?: string }
-    >,
-    res: Response
-  ) => {
-    const { terminalId, secretKey, location } = req.body;
-
-    if (!terminalId || !secretKey) {
-      return res
-        .status(400)
-        .json({ error: "terminalId and secretKey are required" });
-    }
-
-    try {
-      const terminal = await prisma.terminal.upsert({
-        where: { terminal_id: terminalId },
-        update: { secret_key: secretKey, ...(location ? { location } : {}) },
-        create: {
-          terminal_id: terminalId,
-          status: "OFFLINE",
-          secret_key: secretKey,
-          ...(location ? { location } : {}),
-        },
-      });
-
-      logger.info({ terminalId, location }, "admin.terminal_registered");
-      res.json({ success: true, terminal });
-    } catch (error) {
-      const errMessage =
-        error instanceof Error ? error.message : "Unknown error";
-      logger.error({ err: errMessage }, "admin.terminal_registration_error");
-      res.status(500).json({ error: "Failed to register terminal" });
-    }
-  }
-);
 
 // Safely extracts a single string from a query parameter.
 function qs(val: unknown): string | undefined {
@@ -449,109 +51,59 @@ function qs(val: unknown): string | undefined {
   return undefined;
 }
 
-const VALID_AGENT_STATUSES: AgentStatus[] = [
-  "ACTIVE",
-  "SUSPENDED",
-  "DEACTIVATED",
-];
+const paging = (req: CustomAuthRequest) => ({
+  page: Math.max(1, parseInt(qs(req.query.page) ?? "1") || 1),
+  limit: Math.min(100, Math.max(1, parseInt(qs(req.query.limit) ?? "20") || 20)),
+});
 
-const VALID_DISPUTE_STATUSES = [
-  "OPEN",
-  "UNDER_REVIEW",
-  "RESOLVED",
-  "REJECTED",
-] as const;
+const VALID_AGENT_STATUSES: AgentStatus[] = ["ACTIVE", "SUSPENDED", "DEACTIVATED"];
+const VALID_DISPUTE_STATUSES = ["OPEN", "UNDER_REVIEW", "RESOLVED", "REJECTED"] as const;
 type ValidDisputeStatus = (typeof VALID_DISPUTE_STATUSES)[number];
 
-function getAdminUserId(
-  req: CustomAuthRequest,
-  res: Response
-): string | undefined {
-  if (!req.user || req.user.role !== "ADMIN") {
-    res.status(403).json({ error: "Admin access required" });
-    return undefined;
-  }
+const invalidStatus = (valid: readonly string[]) => `Invalid status. Must be one of: ${valid.join(", ")}`;
 
-  return req.user.userId;
-}
-
-export const createAgentHandler = async (
-  req: CustomAuthRequest & {
-    body: {
-      firstname: string;
-      lastname: string;
-      email: string;
-      phone: string;
-      password: string;
-    };
-  },
-  res: Response
-) => {
-  const { firstname, lastname, email, phone, password } = req.body;
-
+export const createAgentHandler = async (req: CustomAuthRequest, res: Response) => {
+  const { firstname, lastname, email, phone, password } = req.body ?? {};
   if (!firstname || !lastname || !email || !phone || !password) {
-    return res.status(400).json({
-      error: "firstname, lastname, email, phone, and password are required",
-    });
+    return res.status(400).json({ error: "firstname, lastname, email, phone, and password are required" });
   }
 
-  const adminId = getAdminUserId(req, res);
-  if (!adminId) {
-    return;
-  }
-
+  const adminId = req.user!.userId;
   try {
     const agent = await createAgent(
-      { firstname, lastname, email, phone, password },
+      {
+        firstname: String(firstname),
+        lastname: String(lastname),
+        email: String(email),
+        phone: String(phone),
+        password: String(password),
+      },
       adminId
     );
-
     logger.info({ agentId: agent.id, adminId }, "admin.route_agent_created");
     return res.status(201).json({ success: true, agent });
   } catch (error) {
-    if (error instanceof Error && error.message === "EMAIL_ALREADY_IN_USE") {
-      return res
-        .status(409)
-        .json({ error: "An agent with this email already exists" });
-    }
-
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "admin.route_create_agent_error");
-    return res.status(500).json({ error: "Failed to create agent" });
+    return fail(
+      res,
+      error,
+      { EMAIL_ALREADY_IN_USE: [409, "An agent with this email already exists"] },
+      "admin.route_create_agent_error",
+      "Failed to create agent"
+    );
   }
 };
 
-export const listAgentsHandler = async (
-  req: CustomAuthRequest,
-  res: Response
-) => {
+export const listAgentsHandler = async (req: CustomAuthRequest, res: Response) => {
   const rawStatus = qs(req.query.status);
-  const page = Math.max(1, parseInt(qs(req.query.page) ?? "1") || 1);
-  const limit = Math.min(
-    100,
-    Math.max(1, parseInt(qs(req.query.limit) ?? "20") || 20)
-  );
-
   if (rawStatus && !VALID_AGENT_STATUSES.includes(rawStatus as AgentStatus)) {
-    return res.status(400).json({
-      error: `Invalid status. Must be one of: ${VALID_AGENT_STATUSES.join(
-        ", "
-      )}`,
-    });
+    return res.status(400).json({ error: invalidStatus(VALID_AGENT_STATUSES) });
   }
 
   try {
-    const result = await listAgents({
-      status: rawStatus as AgentStatus | undefined,
-      page,
-      limit,
-    });
-
+    const result = await listAgents({ status: rawStatus as AgentStatus | undefined, ...paging(req) });
     return res.status(200).json({ success: true, ...result });
   } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "admin.route_list_agents_error");
-    return res.status(500).json({ error: "Failed to fetch agents" });
+    return fail(res, error, {}, "admin.route_list_agents_error", "Failed to fetch agents");
   }
 };
 
@@ -560,175 +112,103 @@ export const getAgentByIdHandler = async (
   res: Response
 ) => {
   const { id } = req.params;
-
   try {
-    const agent = await getAgentById(id);
-    return res.status(200).json({ success: true, agent });
+    return res.status(200).json({ success: true, agent: await getAgentById(id) });
   } catch (error) {
-    if (error instanceof Error && error.message === "AGENT_NOT_FOUND") {
-      return res.status(404).json({ error: "Agent not found" });
-    }
-
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error(
-      { err: errMessage, agentId: id },
-      "admin.route_get_agent_error"
+    return fail(
+      res,
+      error,
+      { AGENT_NOT_FOUND: [404, "Agent not found"] },
+      "admin.route_get_agent_error",
+      "Failed to fetch agent",
+      "error",
+      { agentId: id }
     );
-    return res.status(500).json({ error: "Failed to fetch agent" });
   }
 };
 
 export const updateAgentStatusHandler = async (
-  req: CustomAuthRequest & {
-    params: { id: string };
-    body: { status: string };
-  },
+  req: CustomAuthRequest & { params: { id: string } },
   res: Response
 ) => {
   const { id } = req.params;
-  const { status } = req.body;
-
-  if (!status) {
-    return res.status(400).json({ error: "status is required" });
-  }
-
+  const status = req.body?.status;
+  if (!status) return res.status(400).json({ error: "status is required" });
   if (!VALID_AGENT_STATUSES.includes(status as AgentStatus)) {
-    return res.status(400).json({
-      error: `Invalid status. Must be one of: ${VALID_AGENT_STATUSES.join(
-        ", "
-      )}`,
-    });
+    return res.status(400).json({ error: invalidStatus(VALID_AGENT_STATUSES) });
   }
 
-  const adminId = getAdminUserId(req, res);
-  if (!adminId) {
-    return;
-  }
-
+  const adminId = req.user!.userId;
   try {
     const agent = await updateAgentStatus(id, status as AgentStatus);
-
-    logger.info(
-      { agentId: id, newStatus: status, adminId },
-      "admin.route_agent_status_updated"
-    );
+    logger.info({ agentId: id, newStatus: status, adminId }, "admin.route_agent_status_updated");
     return res.status(200).json({ success: true, agent });
   } catch (error) {
-    if (error instanceof Error) {
-      switch (error.message) {
-        case "AGENT_NOT_FOUND":
-          return res.status(404).json({ error: "Agent not found" });
-        case "AGENT_ALREADY_IN_STATUS":
-          return res
-            .status(409)
-            .json({ error: "Agent is already in that status" });
-        case "CANNOT_TRANSITION_FROM_DEACTIVATED":
-          return res.status(409).json({
-            error:
-              "A deactivated agent can only be set to ACTIVE, not SUSPENDED",
-          });
-      }
-    }
-
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error(
-      { err: errMessage, agentId: id },
-      "admin.route_update_agent_status_error"
+    return fail(
+      res,
+      error,
+      {
+        AGENT_NOT_FOUND: [404, "Agent not found"],
+        AGENT_ALREADY_IN_STATUS: [409, "Agent is already in that status"],
+        CANNOT_TRANSITION_FROM_DEACTIVATED: [409, "A deactivated agent can only be set to ACTIVE, not SUSPENDED"],
+      },
+      "admin.route_update_agent_status_error",
+      "Failed to update agent status",
+      "error",
+      { agentId: id }
     );
-    return res.status(500).json({ error: "Failed to update agent status" });
   }
 };
 
-export const getAdminOverviewHandler = async (
-  _req: CustomAuthRequest,
-  res: Response
-) => {
+export const getAdminOverviewHandler = async (_req: CustomAuthRequest, res: Response) => {
   try {
-    const overview = await getAdminOverview();
-    return res.status(200).json({ success: true, overview });
+    return res.status(200).json({ success: true, overview: await getAdminOverview() });
   } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "admin.route_overview_error");
-    return res.status(500).json({ error: "Failed to fetch overview" });
+    return fail(res, error, {}, "admin.route_overview_error", "Failed to fetch overview");
   }
 };
 
-export const getIncomeStatsHandler = async (
-  req: CustomAuthRequest,
-  res: Response
-) => {
+export const getIncomeStatsHandler = async (req: CustomAuthRequest, res: Response) => {
   const rawFrom = qs(req.query.from);
   const rawTo = qs(req.query.to);
-  const terminalId = qs(req.query.terminalId);
-  const driverUid = qs(req.query.driverUid);
-
   const from = rawFrom ? new Date(rawFrom) : undefined;
   const to = rawTo ? new Date(rawTo) : undefined;
 
-  if (from && isNaN(from.getTime())) {
-    return res.status(400).json({ error: "Invalid 'from' date format" });
-  }
-  if (to && isNaN(to.getTime())) {
-    return res.status(400).json({ error: "Invalid 'to' date format" });
-  }
+  if (from && isNaN(from.getTime())) return res.status(400).json({ error: "Invalid 'from' date format" });
+  if (to && isNaN(to.getTime())) return res.status(400).json({ error: "Invalid 'to' date format" });
 
   try {
-    const stats = await getIncomeStats({ from, to, terminalId, driverUid });
+    const stats = await getIncomeStats({
+      from,
+      to,
+      terminalId: qs(req.query.terminalId),
+      driverUid: qs(req.query.driverUid),
+    });
     return res.status(200).json({ success: true, stats });
   } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "admin.route_income_error");
-    return res.status(500).json({ error: "Failed to fetch income stats" });
+    return fail(res, error, {}, "admin.route_income_error", "Failed to fetch income stats");
   }
 };
 
-export const listTerminalsHandler = async (
-  _req: CustomAuthRequest,
-  res: Response
-) => {
+export const listTerminalsHandler = async (_req: CustomAuthRequest, res: Response) => {
   try {
-    const terminals = await listTerminals();
-    return res.status(200).json({ success: true, terminals });
+    return res.status(200).json({ success: true, terminals: await listTerminals() });
   } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "admin.route_terminals_error");
-    return res.status(500).json({ error: "Failed to fetch terminals" });
+    return fail(res, error, {}, "admin.route_terminals_error", "Failed to fetch terminals");
   }
 };
 
-export const listDisputesHandler = async (
-  req: CustomAuthRequest,
-  res: Response
-) => {
+export const listDisputesHandler = async (req: CustomAuthRequest, res: Response) => {
   const rawStatus = qs(req.query.status);
-  const page = Math.max(1, parseInt(qs(req.query.page) ?? "1") || 1);
-  const limit = Math.min(
-    100,
-    Math.max(1, parseInt(qs(req.query.limit) ?? "20") || 20)
-  );
-
-  if (
-    rawStatus &&
-    !VALID_DISPUTE_STATUSES.includes(rawStatus as ValidDisputeStatus)
-  ) {
-    return res.status(400).json({
-      error: `Invalid status. Must be one of: ${VALID_DISPUTE_STATUSES.join(
-        ", "
-      )}`,
-    });
+  if (rawStatus && !VALID_DISPUTE_STATUSES.includes(rawStatus as ValidDisputeStatus)) {
+    return res.status(400).json({ error: invalidStatus(VALID_DISPUTE_STATUSES) });
   }
 
   try {
-    const result = await listDisputes({
-      status: rawStatus as ValidDisputeStatus | undefined,
-      page,
-      limit,
-    });
+    const result = await listDisputes({ status: rawStatus as ValidDisputeStatus | undefined, ...paging(req) });
     return res.status(200).json({ success: true, ...result });
   } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "admin.route_list_disputes_error");
-    return res.status(500).json({ error: "Failed to fetch disputes" });
+    return fail(res, error, {}, "admin.route_list_disputes_error", "Failed to fetch disputes");
   }
 };
 
@@ -738,528 +218,162 @@ export const getDisputeByIdHandler = async (
 ) => {
   const { id } = req.params;
   try {
-    const dispute = await getDisputeById(id);
-    return res.status(200).json({ success: true, dispute });
+    return res.status(200).json({ success: true, dispute: await getDisputeById(id) });
   } catch (error) {
-    if (error instanceof Error && error.message === "DISPUTE_NOT_FOUND") {
-      return res.status(404).json({ error: "Dispute not found" });
-    }
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error(
-      { err: errMessage, disputeId: id },
-      "admin.route_get_dispute_error"
+    return fail(
+      res,
+      error,
+      { DISPUTE_NOT_FOUND: [404, "Dispute not found"] },
+      "admin.route_get_dispute_error",
+      "Failed to fetch dispute",
+      "error",
+      { disputeId: id }
     );
-    return res.status(500).json({ error: "Failed to fetch dispute" });
   }
 };
 
 export const updateDisputeStatusHandler = async (
-  req: CustomAuthRequest & {
-    params: { id: string };
-    body: { status: string; resolution?: string };
-  },
+  req: CustomAuthRequest & { params: { id: string } },
   res: Response
 ) => {
   const { id } = req.params;
-  const { status, resolution } = req.body;
-
-  if (!status) {
-    return res.status(400).json({ error: "status is required" });
-  }
-
+  const { status, resolution } = req.body ?? {};
+  if (!status) return res.status(400).json({ error: "status is required" });
   if (!VALID_DISPUTE_STATUSES.includes(status as ValidDisputeStatus)) {
-    return res.status(400).json({
-      error: `Invalid status. Must be one of: ${VALID_DISPUTE_STATUSES.join(
-        ", "
-      )}`,
-    });
+    return res.status(400).json({ error: invalidStatus(VALID_DISPUTE_STATUSES) });
   }
 
-  const adminId = getAdminUserId(req, res);
-  if (!adminId) {
-    return;
-  }
-
+  const adminId = req.user!.userId;
   try {
     const dispute = await updateDisputeStatus(id, {
       newStatus: status as ValidDisputeStatus,
-      resolution,
+      resolution: resolution ? String(resolution) : undefined,
       adminId,
     });
-
-    logger.info(
-      { disputeId: id, newStatus: status, adminId },
-      "admin.route_dispute_status_updated"
-    );
+    logger.info({ disputeId: id, newStatus: status, adminId }, "admin.route_dispute_status_updated");
     return res.status(200).json({ success: true, dispute });
   } catch (error) {
-    if (error instanceof Error) {
-      switch (error.message) {
-        case "DISPUTE_NOT_FOUND":
-          return res.status(404).json({ error: "Dispute not found" });
-        case "DISPUTE_ALREADY_CLOSED":
-          return res
-            .status(409)
-            .json({ error: "Dispute is already resolved or rejected" });
-        case "RESOLUTION_REQUIRED":
-          return res.status(400).json({
-            error: "resolution text is required when closing a dispute",
-          });
-      }
-    }
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error(
-      { err: errMessage, disputeId: id },
-      "admin.route_update_dispute_error"
+    return fail(
+      res,
+      error,
+      {
+        DISPUTE_NOT_FOUND: [404, "Dispute not found"],
+        DISPUTE_ALREADY_CLOSED: [409, "Dispute is already resolved or rejected"],
+        RESOLUTION_REQUIRED: [400, "resolution text is required when closing a dispute"],
+      },
+      "admin.route_update_dispute_error",
+      "Failed to update dispute",
+      "error",
+      { disputeId: id }
     );
-    return res.status(500).json({ error: "Failed to update dispute" });
   }
 };
 
-export const sendNotificationHandler = async (
-  req: CustomAuthRequest & {
-    body: { studentMatric: string; title: string; body: string };
-  },
-  res: Response
-) => {
-  const { studentMatric, title, body } = req.body;
-
+export const sendNotificationHandler = async (req: CustomAuthRequest, res: Response) => {
+  const { studentMatric, title, body } = req.body ?? {};
   if (!studentMatric || !title || !body) {
-    return res
-      .status(400)
-      .json({ error: "studentMatric, title, and body are required" });
-  }
-
-  const adminId = getAdminUserId(req, res);
-  if (!adminId) {
-    return;
+    return res.status(400).json({ error: "studentMatric, title, and body are required" });
   }
 
   try {
-    const notification = await sendNotification(studentMatric, title, body);
-    logger.info({ studentMatric, adminId }, "admin.route_notification_sent");
+    const notification = await sendNotification(String(studentMatric), String(title), String(body));
+    logger.info({ studentMatric, adminId: req.user!.userId }, "admin.route_notification_sent");
     return res.status(201).json({ success: true, notification });
   } catch (error) {
-    if (error instanceof Error && error.message === "STUDENT_NOT_FOUND") {
-      return res.status(404).json({ error: "Student not found" });
-    }
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "admin.route_send_notification_error");
-    return res.status(500).json({ error: "Failed to send notification" });
+    return fail(
+      res,
+      error,
+      { STUDENT_NOT_FOUND: [404, "Student not found"] },
+      "admin.route_send_notification_error",
+      "Failed to send notification"
+    );
   }
 };
 
-export const syncWhitelistHandler = async (req: Request, res: Response) => {
+export const syncWhitelistHandler = async (_req: Request, res: Response) => {
   try {
-    const cardMappings = await prisma.cardMapping.findMany({
-      select: { card_uid: true },
-    });
+    const cards = await prisma.cardMapping.findMany({ select: { card_uid: true } });
+    const uids = cards.map((c) => c.card_uid);
 
-    const whitelistUids = cardMappings.map(
-      (c: { card_uid: string }) => c.card_uid
-    );
+    const chunks = uids.length === 0 ? ["SYS:WL,EMPTY"] : buildChunks("SYS:WL,", uids, 500);
+    logger.info({ cardCount: uids.length, chunkCount: chunks.length }, "admin.sync_whitelist_initiated");
 
-    const MAX_CHUNK_BYTES = 500;
-
-    const buildChunks = (
-      prefix: string,
-      uids: string[],
-      maxBytes: number
-    ): string[] => {
-      const chunks: string[] = [];
-      let currentChunk: string[] = [];
-      let currentSize = prefix.length;
-
-      for (const uid of uids) {
-        const segment = currentChunk.length === 0 ? uid : `|${uid}`;
-        if (currentSize + segment.length > maxBytes) {
-          chunks.push(`${prefix}${currentChunk.join("|")}`);
-          currentChunk = [uid];
-          currentSize = prefix.length + uid.length;
-        } else {
-          currentChunk.push(uid);
-          currentSize += segment.length;
-        }
-      }
-
-      if (currentChunk.length > 0) {
-        chunks.push(`${prefix}${currentChunk.join("|")}`);
-      }
-
-      return chunks;
-    };
-
-    const wlChunks =
-      whitelistUids.length === 0
-        ? ["SYS:WL,EMPTY"]
-        : buildChunks("SYS:WL,", whitelistUids, MAX_CHUNK_BYTES);
-
-    logger.info(
-      {
-        cardCount: whitelistUids.length,
-        chunkCount: wlChunks.length,
-      },
-      "admin.sync_whitelist_initiated"
-    );
-
-    await enqueueSyncWhitelist(wlChunks);
-
+    await enqueueSyncWhitelist(chunks);
     return res.json({
       success: true,
-      message: `Whitelist sync queued for fleet. ${whitelistUids.length} card(s), ${wlChunks.length} chunk(s).`,
+      message: `Whitelist sync queued for fleet. ${uids.length} card(s), ${chunks.length} chunk(s).`,
     });
   } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "admin.sync_whitelist_error");
-    return res.status(500).json({ error: "Failed to queue whitelist sync" });
+    return fail(res, error, {}, "admin.sync_whitelist_error", "Failed to queue whitelist sync");
   }
 };
 
-export const issuePoisonPillHandler = async (
-  req: Request<object, object, { terminalId: string }>,
-  res: Response
-) => {
-  const { terminalId } = req.body;
-  if (!terminalId) {
-    return res.status(400).json({ error: "terminalId is required" });
-  }
-
-  const log = logger.child({ terminalId });
-
-  try {
-    await prisma.terminal.update({
-      where: { terminal_id: terminalId },
-      data: { status: "LOCKED" },
-    });
-
-    const poisonCmd = "CMD:POISON_PILL";
-    auditCriticalOperation("POISON_PILL", getAuditAdminId(req), terminalId);
-    // Delegate queuing & offline delivery exclusively to MQTT service bridge
-    await enqueueRoute(terminalId, poisonCmd);
-
-    log.warn({ poisonCmd }, "admin.poison_pill_queued");
-    res.json({
-      success: true,
-      message: `Poison pill queued for ${terminalId}`,
-    });
-  } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    log.error({ err: errMessage }, "admin.poison_pill_error");
-    res.status(500).json({ error: "Failed to issue poison pill" });
-  }
-};
-
-export const broadcastOtaHandler = async (
-  req: Request<object, object, { firmwareUrl: string }>,
-  res: Response
-) => {
-  const { firmwareUrl } = req.body;
-
-  if (!isAllowedFirmwareUrl(firmwareUrl)) {
-    return res
-      .status(403)
-      .json({ error: "firmwareUrl is not an approved firmware host" });
-  }
-
-  const otaCmd = `CMD:OTA,${firmwareUrl}`;
-  logger.info({ firmwareUrl }, "admin.ota_broadcast_initiated");
-
-  try {
-    const broadcastResult = await enqueueBroadcast(otaCmd);
-    const partialCheck = detectPartialBroadcastFailure(broadcastResult);
-
-    if (partialCheck.isPartial) {
-      logger.warn(
-        { firmwareUrl, ...partialCheck },
-        "admin.ota_broadcast_partial_terminal_failures"
-      );
-      return res.status(207).json({
-        success: false,
-        partial: true,
-        message: `OTA broadcast partially delivered; ${partialCheck.failedCount} terminal(s) failed`,
-        failedCount: partialCheck.failedCount,
-        deliveredCount: partialCheck.deliveredCount,
-        failedTerminals: partialCheck.failedTerminals,
-      });
-    }
-
-    res.json({
-      success: true,
-      message: "OTA command broadcast to fleet",
-      ...broadcastResult,
-    });
-  } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "admin.ota_broadcast_error");
-    res.status(500).json({ error: "OTA broadcast failed" });
-  }
-};
-
-export const confirmRegistrationHandler = async (
-  req: Request<object, object, { otp: string; studentId: string }>,
-  res: Response
-) => {
-  const { otp, studentId } = req.body;
-
-  if (!otp || !studentId) {
+export const unlinkCardAdminHandler = async (req: CustomAuthRequest, res: Response) => {
+  const { cardUid, userIdentifier } = req.body ?? {};
+  if (!cardUid && !userIdentifier) {
     return res.status(400).json({
       success: false,
-      message: "Both otp and studentId are required for agent-assisted linking",
+      message: "Either cardUid or userIdentifier must be provided",
     });
   }
 
   try {
-    const result = await confirmRegistration(otp, studentId);
-
-    if (result.success) {
-      logger.info(
-        { agentIp: req.ip, studentId },
-        "admin.agent_linked_card_success"
-      );
-      return res.status(200).json(result);
-    }
-
-    return res.status(400).json(result);
-  } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "admin.agent_link_error");
-    return res
-      .status(500)
-      .json({ success: false, message: "Internal server error" });
-  }
-};
-
-export const monnifyWebhookHandler = async (
-  req: Request<
-    object,
-    object,
-    {
-      studentUid: string;
-      amount: string | number;
-      reference?: string;
-      transactionReference?: string;
-    }
-  >,
-  res: Response
-) => {
-  res.status(200).json({ received: true });
-
-  const { studentUid, amount, reference, transactionReference } = req.body;
-  const txRef = reference || transactionReference;
-  const log = logger.child({ studentUid, amount, txRef });
-  const parsedAmount = typeof amount === "string" ? parseFloat(amount) : amount;
-
-  if (!studentUid || !amount || isNaN(parsedAmount)) {
-    log.warn("admin.monnify_webhook_invalid_payload");
-    return;
-  }
-
-  try {
-    const result = await creditWallet(studentUid, parsedAmount, txRef);
-
-    if (!result) {
-      log.warn("admin.monnify_webhook_wallet_not_found");
-      return;
-    }
-
-    const { previousBalance, newBalance } = result;
-
-    if (hasCrossedAboveThreshold(previousBalance, newBalance)) {
-      const removeBlCmd = buildDeltaCommand("REM", "BL", studentUid);
-      log.info(
-        { removeBlCmd, previousBalance, newBalance },
-        "admin.monnify_threshold_crossed"
-      );
-      await enqueueBroadcast(removeBlCmd);
-    }
-  } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    log.error({ err: errMessage }, "admin.monnify_webhook_processing_error");
-  }
-};
-
-export const registerTerminalHandler = async (
-  req: Request<
-    object,
-    object,
-    { terminalId: string; secretKey: string; location?: string }
-  >,
-  res: Response
-) => {
-  const { terminalId, secretKey, location } = req.body;
-
-  if (!terminalId || !secretKey) {
-    return res
-      .status(400)
-      .json({ error: "terminalId and secretKey are required" });
-  }
-
-  try {
-    const terminal = await prisma.terminal.upsert({
-      where: { terminal_id: terminalId },
-      update: { secret_key: secretKey, ...(location ? { location } : {}) },
-      create: {
-        terminal_id: terminalId,
-        status: "OFFLINE",
-        secret_key: secretKey,
-        ...(location ? { location } : {}),
-      },
-    });
-
-    logger.info({ terminalId, location }, "admin.terminal_registered");
-    res.json({ success: true, terminal });
-  } catch (error) {
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "admin.terminal_registration_error");
-    res.status(500).json({ error: "Failed to register terminal" });
-  }
-};
-
-export const unlinkCardAdminHandler = async (
-  req: CustomAuthRequest,
-  res: Response
-) => {
-  try {
-    if (!req.user || req.user.role !== "ADMIN") {
-      return res
-        .status(403)
-        .json({ success: false, message: "Admin access required" });
-    }
-
-    const { cardUid, userIdentifier } = req.body;
-    if (!cardUid && !userIdentifier) {
-      return res.status(400).json({
-        success: false,
-        message: "Either cardUid or userIdentifier must be provided",
-      });
-    }
-
     const result = await unlinkCard({
       cardUid: cardUid ? String(cardUid).trim() : undefined,
-      userIdentifier: userIdentifier
-        ? String(userIdentifier).trim()
-        : undefined,
-      callerId: req.user.userId,
-      callerRole: req.user.role,
+      userIdentifier: userIdentifier ? String(userIdentifier).trim() : undefined,
+      callerId: req.user!.userId,
+      callerRole: req.user!.role,
     });
-
     return res.status(200).json(result);
   } catch (error) {
-    if (error instanceof Error) {
-      switch (error.message) {
-        case "CARD_NOT_FOUND":
-          return res
-            .status(404)
-            .json({ success: false, message: "Card mapping not found" });
-        case "USER_NOT_FOUND":
-          return res
-            .status(404)
-            .json({ success: false, message: "User not found" });
-        case "CARD_ALREADY_UNLINKED":
-          return res
-            .status(400)
-            .json({
-              success: false,
-              message: "No active card is linked to this user",
-            });
-        case "CARD_USER_MISMATCH":
-        case "CARD_BELONGS_TO_ANOTHER_USER":
-          return res
-            .status(400)
-            .json({
-              success: false,
-              message: "Card does not belong to the specified user",
-            });
-        case "UNAUTHORIZED_CALLER":
-          return res
-            .status(403)
-            .json({ success: false, message: "Unauthorized to unlink card" });
-      }
-    }
-
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "admin.unlink_card_controller_error");
-    return res.status(500).json({ success: false, message: "Server error" });
+    return fail(
+      res,
+      error,
+      {
+        CARD_NOT_FOUND: [404, "Card mapping not found"],
+        USER_NOT_FOUND: [404, "User not found"],
+        CARD_ALREADY_UNLINKED: [400, "No active card is linked to this user"],
+        CARD_USER_MISMATCH: [400, "Card does not belong to the specified user"],
+        CARD_BELONGS_TO_ANOTHER_USER: [400, "Card does not belong to the specified user"],
+        UNAUTHORIZED_CALLER: [403, "Unauthorized to unlink card"],
+      },
+      "admin.unlink_card_controller_error",
+      "Server error",
+      "message"
+    );
   }
 };
 
-export const linkAdminCardHandler = async (
-  req: CustomAuthRequest,
-  res: Response
-) => {
+export const linkAdminCardHandler = async (req: CustomAuthRequest, res: Response) => {
+  const { otp, pin } = req.body ?? {};
+  if (!otp || !pin) {
+    return res.status(400).json({ success: false, message: "otp and pin are required" });
+  }
+
   try {
-    if (!req.user || req.user.role !== "ADMIN") {
-      return res
-        .status(403)
-        .json({ success: false, message: "Admin access required" });
-    }
-
-    const { otp, pin } = req.body;
-    if (!otp || !pin) {
-      return res
-        .status(400)
-        .json({ success: false, message: "otp and pin are required" });
-    }
-
-    const result = await linkAdminCard(req.user.userId, {
+    const result = await linkAdminCard(req.user!.userId, {
       otp: String(otp).trim(),
       pin: String(pin).trim(),
     });
-
     return res.status(200).json(result);
   } catch (error) {
-    if (error instanceof Error) {
-      const knownErrors: Record<string, { status: number; message: string }> = {
-        ADMIN_NOT_FOUND: { status: 404, message: "Admin account not found" },
-        INVALID_OTP_FORMAT: {
-          status: 400,
-          message: "OTP must be exactly 6 digits",
-        },
-        INVALID_PIN_FORMAT: {
-          status: 400,
-          message: "PIN must be exactly 4 digits",
-        },
-        INVALID_OTP: { status: 400, message: "OTP is invalid or unrecognized" },
-        OTP_ALREADY_USED: {
-          status: 409,
-          message: "This OTP has already been used",
-        },
-        OTP_EXPIRED: {
-          status: 410,
-          message: "This OTP has expired — tap your card again",
-        },
-        MISSING_TERMINAL_CONTEXT: {
-          status: 400,
-          message: "OTP is missing terminal context",
-        },
-        CARD_ALREADY_LINKED: {
-          status: 409,
-          message: "This card is already linked to another user",
-        },
-        ADMIN_ALREADY_HAS_CARD: {
-          status: 409,
-          message: "Your account already has a different card linked",
-        },
-      };
-
-      const known = knownErrors[error.message];
-      if (known) {
-        return res
-          .status(known.status)
-          .json({ success: false, message: known.message });
-      }
-    }
-
-    const errMessage = error instanceof Error ? error.message : "Unknown error";
-    logger.error({ err: errMessage }, "admin.link_card_controller_error");
-    return res.status(500).json({ success: false, message: "Server error" });
+    return fail(
+      res,
+      error,
+      {
+        ADMIN_NOT_FOUND: [404, "Admin account not found"],
+        INVALID_OTP_FORMAT: [400, "OTP must be exactly 6 digits"],
+        INVALID_PIN_FORMAT: [400, "PIN must be exactly 4 digits"],
+        INVALID_OTP: [400, "OTP is invalid or unrecognized"],
+        OTP_ALREADY_USED: [409, "This OTP has already been used"],
+        OTP_EXPIRED: [410, "This OTP has expired — tap your card again"],
+        MISSING_TERMINAL_CONTEXT: [400, "OTP is missing terminal context"],
+        CARD_ALREADY_LINKED: [409, "This card is already linked to another user"],
+        ADMIN_ALREADY_HAS_CARD: [409, "Your account already has a different card linked"],
+      },
+      "admin.link_card_controller_error",
+      "Server error",
+      "message"
+    );
   }
 };
-
-export {
-  approveKycHandler,
-  rejectKycHandler,
-  requireAdminSecret,
-  requireCriticalApproval,
-};
-export default null;

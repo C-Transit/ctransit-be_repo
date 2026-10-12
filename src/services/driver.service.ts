@@ -1,19 +1,22 @@
-"use strict";
-
 import crypto from "crypto";
-import jwt from "jsonwebtoken";
+import { getRedisClient, cacheKeys } from "../config/redis.js";
 import bcrypt from "bcryptjs";
 import { prisma } from "../lib/prisma.js";
-import env from "../config/env.js";
 import logger from "../config/logger.js";
-import { issueRefreshToken } from "./token.service.js";
+import { issueRefreshToken, revokeAllRefreshTokens, signAccessToken } from "./token.service.js";
 import { sendNotification } from "./notification.service.js";
 import { terminalProvisioningService } from "./terminal-provisioning.service.js";
 import { paymentContainer } from "../payments/payment.container.js";
-import type {
-  IPaymentGateway,
-  PayoutParams,
-} from "../payments/payment.interface.js";
+import type { PayoutParams, BankInfo } from "../payments/payment.interface.js";
+
+// ─────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────
+
+const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+const notify = (driverUid: string, title: string, body: string) =>
+  sendNotification(driverUid, title, body).catch(() => {});
+const num = (d: { toString(): string } | null | undefined) => (d ? parseFloat(d.toString()) : 0);
 
 function maskAccountNumber(accountNumber: string): string {
   return accountNumber.length > 4
@@ -21,71 +24,100 @@ function maskAccountNumber(accountNumber: string): string {
     : "****";
 }
 
-export interface DriverRegisterData {
+// Real 60-char hash so a compare against an unknown phone costs the same as a real one.
+const DRIVER_DUMMY_HASH = bcrypt.hashSync("dummy-pin", 10);
+const PIN_MAX_FAILS = 5;
+const PIN_LOCK_SECONDS = 15 * 60;
+
+// PIN check with a lockout per key. Fails open if Redis is down.
+async function checkPin(lockKey: string, pin: string, hash: string | undefined): Promise<boolean> {
+  const redis = getRedisClient();
+  const key = `driver:pin_fail:${lockKey}`;
+
+  const fails = Number(await redis.get(key).catch(() => 0)) || 0;
+  if (fails >= PIN_MAX_FAILS) throw new Error("TOO_MANY_ATTEMPTS");
+
+  const ok = await bcrypt.compare(pin, hash ?? DRIVER_DUMMY_HASH);
+  if (hash && ok) {
+    redis.del(key).catch(() => {});
+    return true;
+  }
+  redis.multi().incr(key).expire(key, PIN_LOCK_SECONDS).exec().catch(() => {});
+  return false;
+}
+
+type TerminalRow = { terminal_id: string; status: string; location: string | null; last_seen: Date | null };
+
+const TERMINAL_SELECT = { terminal_id: true, status: true, location: true, last_seen: true } as const;
+
+const terminalInfo = (t: TerminalRow | null) =>
+  t
+    ? {
+        id: t.terminal_id,
+        name: t.terminal_id,
+        status: t.status,
+        location: t.location ?? null,
+        lastSeen: t.last_seen ? t.last_seen.toISOString() : null,
+      }
+    : { id: null, name: "N/A", status: "N/A", location: null, lastSeen: null };
+
+type DriverRow = {
+  id: string;
   firstname: string;
   lastname: string;
-  matricNumber: string;
-}
+  phone: string | null;
+  role: string;
+  vehicleType: string | null;
+  vehiclePlate: string | null;
+  bankCode: string | null;
+  bankName: string | null;
+  accountNumber: string | null;
+  accountName: string | null;
+  bankVerified: boolean;
+};
 
-async function handleDriverRegister(
-  terminalId: string,
-  data: DriverRegisterData
+// Driver-facing profile: no email and no matric number.
+const toProfile = (d: DriverRow, t: TerminalRow | null) => ({
+  id: d.id,
+  firstname: d.firstname,
+  lastname: d.lastname,
+  phone: d.phone ?? null,
+  role: d.role,
+  terminalId: t?.terminal_id ?? null,
+  terminalStatus: t ? t.status : "N/A",
+  terminal: terminalInfo(t),
+  vehicleType: d.vehicleType ?? null,
+  vehiclePlate: d.vehiclePlate ?? null,
+  bankCode: d.bankCode ?? null,
+  bankName: d.bankName ?? null,
+  accountNumber: d.accountNumber ?? null,
+  accountName: d.accountName ?? null,
+  bankVerified: d.bankVerified ?? false,
+});
+
+async function requireDriver<T extends object = { matricNumber: string }>(
+  userId: string,
+  select: Record<string, boolean> = { matricNumber: true }
 ) {
-  const { firstname, lastname, matricNumber } = data;
-  const log = logger.child({ terminalId, matricNumber });
-
-  // Check if driver already exists
-  const existing = await prisma.user.findUnique({
-    where: { matricNumber: matricNumber.toUpperCase() },
+  const driver = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { ...select, role: true },
   });
-
-  if (existing) {
-    log.warn("driver.already_registered");
-    return {
-      success: false,
-      message: `${matricNumber} already registered`,
-    };
-  }
-
-  const defaultPassword = `${matricNumber.replace(/\//g, "")}Driver!`;
-  const hashedPassword = await bcrypt.hash(defaultPassword, 10);
-
-  await prisma.user.create({
-    data: {
-      firstname,
-      lastname,
-      email: `-`,
-      matricNumber: matricNumber.toUpperCase(),
-      password: hashedPassword,
-      role: "DRIVER",
-      isVerified: true,
-      driverWallet: {
-        create: {
-          balance: 0,
-          total_earnings: 0,
-        },
-      },
-    },
-  });
-
-  log.info({ firstname, lastname }, "driver.registered_from_terminal");
-
-  return {
-    success: true,
-    message: `Driver ${firstname} ${lastname} registered`,
-  };
+  if (!driver || driver.role !== "DRIVER") throw new Error("DRIVER_NOT_FOUND");
+  return driver as unknown as T & { role: string };
 }
+
+// ─────────────────────────────────────────────
+// Terminal session (called from terminal flows)
+// ─────────────────────────────────────────────
 
 async function handleDriverLogin(terminalId: string, driverUid: string) {
   const normUid = driverUid.trim().toUpperCase();
   const log = logger.child({ terminalId, driverUid: normUid });
 
   const driver = await prisma.user.findFirst({
-    where: {
-      matricNumber: normUid,
-      role: "DRIVER",
-    },
-    select: { id: true, firstname: true, lastname: true, matricNumber: true },
+    where: { matricNumber: normUid, role: "DRIVER" },
+    select: { firstname: true, lastname: true, matricNumber: true },
   });
 
   if (!driver) {
@@ -93,24 +125,17 @@ async function handleDriverLogin(terminalId: string, driverUid: string) {
     return { success: false, message: "Driver not recognised." };
   }
 
-  // Enforce single-terminal invariant: Clear driver association from any other
-  // terminal where this driver was previously active.
+  // Single-terminal invariant: clear this driver from any other terminal.
   await prisma.terminal.updateMany({
-    where: {
-      active_driver_uid: driver.matricNumber,
-      terminal_id: { not: terminalId },
-    },
+    where: { active_driver_uid: driver.matricNumber, terminal_id: { not: terminalId } },
     data: { active_driver_uid: null },
   });
-
-  // Assign driver to the current terminal
   await prisma.terminal.update({
     where: { terminal_id: terminalId },
     data: { active_driver_uid: driver.matricNumber },
   });
 
   log.info("driver.logged_into_terminal");
-
   return {
     success: true,
     message: `Welcome ${driver.firstname}`,
@@ -119,15 +144,11 @@ async function handleDriverLogin(terminalId: string, driverUid: string) {
 }
 
 async function handleDriverLogout(terminalId?: string, driverUid?: string) {
-  const normUid = driverUid ? driverUid.trim().toUpperCase() : undefined;
-  const log = logger.child({ terminalId, driverUid: normUid });
+  const normUid = driverUid?.trim().toUpperCase();
 
   if (terminalId) {
     await prisma.terminal.updateMany({
-      where: {
-        terminal_id: terminalId,
-        ...(normUid ? { active_driver_uid: normUid } : {}),
-      },
+      where: { terminal_id: terminalId, ...(normUid ? { active_driver_uid: normUid } : {}) },
       data: { active_driver_uid: null },
     });
   } else if (normUid) {
@@ -137,11 +158,13 @@ async function handleDriverLogout(terminalId?: string, driverUid?: string) {
     });
   }
 
-  log.info("driver.logged_out_of_terminal");
+  logger.info({ terminalId, driverUid: normUid }, "driver.logged_out_of_terminal");
   return { success: true, message: "Driver logged out." };
 }
 
-export { handleDriverRegister, handleDriverLogin, handleDriverLogout };
+// ─────────────────────────────────────────────
+// Listing and registration
+// ─────────────────────────────────────────────
 
 async function listDrivers() {
   const [drivers, activeTerminals] = await Promise.all([
@@ -152,61 +175,29 @@ async function listDrivers() {
         id: true,
         firstname: true,
         lastname: true,
+        phone: true,
         matricNumber: true,
         createdAt: true,
-        driverWallet: {
-          select: {
-            balance: true,
-            total_earnings: true,
-          },
-        },
+        driverWallet: { select: { balance: true, total_earnings: true } },
       },
     }),
-
-    // Only fetch terminals that currently have a driver
     prisma.terminal.findMany({
       where: { active_driver_uid: { not: null } },
-      select: {
-        terminal_id: true,
-        status: true,
-        active_driver_uid: true,
-      },
+      select: { terminal_id: true, status: true, active_driver_uid: true },
     }),
   ]);
 
-  // Map: matricNumber → terminal — O(1) lookups in the merge below
-  const terminalByDriver = new Map(
-    activeTerminals.map((t) => [t.active_driver_uid, t])
-  );
+  const terminalByDriver = new Map(activeTerminals.map((t) => [t.active_driver_uid, t]));
 
   return drivers.map((driver) => ({
     ...driver,
     wallet: {
-      balance: driver.driverWallet
-        ? parseFloat(driver.driverWallet.balance.toString())
-        : 0,
-      total_earnings: driver.driverWallet
-        ? parseFloat(driver.driverWallet.total_earnings.toString())
-        : 0,
+      balance: num(driver.driverWallet?.balance),
+      total_earnings: num(driver.driverWallet?.total_earnings),
     },
     activeTerminal: terminalByDriver.get(driver.matricNumber) ?? null,
   }));
 }
-
-// ─────────────────────────────────────────────
-// registerDriverByAgent
-//
-// Back to the default split: the agent only creates the bare driver account
-// here — firstname, lastname, phone, a 4-digit PIN. Card linking and bank
-// account verification are done afterwards, driver-side, with the agent
-// simply logging into the driver's account (phone + the PIN just set) to
-// help them through it — see linkDriverCard() and verifyAndSaveDriverBank().
-//
-// The driver's matricNumber is generated internally (DRV-XXXXXXXX) — agents
-// never see or type it. The PIN doubles as both the app-login credential
-// (User.password) and, once a card is linked, the terminal tap-in PIN —
-// they're kept as the same secret for now (see linkDriverCard).
-// ─────────────────────────────────────────────
 
 export interface RegisterDriverData {
   firstname: string;
@@ -215,44 +206,29 @@ export interface RegisterDriverData {
   pin: string;
 }
 
-function generateDriverUid(): string {
-  // 4 random bytes → 8 hex chars. Collision odds are negligible, but the
-  // caller still retries on a P2002 hit against matricNumber, just in case.
-  const suffix = crypto.randomBytes(4).toString("hex").toUpperCase();
-  return `DRV-${suffix}`;
-}
+// DRV-XXXXXXXX: internal id, never typed or shown to agents.
+const generateDriverUid = () => `DRV-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
 
+// An agent creates the bare account (name, phone, PIN). Card linking and bank
+// verification happen afterwards, in the driver's own session.
 async function registerDriverByAgent(data: RegisterDriverData) {
   const firstname = data.firstname?.trim();
   const lastname = data.lastname?.trim();
   const phone = data.phone?.trim();
   const pin = data.pin?.trim();
 
-  if (!firstname || !lastname) {
-    throw new Error("MISSING_NAME");
-  }
-  if (!phone || !/^\+?\d{7,15}$/.test(phone)) {
-    throw new Error("INVALID_PHONE");
-  }
-  if (!pin || !/^\d{4}$/.test(pin)) {
-    throw new Error("INVALID_PIN_FORMAT");
-  }
+  if (!firstname || !lastname) throw new Error("MISSING_NAME");
+  if (!phone || !/^\+?\d{7,15}$/.test(phone)) throw new Error("INVALID_PHONE");
+  if (!pin || !/^\d{4}$/.test(pin)) throw new Error("INVALID_PIN_FORMAT");
 
-  // Phone must be free before we go any further.
-  const existingPhone = await prisma.user.findUnique({
-    where: { phone },
-    select: { id: true },
-  });
-  if (existingPhone) {
+  if (await prisma.user.findUnique({ where: { phone }, select: { id: true } })) {
     throw new Error("PHONE_ALREADY_IN_USE");
   }
 
   const pinHash = await bcrypt.hash(pin, 10);
-
-  const MAX_UID_ATTEMPTS = 5;
   let lastError: unknown;
 
-  for (let attempt = 1; attempt <= MAX_UID_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= 5; attempt++) {
     const matricNumber = generateDriverUid();
 
     try {
@@ -260,15 +236,14 @@ async function registerDriverByAgent(data: RegisterDriverData) {
         data: {
           firstname,
           lastname,
-          email: "-",
+          // Placeholder: User.email is required and unique. Drivers have no real email.
+          email: `${matricNumber.toLowerCase()}@drivers.ctransit.me`,
           matricNumber,
           phone,
           password: pinHash,
           role: "DRIVER",
           isVerified: true,
-          driverWallet: {
-            create: { balance: 0, total_earnings: 0 },
-          },
+          driverWallet: { create: { balance: 0, total_earnings: 0 } },
         },
         select: {
           id: true,
@@ -277,98 +252,47 @@ async function registerDriverByAgent(data: RegisterDriverData) {
           phone: true,
           matricNumber: true,
           createdAt: true,
-          driverWallet: {
-            select: { balance: true, total_earnings: true },
-          },
+          driverWallet: { select: { balance: true, total_earnings: true } },
         },
       });
 
-      logger.info(
-        { matricNumber: driver.matricNumber },
-        "driver.registered_by_agent"
-      );
-
+      logger.info({ matricNumber: driver.matricNumber }, "driver.registered_by_agent");
       return driver;
     } catch (error) {
-      const prismaError = error as {
-        code?: string;
-        meta?: { target?: string[] | string };
-      };
-      const target = Array.isArray(prismaError.meta?.target)
-        ? prismaError.meta.target.join(",")
-        : prismaError.meta?.target || "";
+      const e = error as { code?: string; meta?: { target?: string[] | string } };
+      const target = Array.isArray(e.meta?.target) ? e.meta.target.join(",") : e.meta?.target || "";
 
-      // Driver UID collision — vanishingly unlikely, but retry with a fresh one.
-      if (prismaError.code === "P2002" && target.includes("matricNumber")) {
+      if (e.code === "P2002" && target.includes("matricNumber")) {
         lastError = error;
-        continue;
+        continue; // UID collision: retry with a fresh one
       }
-
-      if (prismaError.code === "P2002" && target.includes("phone")) {
+      if (e.code === "P2002" && target.includes("phone")) {
         throw new Error("PHONE_ALREADY_IN_USE", { cause: error });
       }
-
       throw error;
     }
   }
 
-  logger.error(
-    { err: String(lastError) },
-    "driver.uid_generation_exhausted_retries"
-  );
+  logger.error({ err: String(lastError) }, "driver.uid_generation_exhausted_retries");
   throw new Error("DRIVER_UID_GENERATION_FAILED");
 }
 
-async function getDriverWallet(driverUid: string) {
-  const normalised = driverUid.toUpperCase();
-  const wallet = await prisma.driverWallet.findUnique({
-    where: { driver_uid: normalised },
-  });
-  if (!wallet) {
-    return {
-      driver_uid: normalised,
-      balance: 0,
-      total_earnings: 0,
-    };
-  }
-  return {
-    driver_uid: wallet.driver_uid,
-    balance: parseFloat(wallet.balance.toString()),
-    total_earnings: parseFloat(wallet.total_earnings.toString()),
-  };
-}
-
-// Pre-computed hash used in the dummy compare path when no driver matches
-// the given phone. bcrypt.compare is constant-time regardless of match, but
-// calling it at all — even against a fake row — is what prevents a phone
-// number's existence from leaking through response-time differences. Same
-// pattern as agent.service.ts's loginAgent.
-const DRIVER_DUMMY_HASH =
-  "$2b$10$abcdefghijklmnopqrstuuABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+// ─────────────────────────────────────────────
+// Auth and profile
+// ─────────────────────────────────────────────
 
 async function loginDriver(phone: string, pin: string) {
   const trimmedPhone = phone.trim();
-  const driver = await prisma.user.findFirst({
-    where: { phone: trimmedPhone, role: "DRIVER" },
-  });
+  const driver = await prisma.user.findFirst({ where: { phone: trimmedPhone, role: "DRIVER" } });
 
-  // Always run bcrypt — prevents timing-based phone-number enumeration.
-  const validPin = await bcrypt.compare(
-    pin,
-    driver?.password ?? DRIVER_DUMMY_HASH
-  );
-
+  // Always runs bcrypt (against a dummy hash when unknown) and counts failures per phone.
+  const validPin = await checkPin(`login:${trimmedPhone}`, pin, driver?.password);
   if (!driver || !validPin) {
     logger.warn({ phone: trimmedPhone }, "driver.login_invalid_credentials");
     throw new Error("INVALID_CREDENTIALS");
   }
 
-  const accessToken = jwt.sign(
-    { userId: driver.id, role: driver.role, email: driver.email },
-    env.jwt.secret,
-    { expiresIn: "8h" }
-  );
-
+  const accessToken = signAccessToken({ userId: driver.id, role: "DRIVER", email: driver.email });
   const refreshToken = await issueRefreshToken({
     userId: driver.id,
     role: driver.role,
@@ -377,255 +301,81 @@ async function loginDriver(phone: string, pin: string) {
 
   const terminal = await prisma.terminal.findFirst({
     where: { active_driver_uid: driver.matricNumber },
-    select: {
-      terminal_id: true,
-      status: true,
-      location: true,
-      last_seen: true,
-    },
+    select: TERMINAL_SELECT,
   });
 
-  const terminalInfo = terminal
-    ? {
-        id: terminal.terminal_id,
-        name: terminal.terminal_id,
-        status: terminal.status,
-        location: terminal.location ?? null,
-        lastSeen: terminal.last_seen ? terminal.last_seen.toISOString() : null,
-      }
-    : {
-        id: null,
-        name: "N/A",
-        status: "N/A",
-        location: null,
-        lastSeen: null,
-      };
-
-  const profile = {
-    id: driver.id,
-    firstname: driver.firstname,
-    lastname: driver.lastname,
-    email: driver.email,
-    matricNumber: driver.matricNumber,
-    phone: driver.phone ?? null,
-    role: driver.role,
-    terminalId: terminal?.terminal_id ?? null,
-    terminalStatus: terminal ? terminal.status : "N/A",
-    terminal: terminalInfo,
-    vehicleType: driver.vehicleType ?? null,
-    vehiclePlate: driver.vehiclePlate ?? null,
-    bankCode: driver.bankCode ?? null,
-    bankName: driver.bankName ?? null,
-    accountNumber: driver.accountNumber ?? null,
-    accountName: driver.accountName ?? null,
-    bankVerified: driver.bankVerified ?? false,
-  };
-
-  logger.info(
-    { driverId: driver.id, matricNumber: driver.matricNumber },
-    "driver.login_successful"
-  );
-
-  return {
-    accessToken,
-    refreshToken,
-    driver: profile,
-  };
+  logger.info({ driverId: driver.id }, "driver.login_successful");
+  return { accessToken, refreshToken, driver: toProfile(driver, terminal) };
 }
 
 async function getDriverProfile(userId: string) {
-  const driver = await prisma.user.findUnique({
-    where: { id: userId },
-  });
-
-  if (!driver || driver.role !== "DRIVER") {
-    throw new Error("DRIVER_NOT_FOUND");
-  }
+  const driver = await prisma.user.findUnique({ where: { id: userId } });
+  if (!driver || driver.role !== "DRIVER") throw new Error("DRIVER_NOT_FOUND");
 
   const terminal = await prisma.terminal.findFirst({
     where: { active_driver_uid: driver.matricNumber },
-    select: {
-      terminal_id: true,
-      status: true,
-      location: true,
-      last_seen: true,
-    },
+    select: TERMINAL_SELECT,
   });
+  return toProfile(driver, terminal);
+}
 
-  const terminalInfo = terminal
-    ? {
-        id: terminal.terminal_id,
-        name: terminal.terminal_id,
-        status: terminal.status,
-        location: terminal.location ?? null,
-        lastSeen: terminal.last_seen ? terminal.last_seen.toISOString() : null,
-      }
-    : {
-        id: null,
-        name: "N/A",
-        status: "N/A",
-        location: null,
-        lastSeen: null,
-      };
-
+async function getDriverWallet(driverUid: string) {
+  const uid = driverUid.toUpperCase();
+  const wallet = await prisma.driverWallet.findUnique({ where: { driver_uid: uid } });
   return {
-    id: driver.id,
-    firstname: driver.firstname,
-    lastname: driver.lastname,
-    email: driver.email,
-    matricNumber: driver.matricNumber,
-    phone: driver.phone ?? null,
-    role: driver.role,
-    terminalId: terminal?.terminal_id ?? null,
-    terminalStatus: terminal ? terminal.status : "N/A",
-    terminal: terminalInfo,
-    vehicleType: driver.vehicleType ?? null,
-    vehiclePlate: driver.vehiclePlate ?? null,
-    bankCode: driver.bankCode ?? null,
-    bankName: driver.bankName ?? null,
-    accountNumber: driver.accountNumber ?? null,
-    accountName: driver.accountName ?? null,
-    bankVerified: driver.bankVerified ?? false,
+    driver_uid: uid,
+    balance: num(wallet?.balance),
+    total_earnings: num(wallet?.total_earnings),
   };
 }
 
 async function getDriverDashboard(userId: string) {
-  const driver = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { matricNumber: true, role: true },
-  });
-
-  if (!driver || driver.role !== "DRIVER") {
-    throw new Error("DRIVER_NOT_FOUND");
-  }
+  const driver = await requireDriver(userId);
 
   const now = new Date();
-  const startOfToday = new Date(
-    now.getFullYear(),
-    now.getMonth(),
-    now.getDate()
-  );
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const todayRides = { driver_uid: driver.matricNumber, type: "RIDE" as const, synced_at: { gte: startOfToday } };
 
-  const [driverWallet, todayRidesCount, todayEarningsAgg, terminal] =
-    await Promise.all([
-      prisma.driverWallet.findUnique({
-        where: { driver_uid: driver.matricNumber },
-        select: { balance: true },
-      }),
-      prisma.transaction.count({
-        where: {
-          driver_uid: driver.matricNumber,
-          type: "RIDE",
-          synced_at: { gte: startOfToday },
-        },
-      }),
-      prisma.transaction.aggregate({
-        where: {
-          driver_uid: driver.matricNumber,
-          type: "RIDE",
-          synced_at: { gte: startOfToday },
-        },
-        _sum: {
-          driver_share: true,
-        },
-      }),
-      prisma.terminal.findFirst({
-        where: { active_driver_uid: driver.matricNumber },
-        select: {
-          terminal_id: true,
-          status: true,
-          location: true,
-          last_seen: true,
-        },
-      }),
-    ]);
-
-  const terminalInfo = terminal
-    ? {
-        id: terminal.terminal_id,
-        name: terminal.terminal_id,
-        status: terminal.status,
-        location: terminal.location ?? null,
-        lastSeen: terminal.last_seen ? terminal.last_seen.toISOString() : null,
-      }
-    : {
-        id: null,
-        name: "N/A",
-        status: "N/A",
-        location: null,
-        lastSeen: null,
-      };
+  const [wallet, todayRidesCount, todayEarnings, terminal] = await Promise.all([
+    prisma.driverWallet.findUnique({ where: { driver_uid: driver.matricNumber }, select: { balance: true } }),
+    prisma.transaction.count({ where: todayRides }),
+    prisma.transaction.aggregate({ where: todayRides, _sum: { driver_share: true } }),
+    prisma.terminal.findFirst({ where: { active_driver_uid: driver.matricNumber }, select: TERMINAL_SELECT }),
+  ]);
 
   return {
-    todayEarnings: todayEarningsAgg._sum.driver_share
-      ? parseFloat(todayEarningsAgg._sum.driver_share.toString())
-      : 0,
+    todayEarnings: num(todayEarnings._sum.driver_share),
     todayRidesCount,
-    availableBalance: driverWallet
-      ? parseFloat(driverWallet.balance.toString())
-      : 0,
+    availableBalance: num(wallet?.balance),
     terminalStatus: terminal ? terminal.status : "N/A",
     terminalId: terminal?.terminal_id ?? null,
-    terminal: terminalInfo,
+    terminal: terminalInfo(terminal),
   };
 }
 
-async function getDriverRides(
-  userId: string,
-  page: number = 1,
-  limit: number = 20
-) {
-  const driver = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { matricNumber: true, role: true },
-  });
-
-  if (!driver || driver.role !== "DRIVER") {
-    throw new Error("DRIVER_NOT_FOUND");
-  }
+async function getDriverRides(userId: string, page = 1, limit = 20) {
+  const driver = await requireDriver(userId);
 
   const pageNum = Math.max(1, page);
   const limitNum = Math.min(100, Math.max(1, limit));
-  const skip = (pageNum - 1) * limitNum;
+  const where = { driver_uid: driver.matricNumber, type: "RIDE" as const };
 
   const [transactions, total] = await Promise.all([
     prisma.transaction.findMany({
-      where: {
-        driver_uid: driver.matricNumber,
-        type: "RIDE",
-      },
+      where,
       orderBy: { synced_at: "desc" },
-      skip,
+      skip: (pageNum - 1) * limitNum,
       take: limitNum,
-      include: {
-        user: {
-          select: {
-            firstname: true,
-            lastname: true,
-            matricNumber: true,
-          },
-        },
-      },
+      include: { user: { select: { firstname: true, lastname: true, matricNumber: true } } },
     }),
-    prisma.transaction.count({
-      where: {
-        driver_uid: driver.matricNumber,
-        type: "RIDE",
-      },
-    }),
+    prisma.transaction.count({ where }),
   ]);
 
   const rides = transactions.map((tx) => ({
     id: tx.transaction_id,
-    amount: tx.driver_share
-      ? parseFloat(tx.driver_share.toString())
-      : tx.fare
-      ? parseFloat(tx.fare.toString())
-      : parseFloat(tx.amount.toString()),
+    amount: num(tx.driver_share ?? tx.fare ?? tx.amount),
     studentMatric: tx.student_uid,
-    studentName: tx.user
-      ? `${tx.user.firstname} ${tx.user.lastname}`.trim()
-      : tx.student_uid,
+    studentName: tx.user ? `${tx.user.firstname} ${tx.user.lastname}`.trim() : tx.student_uid,
     terminalId: tx.terminal_id,
     status: "COMPLETED",
     createdAt: tx.synced_at,
@@ -634,59 +384,153 @@ async function getDriverRides(
 
   return {
     rides,
-    pagination: {
-      page: pageNum,
-      limit: limitNum,
-      total,
-      totalPages: Math.ceil(total / limitNum),
-    },
+    pagination: { page: pageNum, limit: limitNum, total, totalPages: Math.ceil(total / limitNum) },
   };
 }
 
+// ─────────────────────────────────────────────
+// Banks
+// ─────────────────────────────────────────────
+
+const BANK_CACHE_MS = 24 * 60 * 60 * 1000;
+let bankCache: { at: number; banks: BankInfo[] } | null = null;
+
+// Provider bank list (name + the provider's own code), cached 24h; serves stale if the provider is down.
+async function getBanks(): Promise<BankInfo[]> {
+  if (bankCache && Date.now() - bankCache.at < BANK_CACHE_MS) return bankCache.banks;
+
+  const listBanks = paymentContainer.listBanks?.bind(paymentContainer);
+  if (!listBanks) throw new Error("BANK_LIST_NOT_SUPPORTED");
+
+  try {
+    const banks = await listBanks();
+    if (banks.length === 0) throw new Error("EMPTY_BANK_LIST");
+    bankCache = { at: Date.now(), banks };
+    return banks;
+  } catch (err) {
+    if (bankCache) {
+      logger.warn({ err: errText(err) }, "driver.bank_list_stale_served");
+      return bankCache.banks;
+    }
+    throw err;
+  }
+}
+
+export interface VerifyDriverBankParams {
+  bankCode: string;
+  accountNumber: string;
+  pin: string;
+}
+
+// The driver picks a bank from the dropdown and types only the account number.
+// Bank name/code come from the provider list, the account name from provider resolution,
+// and changing the payout destination requires the driver's own PIN.
+async function verifyAndSaveDriverBank(userId: string, params: VerifyDriverBankParams) {
+  const accountNumber = params.accountNumber?.trim() ?? "";
+  if (!/^\d{10}$/.test(accountNumber)) throw new Error("INVALID_ACCOUNT_NUMBER");
+
+  const driver = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { id: true, role: true, password: true },
+  });
+  if (!driver || driver.role !== "DRIVER") throw new Error("DRIVER_NOT_FOUND");
+
+  if (!(await checkPin(`bank:${driver.id}`, params.pin ?? "", driver.password))) {
+    throw new Error("INVALID_PIN");
+  }
+
+  const bank = (await getBanks()).find((b) => b.code === params.bankCode?.trim());
+  if (!bank) throw new Error("INVALID_BANK_CODE");
+
+  const resolveBankAccount = paymentContainer.resolveBankAccount?.bind(paymentContainer);
+  if (!resolveBankAccount) throw new Error("BANK_VERIFICATION_NOT_SUPPORTED");
+  const resolved = await resolveBankAccount(bank.code, accountNumber);
+
+  const data = await prisma.user.update({
+    where: { id: driver.id },
+    data: {
+      bankCode: bank.code,
+      bankName: bank.name,
+      accountNumber,
+      accountName: resolved.accountName,
+      bankVerified: true,
+    },
+    select: { bankCode: true, bankName: true, accountNumber: true, accountName: true, bankVerified: true },
+  });
+
+  logger.warn(
+    { driverId: driver.id, bankCode: bank.code, accountNumber: maskAccountNumber(accountNumber) },
+    "driver.bank_account_changed"
+  );
+  return { success: true, message: "Bank account verified successfully", data };
+}
+
+// ─────────────────────────────────────────────
+// Withdrawals
+// ─────────────────────────────────────────────
+
 export interface CreateWithdrawalParams {
   amount: number;
-  bankName: string;
-  accountNumber?: string;
-  accountName?: string;
   remarks?: string;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type DbClient = any;
+const CTRANSIT_PAYOUT_FEE_RATIO = 0.04; // the driver bears a 4% payout fee
 
-const CTRANSIT_PAYOUT_FEE_RATIO = 0.04; // 4% C-Transit payout fee
+// PENDING/PROCESSING -> SUCCESS. Returns false if it was already finalized.
+async function markWithdrawalSuccess(id: string, koraReference?: string, fee?: number): Promise<boolean> {
+  const r = await prisma.driverWithdrawal.updateMany({
+    where: { id, status: { in: ["PENDING", "PROCESSING"] } },
+    data: {
+      status: "SUCCESS",
+      ...(koraReference ? { kora_reference: koraReference } : {}),
+      ...(fee !== undefined ? { kora_fee: fee } : {}),
+    },
+  });
+  return r.count > 0;
+}
 
-async function createDriverWithdrawal(
-  userId: string,
-  params: CreateWithdrawalParams,
-  dbClient: DbClient = prisma,
-  payoutGateway: IPaymentGateway = paymentContainer
-) {
-  const { amount, bankName, remarks } = params;
+// PENDING/PROCESSING -> FAILED and refund the reserved gross amount, exactly once.
+async function failWithdrawalAndRefund(
+  id: string,
+  d: { reason: string; koraReference?: string; fee?: number }
+): Promise<boolean> {
+  return prisma.$transaction(async (tx) => {
+    const claimed = await tx.driverWithdrawal.updateMany({
+      where: { id, status: { in: ["PENDING", "PROCESSING"] } },
+      data: {
+        status: "FAILED",
+        failure_reason: d.reason.slice(0, 255), // column is VarChar(255)
+        ...(d.koraReference ? { kora_reference: d.koraReference } : {}),
+        ...(d.fee !== undefined ? { kora_fee: d.fee } : {}),
+      },
+    });
+    if (claimed.count === 0) return false;
 
-  const grossAmount = Math.round(amount * 100) / 100;
-  if (isNaN(grossAmount) || grossAmount <= 0) {
-    throw new Error("INVALID_AMOUNT");
-  }
+    const w = await tx.driverWithdrawal.findUniqueOrThrow({
+      where: { id },
+      select: { driver_uid: true, amount: true },
+    });
+    await tx.driverWallet.update({
+      where: { driver_uid: w.driver_uid },
+      data: { balance: { increment: w.amount } },
+    });
+    return true;
+  });
+}
 
-  // C-Transit business rule: driver bears a 4% payout fee
-  const ctransitFee =
-    Math.round(grossAmount * CTRANSIT_PAYOUT_FEE_RATIO * 100) / 100;
-  const netAmount = Math.round((grossAmount - ctransitFee) * 100) / 100;
+async function createDriverWithdrawal(userId: string, params: CreateWithdrawalParams) {
+  const gross = Math.round(params.amount * 100) / 100;
+  if (!Number.isFinite(gross) || gross <= 0) throw new Error("INVALID_AMOUNT");
 
-  if (netAmount <= 0) {
-    throw new Error("AMOUNT_TOO_LOW");
-  }
+  const fee = Math.round(gross * CTRANSIT_PAYOUT_FEE_RATIO * 100) / 100;
+  const net = Math.round((gross - fee) * 100) / 100;
+  if (net <= 0) throw new Error("AMOUNT_TOO_LOW");
 
-  const driver = await dbClient.user.findUnique({
+  const driver = await prisma.user.findUnique({
     where: { id: userId },
     select: {
-      id: true,
       matricNumber: true,
       role: true,
-      email: true,
-      firstname: true,
-      lastname: true,
       bankCode: true,
       bankName: true,
       accountNumber: true,
@@ -694,294 +538,141 @@ async function createDriverWithdrawal(
       bankVerified: true,
     },
   });
-
-  if (!driver || driver.role !== "DRIVER") {
-    throw new Error("DRIVER_NOT_FOUND");
-  }
-
-  // Strictly enforce verified bank account details
-  if (!driver.bankVerified || !driver.accountNumber || !driver.accountName) {
+  if (!driver || driver.role !== "DRIVER") throw new Error("DRIVER_NOT_FOUND");
+  if (!driver.bankVerified || !driver.bankCode || !driver.accountNumber || !driver.accountName) {
     throw new Error("BANK_NOT_VERIFIED");
   }
 
-  const effectiveBankName =
-    driver.bankName || bankName?.trim() || "Verified Bank";
-  const effectiveAccountNumber = driver.accountNumber.trim();
-  // Server-authoritative: Account name is strictly sourced from Kora resolution stored on user record
-  const effectiveAccountName = driver.accountName.trim();
+  const reference = `WDR-${crypto.randomUUID()}`;
 
-  // Atomic reservation of gross amount from DriverWallet
-  const withdrawal = await dbClient.$transaction(async (tx: DbClient) => {
-    const wallet = await tx.driverWallet.findUnique({
-      where: { driver_uid: driver.matricNumber },
+  // Reserve the gross amount and record the withdrawal in one transaction.
+  const withdrawal = await prisma.$transaction(async (tx) => {
+    const debited = await tx.driverWallet.updateMany({
+      where: { driver_uid: driver.matricNumber, balance: { gte: gross } },
+      data: { balance: { decrement: gross } },
     });
-
-    if (!wallet) {
-      throw new Error("WALLET_NOT_FOUND");
-    }
-
-    const currentBalance = parseFloat(wallet.balance.toString());
-    if (currentBalance < grossAmount) {
-      throw new Error("INSUFFICIENT_BALANCE");
-    }
-
-    // Atomic debit to driver balance — reserves the requested gross amount
-    if (tx.driverWallet.updateMany) {
-      const debitResult = await tx.driverWallet.updateMany({
-        where: {
-          driver_uid: driver.matricNumber,
-          balance: { gte: grossAmount },
-        },
-        data: {
-          balance: { decrement: grossAmount },
-        },
-      });
-
-      if (debitResult.count === 0) {
-        throw new Error("INSUFFICIENT_BALANCE");
-      }
-    } else {
-      await tx.driverWallet.update({
+    if (debited.count === 0) {
+      const wallet = await tx.driverWallet.findUnique({
         where: { driver_uid: driver.matricNumber },
-        data: {
-          balance: { decrement: grossAmount },
-        },
+        select: { driver_uid: true },
       });
+      throw new Error(wallet ? "INSUFFICIENT_BALANCE" : "WALLET_NOT_FOUND");
     }
-
-    const reference = `WDR-${Date.now()}-${Math.random()
-      .toString(36)
-      .substring(2, 8)
-      .toUpperCase()}`;
-
-    const record = await tx.driverWithdrawal.create({
+    return tx.driverWithdrawal.create({
       data: {
         driver_uid: driver.matricNumber,
-        amount: grossAmount,
-        fee: ctransitFee,
-        net_amount: netAmount,
-        bank_name: effectiveBankName,
-        account_number: effectiveAccountNumber,
-        account_name: effectiveAccountName,
-        remarks: remarks?.trim() || null,
+        amount: gross,
+        fee,
+        net_amount: net,
+        bank_name: driver.bankName ?? "Verified Bank",
+        account_number: driver.accountNumber!.trim(),
+        account_name: driver.accountName!.trim(), // always the provider-resolved name
+        remarks: params.remarks?.trim() || null,
         reference,
         status: "PENDING",
       },
     });
-
-    return record;
   });
 
-  logger.info(
-    {
-      driverUid: driver.matricNumber,
-      grossAmount,
-      fee: ctransitFee,
-      netAmount,
-      reference: withdrawal.reference,
-    },
-    "driver.withdrawal_requested"
-  );
+  logger.info({ driverUid: driver.matricNumber, gross, fee, net, reference }, "driver.withdrawal_requested");
 
-  // Immediately initiate Kora bank payout
-  if (dbClient?.driverWithdrawal?.findUnique) {
-    await processWithdrawalPayout(withdrawal.id, dbClient, payoutGateway);
-  }
-
-  const updated = dbClient?.driverWithdrawal?.findUnique
-    ? await dbClient.driverWithdrawal.findUnique({
-        where: { id: withdrawal.id },
-      })
-    : null;
+  const result = await processWithdrawalPayout(withdrawal.id);
 
   return {
-    id: updated?.id || withdrawal.id,
-    amount: parseFloat((updated?.amount || withdrawal.amount).toString()),
-    fee: updated?.fee ? parseFloat(updated.fee.toString()) : ctransitFee,
-    netAmount: updated?.net_amount
-      ? parseFloat(updated.net_amount.toString())
-      : netAmount,
-    status: updated?.status || withdrawal.status,
-    reference: updated?.reference || withdrawal.reference,
-    koraReference: updated?.kora_reference || undefined,
+    id: withdrawal.id,
+    amount: gross,
+    fee,
+    netAmount: net,
+    status: result.status,
+    reference,
+    koraReference: result.koraReference,
   };
 }
 
-async function processWithdrawalPayout(
-  withdrawalId: string,
-  dbClient: DbClient = prisma,
-  gateway: IPaymentGateway = paymentContainer
-): Promise<{
+async function processWithdrawalPayout(withdrawalId: string): Promise<{
   status: string;
   koraReference?: string;
   koraFee?: number;
   failureReason?: string;
 }> {
-  const withdrawal = await dbClient.driverWithdrawal.findUnique({
-    where: { id: withdrawalId },
-    include: { driver: true },
-  });
-
-  if (!withdrawal) {
-    logger.warn({ withdrawalId }, "driver.payout_withdrawal_not_found");
-    return { status: "NOT_FOUND" };
-  }
-
-  // Idempotency check: prevent duplicate payout initiation for the same withdrawal
-  if (withdrawal.status !== "PENDING") {
-    logger.warn(
-      {
-        withdrawalId,
-        reference: withdrawal.reference,
-        status: withdrawal.status,
-      },
-      "driver.payout_duplicate_initiation_prevented"
-    );
-    return {
-      status: withdrawal.status,
-      koraReference: withdrawal.kora_reference || undefined,
-      koraFee: withdrawal.kora_fee
-        ? parseFloat(withdrawal.kora_fee.toString())
-        : undefined,
-    };
-  }
-
-  // Transition lifecycle: PENDING -> PROCESSING
-  await dbClient.driverWithdrawal.update({
-    where: { id: withdrawalId },
+  // Claim PENDING -> PROCESSING exactly once, so a payout can never be initiated twice.
+  const claimed = await prisma.driverWithdrawal.updateMany({
+    where: { id: withdrawalId, status: "PENDING" },
     data: { status: "PROCESSING" },
   });
 
-  if (!gateway || !gateway.initiatePayout) {
-    logger.info(
-      { withdrawalId, reference: withdrawal.reference },
-      "driver.gateway_no_payout_support — retaining PROCESSING status"
-    );
+  const withdrawal = await prisma.driverWithdrawal.findUnique({
+    where: { id: withdrawalId },
+    include: { driver: { select: { id: true, bankCode: true } } },
+  });
+  if (!withdrawal) return { status: "NOT_FOUND" };
+
+  if (claimed.count === 0) {
+    logger.warn({ withdrawalId, status: withdrawal.status }, "driver.payout_duplicate_initiation_prevented");
+    return { status: withdrawal.status, koraReference: withdrawal.kora_reference ?? undefined };
+  }
+
+  const bankCode = withdrawal.driver.bankCode;
+  if (!bankCode) {
+    await failWithdrawalAndRefund(withdrawalId, { reason: "Missing bank code on driver record" });
+    return { status: "FAILED", failureReason: "Missing bank code" };
+  }
+
+  const initiatePayout = paymentContainer.initiatePayout?.bind(paymentContainer);
+  if (!initiatePayout) {
+    logger.warn({ withdrawalId }, "driver.gateway_no_payout_support — retaining PROCESSING");
     return { status: "PROCESSING" };
   }
 
-  const netAmount = withdrawal.net_amount
-    ? parseFloat(withdrawal.net_amount.toString())
-    : parseFloat(withdrawal.amount.toString());
-
+  const net = (withdrawal.net_amount ?? withdrawal.amount).toNumber();
   const payoutParams: PayoutParams = {
     reference: withdrawal.reference,
-    amount: netAmount,
+    amount: net,
     destination: {
       type: "bank_account",
-      amount: netAmount,
+      amount: net,
       currency: "NGN",
       narration: `C-Transit Driver Payout ${withdrawal.reference}`,
-      bank_account: {
-        bank: withdrawal.bank_name,
-        account: withdrawal.account_number,
-      },
+      bank_account: { bank: bankCode, account: withdrawal.account_number }, // bank CODE, not name
     },
-    customer: {
-      name: withdrawal.account_name,
-      email: withdrawal.driver?.email || `${withdrawal.driver_uid}@ctransit.me`,
-    },
+    // Drivers have no real email; the provider only needs a well-formed address.
+    customer: { name: withdrawal.account_name, email: `${withdrawal.driver.id}@drivers.ctransit.me` },
   };
 
   try {
-    const res = await gateway.initiatePayout(payoutParams);
+    const res = await initiatePayout(payoutParams);
 
     if (res.status === "success") {
-      await dbClient.driverWithdrawal.update({
-        where: { id: withdrawalId },
-        data: {
-          status: "SUCCESS",
-          kora_reference: res.koraReference || null,
-          kora_fee: res.fee !== undefined ? res.fee : null,
-        },
-      });
-
-      sendNotification(
-        withdrawal.driver_uid,
-        "Withdrawal Successful",
-        `Your withdrawal of ₦${netAmount.toLocaleString()} has been sent to your bank account.`
-      ).catch(() => {});
-
-      return {
-        status: "SUCCESS",
-        koraReference: res.koraReference,
-        koraFee: res.fee,
-      };
+      await markWithdrawalSuccess(withdrawalId, res.koraReference, res.fee);
+      notify(withdrawal.driver_uid, "Withdrawal Successful", `Your withdrawal of ₦${net.toLocaleString()} has been sent to your bank account.`);
+      return { status: "SUCCESS", koraReference: res.koraReference, koraFee: res.fee };
     }
 
     if (res.status === "failed") {
-      // Rejection / failure -> Restore driver balance exactly once
-      await dbClient.$transaction(async (tx: DbClient) => {
-        const current = await tx.driverWithdrawal.findUnique({
-          where: { id: withdrawalId },
-        });
-
-        if (
-          !current ||
-          current.status === "SUCCESS" ||
-          current.status === "FAILED"
-        ) {
-          return;
-        }
-
-        // Restore reserved gross amount
-        await tx.driverWallet.update({
-          where: { driver_uid: current.driver_uid },
-          data: { balance: { increment: current.amount } },
-        });
-
-        await tx.driverWithdrawal.update({
-          where: { id: withdrawalId },
-          data: {
-            status: "FAILED",
-            failure_reason: res.message || "Payout rejected by payment gateway",
-            kora_reference: res.koraReference || null,
-            kora_fee: res.fee !== undefined ? res.fee : null,
-          },
-        });
-      });
-
-      sendNotification(
-        withdrawal.driver_uid,
-        "Withdrawal Failed",
-        `Your withdrawal request could not be processed. Your wallet balance has been restored.`
-      ).catch(() => {});
-
-      return {
-        status: "FAILED",
-        failureReason: res.message,
+      await failWithdrawalAndRefund(withdrawalId, {
+        reason: res.message || "Payout rejected by payment gateway",
         koraReference: res.koraReference,
-        koraFee: res.fee,
-      };
+        fee: res.fee,
+      });
+      notify(withdrawal.driver_uid, "Withdrawal Failed", "Your withdrawal request could not be processed. Your wallet balance has been restored.");
+      return { status: "FAILED", failureReason: res.message, koraReference: res.koraReference, koraFee: res.fee };
     }
 
-    // PROCESSING, PENDING, or ambiguous_timeout
-    await dbClient.driverWithdrawal.update({
-      where: { id: withdrawalId },
+    // processing / pending / ambiguous_timeout: the webhook (or reconciliation) decides.
+    await prisma.driverWithdrawal.updateMany({
+      where: { id: withdrawalId, status: "PROCESSING" },
       data: {
-        status: "PROCESSING",
-        kora_reference: res.koraReference || null,
-        kora_fee: res.fee !== undefined ? res.fee : null,
-        remarks:
-          res.status === "ambiguous_timeout"
-            ? "Payout processing; pending webhook/query reconciliation"
-            : withdrawal.remarks,
+        ...(res.koraReference ? { kora_reference: res.koraReference } : {}),
+        ...(res.fee !== undefined ? { kora_fee: res.fee } : {}),
+        ...(res.status === "ambiguous_timeout"
+          ? { remarks: "Payout processing; pending webhook/query reconciliation" }
+          : {}),
       },
     });
-
-    return {
-      status: "PROCESSING",
-      koraReference: res.koraReference,
-      koraFee: res.fee,
-    };
+    return { status: "PROCESSING", koraReference: res.koraReference, koraFee: res.fee };
   } catch (error) {
-    logger.error(
-      {
-        withdrawalId,
-        error: error instanceof Error ? error.message : String(error),
-      },
-      "driver.payout_unexpected_exception — retaining PROCESSING status"
-    );
+    // Never refund on an unknown outcome: the money may already have left.
+    logger.error({ withdrawalId, error: errText(error) }, "driver.payout_unexpected_exception — retaining PROCESSING");
     return { status: "PROCESSING" };
   }
 }
@@ -997,17 +688,12 @@ export interface PayoutWebhookParams {
 }
 
 async function handleDriverPayoutWebhook(
-  params: PayoutWebhookParams,
-  dbClient: DbClient = prisma
+  params: PayoutWebhookParams
 ): Promise<{ success: boolean; message: string; withdrawalId?: string }> {
-  const { reference, koraReference, event, status, fee, reason } = params;
+  const { reference, koraReference, event, fee, reason } = params;
+  if (!reference && !koraReference) return { success: false, message: "Missing reference" };
 
-  if (!reference && !koraReference) {
-    return { success: false, message: "Missing reference" };
-  }
-
-  // Find withdrawal by C-Transit reference or Kora reference
-  const withdrawal = await dbClient.driverWithdrawal.findFirst({
+  const withdrawal = await prisma.driverWithdrawal.findFirst({
     where: {
       OR: [
         ...(reference ? [{ reference }] : []),
@@ -1015,190 +701,107 @@ async function handleDriverPayoutWebhook(
       ],
     },
   });
-
   if (!withdrawal) {
-    logger.warn(
-      { reference, koraReference },
-      "driver.payout_webhook_not_found"
-    );
+    logger.warn({ reference, koraReference }, "driver.payout_webhook_not_found");
     return { success: false, message: "Withdrawal not found" };
   }
 
-  // Idempotency: repeated webhooks must not change balances/status twice!
-  if (withdrawal.status === "SUCCESS") {
-    logger.info(
-      { reference: withdrawal.reference },
-      "driver.payout_webhook_already_success — idempotent skip"
-    );
-    return {
-      success: true,
-      message: "Withdrawal already marked SUCCESS",
-      withdrawalId: withdrawal.id,
-    };
+  const succeeded = event === "transfer.success";
+  const failed = event === "transfer.failed";
+  const id = withdrawal.id;
+
+  if (withdrawal.status === "SUCCESS" || withdrawal.status === "FAILED") {
+    if ((withdrawal.status === "FAILED" && succeeded) || (withdrawal.status === "SUCCESS" && failed)) {
+      logger.error(
+        { reference: withdrawal.reference, status: withdrawal.status, event },
+        "driver.payout_webhook_conflicts_with_final_state — manual review"
+      );
+    }
+    return { success: true, message: `Withdrawal already marked ${withdrawal.status}`, withdrawalId: id };
   }
 
-  if (withdrawal.status === "FAILED") {
-    logger.info(
-      { reference: withdrawal.reference },
-      "driver.payout_webhook_already_failed — idempotent skip"
-    );
-    return {
-      success: true,
-      message: "Withdrawal already marked FAILED",
-      withdrawalId: withdrawal.id,
-    };
+  if (succeeded) {
+    if (await markWithdrawalSuccess(id, koraReference, fee)) {
+      notify(withdrawal.driver_uid, "Withdrawal Successful", "Your withdrawal has been successfully paid out to your bank account.");
+      logger.info({ reference: withdrawal.reference }, "driver.payout_webhook_success_finalized");
+    }
+    return { success: true, message: "Withdrawal finalized as SUCCESS", withdrawalId: id };
   }
 
-  const isSuccess =
-    event === "transfer.success" ||
-    event === "payout.success" ||
-    event === "disbursement.success" ||
-    status === "success" ||
-    status === "successful";
-
-  const isFailed =
-    event === "transfer.failed" ||
-    event === "payout.failed" ||
-    event === "disbursement.failed" ||
-    status === "failed" ||
-    status === "rejected";
-
-  if (isSuccess) {
-    await dbClient.$transaction(async (tx: DbClient) => {
-      const current = await tx.driverWithdrawal.findUnique({
-        where: { id: withdrawal.id },
-      });
-
-      if (
-        !current ||
-        current.status === "SUCCESS" ||
-        current.status === "FAILED"
-      ) {
-        return;
-      }
-
-      await tx.driverWithdrawal.update({
-        where: { id: withdrawal.id },
-        data: {
-          status: "SUCCESS",
-          kora_reference: koraReference || current.kora_reference,
-          kora_fee: fee !== undefined ? fee : current.kora_fee,
-        },
-      });
+  if (failed) {
+    const refunded = await failWithdrawalAndRefund(id, {
+      reason: reason || "Transfer failed by payout provider",
+      koraReference,
+      fee,
     });
-
-    sendNotification(
-      withdrawal.driver_uid,
-      "Withdrawal Successful",
-      `Your withdrawal has been successfully paid out to your bank account.`
-    ).catch(() => {});
-
-    logger.info(
-      { reference: withdrawal.reference, driverUid: withdrawal.driver_uid },
-      "driver.payout_webhook_success_finalized"
-    );
-
-    return {
-      success: true,
-      message: "Withdrawal finalized as SUCCESS",
-      withdrawalId: withdrawal.id,
-    };
-  }
-
-  if (isFailed) {
-    await dbClient.$transaction(async (tx: DbClient) => {
-      const current = await tx.driverWithdrawal.findUnique({
-        where: { id: withdrawal.id },
-      });
-
-      // Crucial: successful payout CANNOT restore/refund balance!
-      if (
-        !current ||
-        current.status === "SUCCESS" ||
-        current.status === "FAILED"
-      ) {
-        return;
-      }
-
-      // Restore reserved gross balance exactly once
-      await tx.driverWallet.update({
-        where: { driver_uid: current.driver_uid },
-        data: { balance: { increment: current.amount } },
-      });
-
-      await tx.driverWithdrawal.update({
-        where: { id: withdrawal.id },
-        data: {
-          status: "FAILED",
-          failure_reason: reason || "Transfer failed by payout provider",
-          kora_reference: koraReference || current.kora_reference,
-          kora_fee: fee !== undefined ? fee : current.kora_fee,
-        },
-      });
-    });
-
-    sendNotification(
-      withdrawal.driver_uid,
-      "Withdrawal Failed",
-      `Your withdrawal could not be completed. Your wallet balance has been restored.`
-    ).catch(() => {});
-
-    logger.info(
-      {
-        reference: withdrawal.reference,
-        driverUid: withdrawal.driver_uid,
-        amount: withdrawal.amount,
-      },
-      "driver.payout_webhook_failed_balance_restored"
-    );
-
-    return {
-      success: true,
-      message: "Withdrawal marked FAILED and balance restored",
-      withdrawalId: withdrawal.id,
-    };
+    if (refunded) {
+      notify(withdrawal.driver_uid, "Withdrawal Failed", "Your withdrawal could not be completed. Your wallet balance has been restored.");
+      logger.info({ reference: withdrawal.reference, amount: withdrawal.amount.toString() }, "driver.payout_webhook_failed_balance_restored");
+    }
+    return { success: true, message: "Withdrawal marked FAILED and balance restored", withdrawalId: id };
   }
 
   return { success: true, message: "Unhandled webhook event" };
 }
 
-async function getDriverWithdrawals(
-  userId: string,
-  page: number = 1,
-  limit: number = 20
-) {
-  const driver = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { matricNumber: true, role: true },
+// Resolves PENDING/PROCESSING withdrawals older than N minutes by asking the provider.
+// Same atomic claims as the webhook, so it is safe to run twice or alongside one.
+async function reconcileStuckWithdrawals(olderThanMinutes = 15) {
+  const verifyPayout = paymentContainer.verifyPayout?.bind(paymentContainer);
+  if (!verifyPayout) return { checked: 0, success: 0, failed: 0, unresolved: 0 };
+
+  const stuck = await prisma.driverWithdrawal.findMany({
+    where: {
+      status: { in: ["PENDING", "PROCESSING"] },
+      updated_at: { lt: new Date(Date.now() - olderThanMinutes * 60_000) },
+    },
+    select: { id: true, reference: true, status: true },
+    take: 50,
   });
 
-  if (!driver || driver.role !== "DRIVER") {
-    throw new Error("DRIVER_NOT_FOUND");
+  const summary = { checked: stuck.length, success: 0, failed: 0, unresolved: 0 };
+
+  for (const w of stuck) {
+    const q = await verifyPayout(w.reference);
+
+    if (q.status === "success") {
+      if (await markWithdrawalSuccess(w.id, q.koraReference, q.fee)) summary.success++;
+    } else if (q.status === "failed" || (q.status === "not_found" && w.status === "PENDING")) {
+      // not_found on a PENDING row means the request never reached the provider.
+      const reason = q.status === "failed" ? q.message || "Payout failed (reconciled)" : "Payout never reached provider";
+      if (await failWithdrawalAndRefund(w.id, { reason, koraReference: q.koraReference, fee: q.fee })) summary.failed++;
+    } else {
+      summary.unresolved++;
+      logger.warn({ reference: w.reference, status: q.status }, "driver.reconcile_unresolved");
+    }
   }
+
+  logger.info(summary, "driver.reconcile_complete");
+  return summary;
+}
+
+async function getDriverWithdrawals(userId: string, page = 1, limit = 20) {
+  const driver = await requireDriver(userId);
 
   const pageNum = Math.max(1, page);
   const limitNum = Math.min(100, Math.max(1, limit));
-  const skip = (pageNum - 1) * limitNum;
+  const where = { driver_uid: driver.matricNumber };
 
   const [records, total] = await Promise.all([
     prisma.driverWithdrawal.findMany({
-      where: { driver_uid: driver.matricNumber },
+      where,
       orderBy: { created_at: "desc" },
-      skip,
+      skip: (pageNum - 1) * limitNum,
       take: limitNum,
     }),
-    prisma.driverWithdrawal.count({
-      where: { driver_uid: driver.matricNumber },
-    }),
+    prisma.driverWithdrawal.count({ where }),
   ]);
 
   const withdrawals = records.map((w) => ({
     id: w.id,
-    amount: parseFloat(w.amount.toString()),
-    fee: w.fee ? parseFloat(w.fee.toString()) : 0,
-    netAmount: w.net_amount
-      ? parseFloat(w.net_amount.toString())
-      : parseFloat(w.amount.toString()),
+    amount: num(w.amount),
+    fee: num(w.fee),
+    netAmount: num(w.net_amount ?? w.amount),
     status: w.status,
     createdAt: w.created_at,
     reference: w.reference,
@@ -1208,14 +811,13 @@ async function getDriverWithdrawals(
 
   return {
     withdrawals,
-    pagination: {
-      page: pageNum,
-      limit: limitNum,
-      total,
-      totalPages: Math.ceil(total / limitNum),
-    },
+    pagination: { page: pageNum, limit: limitNum, total, totalPages: Math.ceil(total / limitNum) },
   };
 }
+
+// ─────────────────────────────────────────────
+// Card and terminal PIN
+// ─────────────────────────────────────────────
 
 export interface LinkDriverCardParams {
   otp: string;
@@ -1231,100 +833,47 @@ async function linkDriverCard(userId: string, params: LinkDriverCardParams) {
     where: { id: userId },
     select: { id: true, matricNumber: true, role: true, password: true },
   });
+  if (!driver || driver.role !== "DRIVER") throw new Error("DRIVER_NOT_FOUND");
 
-  if (!driver || driver.role !== "DRIVER") {
-    throw new Error("DRIVER_NOT_FOUND");
-  }
-
-  // The driver's login PIN and terminal PIN are the same secret by design —
-  // re-confirm it here rather than accepting a new one. This is also what
-  // gives us the plaintext PIN we need for the ADD:DR downlink below; it's
-  // never stored anywhere, only hashed into DriverCardCredential.pin_hash.
-  if (!pin || typeof pin !== "string" || !/^\d{4}$/.test(pin.trim())) {
-    throw new Error("INVALID_PIN_FORMAT");
-  }
+  // The login PIN and terminal PIN are one secret: re-confirm it, and keep the plaintext
+  // only long enough for the ADD:DR downlink (stored solely as a hash).
+  if (typeof pin !== "string" || !/^\d{4}$/.test(pin.trim())) throw new Error("INVALID_PIN_FORMAT");
   const cleanPin = pin.trim();
-  const pinMatches = await bcrypt.compare(cleanPin, driver.password);
-  if (!pinMatches) {
-    throw new Error("INVALID_PIN");
+  if (!(await checkPin(`link:${driver.id}`, cleanPin, driver.password))) throw new Error("INVALID_PIN");
+
+  // The driver is identified only by the token. A mismatched client-supplied id is rejected.
+  if (driverId && driverId !== driver.id && driverId.toUpperCase() !== driver.matricNumber) {
+    throw new Error("UNAUTHORIZED_DRIVER_ID");
   }
 
-  // Security: authenticated user is identified exclusively from token userId.
-  // If client supplies driverId, reject if mismatched.
-  if (driverId) {
-    if (
-      driverId !== driver.id &&
-      driverId.toUpperCase() !== driver.matricNumber
-    ) {
-      throw new Error("UNAUTHORIZED_DRIVER_ID");
-    }
-  }
-
-  if (!otp || typeof otp !== "string" || !/^\d{6}$/.test(otp.trim())) {
-    throw new Error("INVALID_OTP_FORMAT");
-  }
-
+  if (typeof otp !== "string" || !/^\d{6}$/.test(otp.trim())) throw new Error("INVALID_OTP_FORMAT");
   const cleanOtp = otp.trim();
-  const otpRecord = await prisma.registrationOtp.findUnique({
-    where: { otp: cleanOtp },
-  });
 
-  if (!otpRecord) {
-    throw new Error("INVALID_OTP");
-  }
+  const otpRecord = await prisma.registrationOtp.findUnique({ where: { otp: cleanOtp } });
+  if (!otpRecord) throw new Error("INVALID_OTP");
 
-  // Security: Card UID is strictly resolved from the terminal-generated OTP record.
-  // If client provided cardUid, reject if mismatched.
-  if (
-    cardUid &&
-    otpRecord.card_uid.toUpperCase() !== cardUid.trim().toUpperCase()
-  ) {
+  // The card UID comes only from the terminal-generated OTP record.
+  if (cardUid && otpRecord.card_uid.toUpperCase() !== cardUid.trim().toUpperCase()) {
     throw new Error("CARD_MISMATCH");
   }
+  if (otpRecord.expires_at < new Date()) throw new Error("OTP_EXPIRED");
+  if (!otpRecord.terminal_id) throw new Error("MISSING_TERMINAL_CONTEXT");
 
-  if (otpRecord.expires_at < new Date()) {
-    throw new Error("OTP_EXPIRED");
-  }
+  const [cardOwner, driverCard] = await Promise.all([
+    prisma.cardMapping.findUnique({ where: { card_uid: otpRecord.card_uid } }),
+    prisma.cardMapping.findUnique({ where: { student_uid: driver.matricNumber } }),
+  ]);
 
-  if (!otpRecord.terminal_id) {
-    throw new Error("MISSING_TERMINAL_CONTEXT");
-  }
-
-  // 1. Invariant check: ensure card is not already linked to another user
-  const existingCardMapping = await prisma.cardMapping.findUnique({
-    where: { card_uid: otpRecord.card_uid },
-  });
-
-  if (existingCardMapping) {
-    if (existingCardMapping.student_uid === driver.matricNumber) {
-      return {
-        success: true,
-        message: "Card already linked",
-        cardUid: existingCardMapping.card_uid,
-        alreadyLinked: true,
-      };
+  if (cardOwner) {
+    if (cardOwner.student_uid === driver.matricNumber) {
+      return { success: true, message: "Card already linked", cardUid: cardOwner.card_uid, alreadyLinked: true };
     }
     throw new Error("CARD_ALREADY_LINKED");
   }
+  if (driverCard && driverCard.card_uid !== otpRecord.card_uid) throw new Error("DRIVER_ALREADY_HAS_CARD");
+  if (otpRecord.used) throw new Error("OTP_ALREADY_USED");
 
-  // 2. Invariant check: ensure driver does not already have another active card linked
-  const existingDriverMapping = await prisma.cardMapping.findUnique({
-    where: { student_uid: driver.matricNumber },
-  });
-
-  if (
-    existingDriverMapping &&
-    existingDriverMapping.card_uid !== otpRecord.card_uid
-  ) {
-    throw new Error("DRIVER_ALREADY_HAS_CARD");
-  }
-
-  if (otpRecord.used) {
-    throw new Error("OTP_ALREADY_USED");
-  }
-
-  // 3. Atomically consume OTP, create CardMapping, and store the terminal
-  // credential (card UID + this same PIN, hashed) in one go.
+  // Consume the OTP, map the card and store the terminal credential in one transaction.
   const pinHash = await bcrypt.hash(cleanPin, 10);
   try {
     await prisma.$transaction(async (tx) => {
@@ -1334,61 +883,38 @@ async function linkDriverCard(userId: string, params: LinkDriverCardParams) {
       });
 
       if (consumed.count === 0) {
-        const existing = await tx.cardMapping.findUnique({
-          where: { student_uid: driver.matricNumber },
-        });
-        if (existing && existing.card_uid === otpRecord.card_uid) {
-          return;
-        }
+        const existing = await tx.cardMapping.findUnique({ where: { student_uid: driver.matricNumber } });
+        if (existing?.card_uid === otpRecord.card_uid) return;
         throw new Error("OTP_ALREADY_USED");
       }
 
       await tx.cardMapping.create({
-        data: {
-          card_uid: otpRecord.card_uid,
-          student_uid: driver.matricNumber,
-        },
+        data: { card_uid: otpRecord.card_uid, student_uid: driver.matricNumber },
       });
-
       await tx.driverCardCredential.upsert({
         where: { driver_uid: driver.matricNumber },
         update: { card_uid: otpRecord.card_uid, pin_hash: pinHash },
-        create: {
-          driver_uid: driver.matricNumber,
-          card_uid: otpRecord.card_uid,
-          pin_hash: pinHash,
-        },
+        create: { driver_uid: driver.matricNumber, card_uid: otpRecord.card_uid, pin_hash: pinHash },
       });
     });
   } catch (error) {
-    const prismaError = error as {
-      code?: string;
-      meta?: { target?: string[] | string };
-    };
-    const target = Array.isArray(prismaError.meta?.target)
-      ? prismaError.meta.target.join(",")
-      : prismaError.meta?.target || "";
+    const e = error as { code?: string; meta?: { target?: string[] | string } };
+    const target = Array.isArray(e.meta?.target) ? e.meta.target.join(",") : e.meta?.target || "";
 
-    if (prismaError.code === "P2002") {
-      if (target.includes("card_uid"))
-        throw new Error("CARD_ALREADY_LINKED", { cause: error });
-      if (target.includes("student_uid"))
-        throw new Error("DRIVER_ALREADY_HAS_CARD", { cause: error });
+    if (e.code === "P2002") {
+      if (target.includes("card_uid")) throw new Error("CARD_ALREADY_LINKED", { cause: error });
+      if (target.includes("student_uid")) throw new Error("DRIVER_ALREADY_HAS_CARD", { cause: error });
     }
-
     throw error;
   }
 
-  // 4. In-app notification to driver
-  sendNotification(
+  notify(
     driver.matricNumber,
     "Driver Card Linked Successfully 💳",
     "Your physical driver card has been successfully linked to your C-Transit driver account."
-  ).catch(() => {});
+  );
 
-  // 5. Now that both the card UID and PIN are known, provision the
-  // terminal's DR list: ADD:DR,{uid},{pin}. Best-effort — the DB is already
-  // correct even if this hardware push fails, so we log rather than throw.
+  // Push ADD:DR,{uid},{pin} to the terminal. Best-effort: the DB is already correct.
   try {
     await terminalProvisioningService.provisionCredential({
       cardUid: otpRecord.card_uid,
@@ -1396,26 +922,15 @@ async function linkDriverCard(userId: string, params: LinkDriverCardParams) {
       list: "DR",
       originTerminalId: otpRecord.terminal_id,
     });
-  } catch (provisionErr) {
+  } catch (err) {
     logger.error(
-      {
-        driverUid: driver.matricNumber,
-        cardUid: otpRecord.card_uid,
-        err:
-          provisionErr instanceof Error
-            ? provisionErr.message
-            : String(provisionErr),
-      },
+      { driverUid: driver.matricNumber, err: errText(err) },
       "driver.terminal_provisioning_failed_after_card_link"
     );
   }
 
   logger.info(
-    {
-      cardUid: otpRecord.card_uid,
-      driverUid: driver.matricNumber,
-      terminalId: otpRecord.terminal_id,
-    },
+    { driverUid: driver.matricNumber, terminalId: otpRecord.terminal_id },
     "driver.card_linked_successfully"
   );
 
@@ -1432,192 +947,105 @@ export interface SetDriverPinParams {
 }
 
 async function setDriverCardPin(userId: string, params: SetDriverPinParams) {
-  const { pin } = params;
-
   const driver = await prisma.user.findUnique({
     where: { id: userId },
     select: { id: true, matricNumber: true, role: true },
   });
+  if (!driver || driver.role !== "DRIVER") throw new Error("DRIVER_NOT_FOUND");
 
-  if (!driver || driver.role !== "DRIVER") {
-    throw new Error("DRIVER_NOT_FOUND");
-  }
+  const cardMap = await prisma.cardMapping.findUnique({ where: { student_uid: driver.matricNumber } });
+  if (!cardMap) throw new Error("CARD_NOT_LINKED");
 
-  // 1. Verify driver has an active linked card
-  const cardMap = await prisma.cardMapping.findUnique({
-    where: { student_uid: driver.matricNumber },
-  });
-
-  if (!cardMap) {
-    throw new Error("CARD_NOT_LINKED");
-  }
-
-  // 2. Validate PIN format (numeric, exactly 4 digits — matches the
-  // firmware's ADD:DR,{uid},{pin} field and the driver's app-login PIN)
-  if (!pin || typeof pin !== "string" || !/^\d{4}$/.test(pin.trim())) {
-    throw new Error("INVALID_PIN_FORMAT");
-  }
-
+  // Exactly 4 digits: matches the firmware's ADD:DR field and the app-login PIN.
+  const pin = params.pin;
+  if (typeof pin !== "string" || !/^\d{4}$/.test(pin.trim())) throw new Error("INVALID_PIN_FORMAT");
   const cleanPin = pin.trim();
 
-  // 3. Hash PIN securely (cost 10) - NEVER plaintext, NEVER logged!
-  // One PIN serves both the terminal tap-in and the driver's app login, so
-  // the same hash is written to both DriverCardCredential.pin_hash and
-  // User.password — keeping this endpoint in sync with app login too.
+  // One PIN serves terminal tap-in and app login, so the same hash goes to both.
   const pinHash = await bcrypt.hash(cleanPin, 10);
-
   await prisma.$transaction([
     prisma.driverCardCredential.upsert({
       where: { driver_uid: driver.matricNumber },
-      update: {
-        card_uid: cardMap.card_uid,
-        pin_hash: pinHash,
-      },
-      create: {
-        driver_uid: driver.matricNumber,
-        card_uid: cardMap.card_uid,
-        pin_hash: pinHash,
-      },
+      update: { card_uid: cardMap.card_uid, pin_hash: pinHash },
+      create: { driver_uid: driver.matricNumber, card_uid: cardMap.card_uid, pin_hash: pinHash },
     }),
-    prisma.user.update({
-      where: { id: driver.id },
-      data: { password: pinHash },
-    }),
+    prisma.user.update({ where: { id: driver.id }, data: { password: pinHash } }),
   ]);
 
-  // 5. Provision the terminal's DR list — card UID + PIN together, per the
-  // firmware contract (ADD:DR,{uid},{pin}).
+  // A changed PIN must not leave old sessions refreshable.
+  await revokeAllRefreshTokens(driver.id);
+
   await terminalProvisioningService.provisionCredential({
     cardUid: cardMap.card_uid,
     pin: cleanPin,
     list: "DR",
   });
 
-  // 6. In-app notification
-  sendNotification(
-    driver.matricNumber,
-    "Terminal PIN Updated 🔒",
-    "Your physical terminal login PIN has been successfully set."
-  ).catch(() => {});
+  notify(driver.matricNumber, "Terminal PIN Updated 🔒", "Your physical terminal login PIN has been successfully set.");
+  logger.info({ driverUid: driver.matricNumber }, "driver.terminal_pin_set_successfully");
 
-  logger.info(
-    { driverUid: driver.matricNumber, cardUid: cardMap.card_uid },
-    "driver.terminal_pin_set_successfully"
-  );
-
-  return {
-    success: true,
-    message: "Terminal PIN set successfully",
-    cardUid: cardMap.card_uid,
-  };
+  return { success: true, message: "Terminal PIN set successfully", cardUid: cardMap.card_uid };
 }
 
 async function getDriverPinStatus(userId: string) {
-  const driver = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { id: true, matricNumber: true, role: true },
-  });
+  const driver = await requireDriver(userId);
 
-  if (!driver || driver.role !== "DRIVER") {
-    throw new Error("DRIVER_NOT_FOUND");
-  }
-
-  const cardMap = await prisma.cardMapping.findUnique({
-    where: { student_uid: driver.matricNumber },
-  });
-
-  let hasPin = false;
-  if (prisma.driverCardCredential) {
-    const cred = await prisma.driverCardCredential.findUnique({
-      where: { driver_uid: driver.matricNumber },
-    });
-    hasPin = !!cred;
-  }
+  const [cardMap, credential] = await Promise.all([
+    prisma.cardMapping.findUnique({ where: { student_uid: driver.matricNumber } }),
+    prisma.driverCardCredential.findUnique({ where: { driver_uid: driver.matricNumber } }),
+  ]);
 
   return {
     success: true,
     isCardLinked: !!cardMap,
     cardUid: cardMap?.card_uid || null,
-    hasPin,
+    hasPin: !!credential,
   };
 }
 
-export interface VerifyDriverBankParams {
-  bankCode: string;
-  accountNumber: string;
-}
-
-async function verifyAndSaveDriverBank(
-  userId: string,
-  params: VerifyDriverBankParams,
-  payoutGateway: IPaymentGateway = paymentContainer
-) {
-  const { bankCode, accountNumber } = params;
-
-  if (!bankCode || typeof bankCode !== "string" || !bankCode.trim()) {
-    throw new Error("MISSING_BANK_CODE");
-  }
-
-  const cleanAccountNumber = accountNumber ? accountNumber.trim() : "";
-  if (!cleanAccountNumber || !/^\d{10}$/.test(cleanAccountNumber)) {
-    throw new Error("INVALID_ACCOUNT_NUMBER");
-  }
-
+async function unlinkDriverCard(userId: string, pin: string) {
   const driver = await prisma.user.findUnique({
     where: { id: userId },
-    select: { id: true, matricNumber: true, role: true },
+    select: { id: true, matricNumber: true, role: true, password: true },
   });
+  if (!driver || driver.role !== "DRIVER") throw new Error("DRIVER_NOT_FOUND");
 
-  if (!driver || driver.role !== "DRIVER") {
-    throw new Error("DRIVER_NOT_FOUND");
+  if (typeof pin !== "string" || !/^\d{4}$/.test(pin.trim())) throw new Error("INVALID_PIN_FORMAT");
+  if (!(await checkPin(`unlink:${driver.id}`, pin.trim(), driver.password))) throw new Error("INVALID_PIN");
+
+  const mapping = await prisma.cardMapping.findUnique({ where: { student_uid: driver.matricNumber } });
+  if (!mapping) throw new Error("CARD_NOT_LINKED");
+  const cardUid = mapping.card_uid;
+
+  await prisma.$transaction([
+    prisma.cardMapping.deleteMany({ where: { card_uid: cardUid } }),
+    prisma.driverCardCredential.deleteMany({ where: { driver_uid: driver.matricNumber } }),
+    // A driver without a card must not stay logged into a terminal.
+    prisma.terminal.updateMany({ where: { active_driver_uid: driver.matricNumber }, data: { active_driver_uid: null } }),
+  ]);
+
+  getRedisClient().del(cacheKeys.cardMap(cardUid)).catch(() => {});
+
+  let terminalSyncSuccess = true;
+  for (const list of ["DR", "WL"] as const) {
+    try {
+      const r = await terminalProvisioningService.deprovisionCard(cardUid, list);
+      terminalSyncSuccess = terminalSyncSuccess && r.success;
+    } catch (err) {
+      terminalSyncSuccess = false;
+      logger.error({ driverUid: driver.matricNumber, list, err: errText(err) }, "driver.card_unlink_terminal_sync_failed");
+    }
   }
 
-  if (!payoutGateway.resolveBankAccount) {
-    throw new Error("BANK_VERIFICATION_NOT_SUPPORTED");
-  }
+  notify(driver.matricNumber, "Card Unlinked", "Your driver card has been unlinked from your account.");
+  logger.warn({ driverUid: driver.matricNumber, terminalSyncSuccess }, "driver.card_unlinked");
 
-  // 1. Call Kora bank account resolution
-  const resolved = await payoutGateway.resolveBankAccount(
-    bankCode.trim(),
-    cleanAccountNumber
-  );
-
-  // 2. Persist verified bank details to User model
-  const updatedDriver = await prisma.user.update({
-    where: { id: userId },
-    data: {
-      bankCode: resolved.bankCode,
-      bankName: resolved.bankName || "Verified Bank",
-      accountNumber: resolved.accountNumber,
-      accountName: resolved.accountName,
-      bankVerified: true,
-    },
-    select: {
-      bankCode: true,
-      bankName: true,
-      accountNumber: true,
-      accountName: true,
-      bankVerified: true,
-    },
-  });
-
-  logger.info(
-    {
-      driverId: userId,
-      bankCode: resolved.bankCode,
-      accountNumber: maskAccountNumber(resolved.accountNumber),
-    },
-    "driver.bank_account_verified_and_saved"
-  );
-
-  return {
-    success: true,
-    message: "Bank account verified successfully",
-    data: updatedDriver,
-  };
+  return { success: true, message: "Card unlinked successfully", terminalSyncSuccess };
 }
 
 export {
+  handleDriverLogin,
+  handleDriverLogout,
   listDrivers,
   registerDriverByAgent,
   getDriverWallet,
@@ -1625,12 +1053,15 @@ export {
   getDriverProfile,
   getDriverDashboard,
   getDriverRides,
+  getBanks,
+  verifyAndSaveDriverBank,
   createDriverWithdrawal,
   processWithdrawalPayout,
   handleDriverPayoutWebhook,
+  reconcileStuckWithdrawals,
   getDriverWithdrawals,
   linkDriverCard,
   setDriverCardPin,
   getDriverPinStatus,
-  verifyAndSaveDriverBank,
+  unlinkDriverCard,
 };
