@@ -2,6 +2,8 @@ import { Router } from "express";
 import {
   initializeCheckout,
   getCheckoutStatus,
+  getTopupHistory,
+  requeryTopup,
 } from "../controller/payment.controller.js";
 import {
   handlePaymentWebhook,
@@ -11,6 +13,10 @@ import {
   authenticateToken,
   requireStudent,
 } from "../middleware/auth.middleware.js";
+import {
+  walletLimiter,
+  requeryLimiter,
+} from "../middleware/rate-limit.middleware.js";
 
 const router = Router();
 
@@ -28,6 +34,20 @@ router.get(
   authenticateToken,
   requireStudent,
   getCheckoutStatus
+);
+router.get(
+  "/history",
+  authenticateToken,
+  requireStudent,
+  walletLimiter,
+  getTopupHistory
+);
+router.post(
+  "/requery/:reference",
+  authenticateToken,
+  requireStudent,
+  requeryLimiter,
+  requeryTopup
 );
 
 export default router;

@@ -1,23 +1,10 @@
 import type { Request, Response } from "express";
 import { paymentContainer } from "../payments/payment.container.js";
-import {
-  creditPaymentAttempt,
-  hasCrossedAboveThreshold,
-} from "../services/ledger.service.js";
-import { enqueueBroadcast } from "../utils/bridge.js";
-import { buildDeltaCommand } from "../utils/parser.js";
-import { sendNotification } from "../services/notification.service.js";
+import { creditPaymentAttempt } from "../services/ledger.service.js";
+import { runPostCreditEffects } from "../services/topup.service.js";
 import { handleDriverPayoutWebhook } from "../services/driver.service.js";
 import prisma from "../lib/prisma.js";
 import logger from "../config/logger.js";
-
-const errMsg = (err: unknown) =>
-  err instanceof Error ? err.message : String(err);
-
-const notify = (matric: string, title: string, body: string) =>
-  sendNotification(matric, title, body).catch((err: unknown) =>
-    logger.warn({ err: errMsg(err) }, "webhook.notification_failed — non-fatal")
-  );
 
 // Kora signs only the `data` object (HMAC-SHA256).
 function isValidSignature(req: Request): boolean {
@@ -150,41 +137,13 @@ export const handlePaymentWebhook = async (req: Request, res: Response) => {
         .json({ success: false, message: "Wallet not found." });
   }
 
-  const { matric, previousBalance, newBalance } = outcome;
-  log.info({ matric, previousBalance, newBalance }, "webhook.wallet_credited");
-
-  notify(
-    matric,
-    "Wallet Top-Up Successful",
-    `Your CTransit wallet has been credited with ₦${amount.toFixed(
-      2
-    )}. New balance: ₦${newBalance.toFixed(2)}.`
+  // Post-commit and best-effort: the money is already safe, so nothing here may fail the webhook.
+  await runPostCreditEffects(
+    outcome.matric,
+    amount,
+    outcome.previousBalance,
+    outcome.newBalance
   );
-
-  if (hasCrossedAboveThreshold(previousBalance, newBalance)) {
-    // Post-commit and best-effort. The money is already safe, so nothing below may fail the webhook.
-    try {
-      await prisma.blacklist.deleteMany({ where: { student_uid: matric } });
-      const card = await prisma.cardMapping.findUnique({
-        where: { student_uid: matric },
-        select: { card_uid: true },
-      });
-      if (card)
-        await enqueueBroadcast(buildDeltaCommand("REM", "BL", card.card_uid));
-      notify(
-        matric,
-        "Ride Access Restored",
-        `Your balance is now ₦${newBalance.toFixed(
-          2
-        )}. You can tap your card to ride again.`
-      );
-    } catch (err) {
-      log.error(
-        { err: errMsg(err), matric },
-        "webhook.blacklist_removal_failed — wallet already credited"
-      );
-    }
-  }
 
   return res
     .status(200)

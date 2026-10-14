@@ -25,15 +25,12 @@ import {
   markAllDriverNotificationsReadHandler,
   unlinkDriverCardHandler,
 } from "../controller/driver.controller.js";
-import { handlePaymentWebhook } from "../controller/webhook.controller.js";
 
 const router = Router();
 
 // Public Routes
 // 1. POST /api/drivers/login
 router.post("/login", loginLimiter, loginDriverHandler);
-router.post("/payout-webhook", handlePaymentWebhook);
-router.post("/webhook", handlePaymentWebhook);
 
 // Protected Driver Routes 
 router.use(authenticateToken);

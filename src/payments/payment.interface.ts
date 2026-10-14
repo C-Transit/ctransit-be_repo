@@ -63,6 +63,17 @@ export interface CheckoutInitializationResponse {
   checkoutUrl: string;
 }
 
+// Result of asking Kora about a checkout charge. "unknown" means we could not
+// get a trustworthy answer (timeout, HTTP error, malformed body); callers must
+// never treat it as a failure.
+export interface ChargeStatusQuery {
+  status: "success" | "failed" | "processing" | "pending" | "not_found" | "unknown";
+  reference: string;
+  amount?: number;
+  currency?: string;
+  message?: string;
+}
+
 export interface BankInfo {
   name: string;
   code: string;
@@ -87,6 +98,9 @@ export interface IPaymentGateway {
   initializeCheckout?(
     params: CheckoutInitializationParams
   ): Promise<CheckoutInitializationResponse>;
+
+  // Queries the current status of a checkout charge by merchant reference.
+  verifyCharge?(reference: string): Promise<ChargeStatusQuery>;
 
   // Lists supported banks with the provider's own bank codes.
   listBanks?(): Promise<BankInfo[]>;

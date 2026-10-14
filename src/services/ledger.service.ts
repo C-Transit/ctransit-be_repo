@@ -44,7 +44,7 @@ async function creditPaymentAttempt(
     if (!attempt) return { status: "NOT_FOUND" };
     if (!attempt.amount.equals(paidAmount))
       return { status: "AMOUNT_MISMATCH" };
-    if (currency && currency.toUpperCase() !== attempt.currency.toUpperCase()) {
+   if (!currency || currency.toUpperCase() !== attempt.currency.toUpperCase()) {
       return { status: "CURRENCY_MISMATCH" };
     }
 

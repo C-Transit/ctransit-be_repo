@@ -32,6 +32,7 @@ export const transactionLimiter = from(rl.transactions, "Too many transaction re
 export const walletLimiter = from(rl.wallets, "Too many wallet requests. Please try again in 15 minutes.");
 export const disputeLimiter = from(rl.disputes, "Too many dispute submissions. Please try again in an hour.");
 export const notificationLimiter = from(rl.notifications, "Too many notification requests. Please try again in 15 minutes.");
+export const requeryLimiter = buildLimiter(MIN_15, 20, "Too many payment checks. Please try again in 15 minutes."); // NEW
 
 // Driver PIN, card link and bank verification (the per-driver PIN lockout is the real guard)
 export const driverPinLimiter = buildLimiter(MIN_15, 10, "Too many PIN configuration attempts. Please try again in 15 minutes.");

@@ -7,6 +7,7 @@ import {
   BankAccountResolution,
   CheckoutInitializationParams,
   CheckoutInitializationResponse,
+  ChargeStatusQuery,
   BankInfo,
 } from "./payment.interface.js";
 import logger from "../config/logger.js";
@@ -86,6 +87,88 @@ export class KoraProvider implements IPaymentGateway {
       reference: body.data.reference || params.reference,
       checkoutUrl,
     };
+  }
+
+  /**
+   * Asks Kora for the current state of a checkout charge (GET /charges/:reference).
+   * Never throws: any timeout, HTTP error or malformed body returns "unknown",
+   * which callers must treat as "could not check", never as a failed payment.
+   */
+  async verifyCharge(reference: string): Promise<ChargeStatusQuery> {
+    const endpoint = `${this.baseUrl}/api/v1/charges/${encodeURIComponent(
+      reference
+    )}`;
+
+    try {
+      const response = await fetch(endpoint, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${this.secretKey}` },
+        signal: AbortSignal.timeout(8000),
+      });
+
+      if (response.status === 404) {
+        return {
+          status: "not_found",
+          reference,
+          message: "Charge not found on Kora",
+        };
+      }
+
+      if (!response.ok) {
+        return {
+          status: "unknown",
+          reference,
+          message: `Kora charge check returned HTTP ${response.status}`,
+        };
+      }
+
+      const body = await response.json().catch(() => null);
+      if (!body || body.status === false || !body.data) {
+        return {
+          status: "unknown",
+          reference,
+          message: body?.message || "Invalid response from Kora charge check",
+        };
+      }
+
+      const data = body.data;
+      const rawStatus = String(data.status ?? "").toLowerCase();
+      let status: ChargeStatusQuery["status"] = "unknown";
+      if (rawStatus === "success" || rawStatus === "successful") {
+        status = "success";
+      } else if (rawStatus === "failed") {
+        status = "failed";
+      } else if (rawStatus === "processing") {
+        status = "processing";
+      } else if (rawStatus === "pending") {
+        status = "pending";
+      }
+
+      const parsedAmount =
+        data.amount !== undefined ? Number(data.amount) : undefined;
+
+      return {
+        status,
+        reference,
+        amount:
+          parsedAmount !== undefined && Number.isFinite(parsedAmount)
+            ? parsedAmount
+            : undefined,
+        currency: typeof data.currency === "string" ? data.currency : undefined,
+        message: body.message,
+      };
+    } catch (err) {
+      logger.warn(
+        { reference, err: err instanceof Error ? err.message : String(err) },
+        "kora.verify_charge_failed"
+      );
+      return {
+        status: "unknown",
+        reference,
+        message:
+          err instanceof Error ? err.message : "Charge verification failed",
+      };
+    }
   }
 
   async resolveBankAccount(

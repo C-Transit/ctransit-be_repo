@@ -70,9 +70,12 @@ export async function initializeCheckoutForStudent(
     }
 
     // Timeout, network error or 5xx: Kora may have created the checkout. Leave PENDING
-    // so a signed charge.success can still complete this attempt.
+    // so a signed charge.success can still complete this attempt. The reference travels
+    // with the error so the client can poll the status endpoint instead of retrying.
     logger.warn({ reference, err: message }, "payment.checkout_outcome_ambiguous — attempt left PENDING");
-    throw new Error("CHECKOUT_OUTCOME_UNKNOWN", { cause: error });
+    const unknown = new Error("CHECKOUT_OUTCOME_UNKNOWN", { cause: error }) as Error & { reference?: string };
+    unknown.reference = reference;
+    throw unknown;
   }
 }
 
