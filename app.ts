@@ -57,10 +57,10 @@ app.use(
           "http://localhost:3001",
           "http://localhost:3002",
           "http://localhost:3003",
+          "https://ctransit-driver.vercel.app",
         ]
         : [
           "https://c-transit-pink.vercel.app",
-          "https://ctransit-driver.vercel.app",
         ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
