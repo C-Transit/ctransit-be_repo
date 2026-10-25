@@ -8,6 +8,7 @@ import {
   driverCardLinkLimiter,
   driverPinLimiter,
   bankVerifyLimiter,
+  bankResolveLimiter,
 } from "../middleware/rate-limit.middleware.js";
 import {
   loginDriverHandler,
@@ -20,6 +21,8 @@ import {
   setDriverCardPinHandler,
   getDriverPinStatusHandler,
   verifyDriverBankHandler,
+  resolveDriverBankHandler,
+  getBanksHandler,
   getDriverNotificationsHandler,
   markDriverNotificationReadHandler,
   markAllDriverNotificationsReadHandler,
@@ -63,7 +66,13 @@ router.post("/card/unlink", driverPinLimiter, unlinkDriverCardHandler);
 // 9. GET /api/drivers/card/pin/status
 router.get("/card/pin/status", getDriverPinStatusHandler);
 
-// 10. POST /api/drivers/bank/verify
+// 10. GET /api/drivers/banks (bank dropdown: name + provider code)
+router.get("/banks", getBanksHandler);
+
+// 10a. POST /api/drivers/bank/resolve (read-only name lookup, nothing saved)
+router.post("/bank/resolve", bankResolveLimiter, resolveDriverBankHandler);
+
+// 10b. POST /api/drivers/bank/verify (PIN required, saves the destination)
 router.post("/bank/verify", bankVerifyLimiter, verifyDriverBankHandler);
 
 // 11. GET /api/drivers/notifications

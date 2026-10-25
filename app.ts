@@ -14,7 +14,10 @@ import agentRoutes from "./src/routes/agent.routes.js";
 import disputeRoutes from "./src/routes/dispute.routes.js";
 import notificationRoutes from "./src/routes/notification.routes.js";
 import driverRoutes from "./src/routes/driver.routes.js";
+import internalRoutes from "./src/routes/internal.routes.js";
 import walletsRouter from "./src/routes/wallet.routes.js";
+import swaggerUi from "swagger-ui-express";
+import { openApiDocument } from "./src/docs/openapi.js";
 import paymentRoutes from "./src/routes/payment.routes.js";
 import { authenticateToken } from "./src/middleware/auth.middleware.js";
 import {
@@ -152,7 +155,14 @@ app.use("/api/transactions", transactionLimiter, authenticateToken, transactionR
 app.use("/api/agents", agentRoutes);
 app.use("/api/disputes", disputeLimiter, disputeRoutes);
 app.use("/api/notifications", notificationLimiter, notificationRoutes);
+app.use("/api/internal", internalRoutes);
 app.use("/api/drivers", driverRoutes);
+
+// Swagger / OpenAPI documentation
+app.get("/openapi.json", (_req, res) => res.json(openApiDocument));
+app.get("/api/docs.json", (_req, res) => res.json(openApiDocument));
+app.use("/docs", swaggerUi.serve, swaggerUi.setup(openApiDocument, { explorer: true }));
+app.use("/api/docs", swaggerUi.serve, swaggerUi.setup(openApiDocument, { explorer: true }));
 
 app.use((_req, res) => {
   res.status(404).json({ error: "Not found" });

@@ -422,6 +422,41 @@ export interface VerifyDriverBankParams {
   pin: string;
 }
 
+export interface ResolveDriverBankParams {
+  bankCode: string;
+  accountNumber: string;
+}
+
+export interface ResolvedDriverBank {
+  accountName: string;
+  accountNumber: string;
+  bankCode: string;
+  bankName: string;
+}
+
+// Read-only lookup shared by the preview endpoint (no PIN, nothing saved) and by
+// verifyAndSaveDriverBank (PIN required, persists the payout destination).
+async function resolveDriverBankAccount(
+  params: ResolveDriverBankParams
+): Promise<ResolvedDriverBank> {
+  const accountNumber = params.accountNumber?.trim() ?? "";
+  if (!/^\d{10}$/.test(accountNumber)) throw new Error("INVALID_ACCOUNT_NUMBER");
+
+  const bank = (await getBanks()).find((b) => b.code === params.bankCode?.trim());
+  if (!bank) throw new Error("INVALID_BANK_CODE");
+
+  const resolveBankAccount = paymentContainer.resolveBankAccount?.bind(paymentContainer);
+  if (!resolveBankAccount) throw new Error("BANK_VERIFICATION_NOT_SUPPORTED");
+  const resolved = await resolveBankAccount(bank.code, accountNumber);
+
+  return {
+    accountName: resolved.accountName,
+    accountNumber: resolved.accountNumber || accountNumber,
+    bankCode: bank.code,
+    bankName: resolved.bankName || bank.name,
+  };
+}
+
 // The driver picks a bank from the dropdown and types only the account number.
 // Bank name/code come from the provider list, the account name from provider resolution,
 // and changing the payout destination requires the driver's own PIN.
@@ -439,19 +474,17 @@ async function verifyAndSaveDriverBank(userId: string, params: VerifyDriverBankP
     throw new Error("INVALID_PIN");
   }
 
-  const bank = (await getBanks()).find((b) => b.code === params.bankCode?.trim());
-  if (!bank) throw new Error("INVALID_BANK_CODE");
-
-  const resolveBankAccount = paymentContainer.resolveBankAccount?.bind(paymentContainer);
-  if (!resolveBankAccount) throw new Error("BANK_VERIFICATION_NOT_SUPPORTED");
-  const resolved = await resolveBankAccount(bank.code, accountNumber);
+  const resolved = await resolveDriverBankAccount({
+    bankCode: params.bankCode,
+    accountNumber,
+  });
 
   const data = await prisma.user.update({
     where: { id: driver.id },
     data: {
-      bankCode: bank.code,
-      bankName: bank.name,
-      accountNumber,
+      bankCode: resolved.bankCode,
+      bankName: resolved.bankName,
+      accountNumber: resolved.accountNumber,
       accountName: resolved.accountName,
       bankVerified: true,
     },
@@ -459,7 +492,7 @@ async function verifyAndSaveDriverBank(userId: string, params: VerifyDriverBankP
   });
 
   logger.warn(
-    { driverId: driver.id, bankCode: bank.code, accountNumber: maskAccountNumber(accountNumber) },
+    { driverId: driver.id, bankCode: resolved.bankCode, accountNumber: maskAccountNumber(accountNumber) },
     "driver.bank_account_changed"
   );
   return { success: true, message: "Bank account verified successfully", data };
@@ -472,6 +505,7 @@ async function verifyAndSaveDriverBank(userId: string, params: VerifyDriverBankP
 export interface CreateWithdrawalParams {
   amount: number;
   remarks?: string;
+  pin: string;
 }
 
 const CTRANSIT_PAYOUT_FEE_RATIO = 0.04; // the driver bears a 4% payout fee
@@ -529,8 +563,10 @@ async function createDriverWithdrawal(userId: string, params: CreateWithdrawalPa
   const driver = await prisma.user.findUnique({
     where: { id: userId },
     select: {
+      id: true,
       matricNumber: true,
       role: true,
+      password: true,
       bankCode: true,
       bankName: true,
       accountNumber: true,
@@ -539,6 +575,13 @@ async function createDriverWithdrawal(userId: string, params: CreateWithdrawalPa
     },
   });
   if (!driver || driver.role !== "DRIVER") throw new Error("DRIVER_NOT_FOUND");
+
+  const pin = params.pin?.trim() ?? "";
+  if (!/^\d{4}$/.test(pin)) throw new Error("INVALID_PIN_FORMAT");
+  if (!(await checkPin(`withdraw:${driver.id}`, pin, driver.password))) {
+    throw new Error("INVALID_PIN");
+  }
+
   if (!driver.bankVerified || !driver.bankCode || !driver.accountNumber || !driver.accountName) {
     throw new Error("BANK_NOT_VERIFIED");
   }
@@ -1055,6 +1098,7 @@ export {
   getDriverRides,
   getBanks,
   verifyAndSaveDriverBank,
+  resolveDriverBankAccount,
   createDriverWithdrawal,
   processWithdrawalPayout,
   handleDriverPayoutWebhook,
