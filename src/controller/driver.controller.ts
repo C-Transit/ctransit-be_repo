@@ -12,6 +12,7 @@ import {
   setDriverCardPin,
   getDriverPinStatus,
   verifyAndSaveDriverBank,
+  resolveDriverBankAccount,
   getBanks,
   unlinkDriverCard,
 } from "../services/driver.service.js";
@@ -121,9 +122,44 @@ export const getBanksHandler = async (_req: CustomAuthRequest, res: Response) =>
   }
 };
 
+// POST /api/drivers/bank/resolve { bankCode, accountNumber }
+// Read-only preview: returns the resolved account name without changing the saved destination.
+export const resolveDriverBankHandler = async (req: CustomAuthRequest, res: Response) => {
+  const { bankCode, accountNumber } = req.body ?? {};
+  if (!bankCode || !accountNumber) {
+    return res.status(400).json({
+      success: false,
+      message: "bankCode and accountNumber are required",
+    });
+  }
+
+  try {
+    const data = await resolveDriverBankAccount({
+      bankCode: String(bankCode).trim(),
+      accountNumber: String(accountNumber).trim(),
+    });
+    return res.status(200).json({ success: true, data });
+  } catch (error) {
+    const code = error instanceof Error ? error.message : "";
+    const known: ErrorTable = {
+      INVALID_ACCOUNT_NUMBER: [400, "Account number must be exactly 10 digits"],
+      INVALID_BANK_CODE: [400, "Please select a valid bank"],
+      BANK_VERIFICATION_NOT_SUPPORTED: [501, "Bank account resolution is not supported by payment provider"],
+      BANK_LIST_NOT_SUPPORTED: [501, "Bank list is not supported by the payment provider"],
+    };
+    if (known[code]) return res.status(known[code][0]).json({ success: false, message: known[code][1] });
+
+    logger.warn({ err: code }, "driver.bank_resolve_failed");
+    return res.status(400).json({
+      success: false,
+      message: "Could not resolve this account. Check the bank and account number.",
+    });
+  }
+};
+
 // POST /api/drivers/withdraw
 export const createDriverWithdrawalHandler = async (req: CustomAuthRequest, res: Response) => {
-  const { amount, remarks } = req.body ?? {};
+  const { amount, remarks, pin } = req.body ?? {};
   const parsedAmount = Number(amount);
   if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
     return res.status(400).json({
@@ -136,6 +172,7 @@ export const createDriverWithdrawalHandler = async (req: CustomAuthRequest, res:
     const result = await createDriverWithdrawal(req.user!.userId, {
       amount: parsedAmount,
       remarks: remarks ? String(remarks).trim() : undefined,
+      pin: String(pin ?? "").trim(),
     });
     return res.status(201).json({
       success: true,
@@ -155,6 +192,9 @@ export const createDriverWithdrawalHandler = async (req: CustomAuthRequest, res:
         INSUFFICIENT_BALANCE: [400, "Withdrawal amount exceeds available balance"],
         INVALID_AMOUNT: [400, "Please specify a valid positive withdrawal amount"],
         AMOUNT_TOO_LOW: [400, "Withdrawal amount is too low after fees"],
+        INVALID_PIN_FORMAT: [400, "PIN must be exactly 4 digits"],
+        INVALID_PIN: [400, "Incorrect PIN"],
+        TOO_MANY_ATTEMPTS: [429, "Too many failed PIN attempts. Try again in 15 minutes."],
         WALLET_NOT_FOUND: [404, "Driver wallet not found"],
         ...DRIVER_NOT_FOUND,
       },
@@ -215,7 +255,7 @@ export const linkDriverCardHandler = async (req: CustomAuthRequest, res: Respons
         ],
         OTP_EXPIRED: [400, "OTP has expired. Please tap your card again."],
         INVALID_PIN_FORMAT: [400, "PIN must be exactly 4 digits"],
-        INVALID_PIN: [401, "Incorrect PIN"],
+        INVALID_PIN: [400, "Incorrect PIN"],
         TOO_MANY_ATTEMPTS: [429, "Too many failed PIN attempts. Try again in 15 minutes."],
         ...DRIVER_NOT_FOUND,
       },
@@ -279,7 +319,7 @@ export const verifyDriverBankHandler = async (req: CustomAuthRequest, res: Respo
     const known: ErrorTable = {
       INVALID_ACCOUNT_NUMBER: [400, "Account number must be exactly 10 digits"],
       INVALID_BANK_CODE: [400, "Please select a valid bank"],
-      INVALID_PIN: [401, "Incorrect PIN"],
+      INVALID_PIN: [400, "Incorrect PIN"],
       TOO_MANY_ATTEMPTS: [429, "Too many failed PIN attempts. Try again in 15 minutes."],
       BANK_VERIFICATION_NOT_SUPPORTED: [501, "Bank account resolution is not supported by payment provider"],
       BANK_LIST_NOT_SUPPORTED: [501, "Bank list is not supported by the payment provider"],
@@ -352,7 +392,7 @@ export const unlinkDriverCardHandler = async (req: CustomAuthRequest, res: Respo
       {
         CARD_NOT_LINKED: [400, "No card is linked to this account."],
         INVALID_PIN_FORMAT: [400, "PIN must be exactly 4 digits"],
-        INVALID_PIN: [401, "Incorrect PIN"],
+        INVALID_PIN: [400, "Incorrect PIN"],
         TOO_MANY_ATTEMPTS: [429, "Too many failed PIN attempts. Try again in 15 minutes."],
         ...DRIVER_NOT_FOUND,
       },

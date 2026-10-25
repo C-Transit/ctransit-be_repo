@@ -38,5 +38,7 @@ export const requeryLimiter = buildLimiter(MIN_15, 20, "Too many payment checks.
 export const driverPinLimiter = buildLimiter(MIN_15, 10, "Too many PIN configuration attempts. Please try again in 15 minutes.");
 export const driverCardLinkLimiter = buildLimiter(MIN_15, 10, "Too many card-link attempts. Please try again in 15 minutes.");
 export const bankVerifyLimiter = buildLimiter(MIN_15, 15, "Too many bank verification requests. Please try again in 15 minutes.");
+// Read-only account-name lookups. Higher than verify because the UI resolves as the driver types.
+export const bankResolveLimiter = buildLimiter(MIN_15, 30, "Too many bank lookups. Please try again in 15 minutes.");
 
 export const globalLimiter = from(rl.global, "Too many requests. Please try again in 15 minutes.");
