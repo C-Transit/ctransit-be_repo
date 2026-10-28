@@ -35,6 +35,11 @@ if [[ -z "${KORA_SECRET_KEY:-}" ]]; then
   echo
 fi
 
+if [[ -z "${KORA_SECRET_KEY:-}" ]]; then
+  echo "KORA_SECRET_KEY is required."
+  exit 1
+fi
+
 if [[ -z "${PAYOUT_PROXY_SECRET:-}" ]]; then
   read -r -s -p "Payout proxy shared secret (32+ chars): " PAYOUT_PROXY_SECRET
   echo
