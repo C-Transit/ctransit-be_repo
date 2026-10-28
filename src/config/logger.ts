@@ -32,6 +32,7 @@ const SENSITIVE_HEADERS = [
   "cookie",
   "x-api-key",
   "x-internal-secret",
+  "x-admin-secret",
   "x-critical-approval-token",
   "x-korapay-signature",
 ];
