@@ -159,7 +159,7 @@ export const resolveDriverBankHandler = async (req: CustomAuthRequest, res: Resp
 
 // POST /api/drivers/withdraw
 export const createDriverWithdrawalHandler = async (req: CustomAuthRequest, res: Response) => {
-  const { amount, remarks, pin } = req.body ?? {};
+  const { amount, remarks, pin, idempotencyKey } = req.body ?? {};
   const parsedAmount = Number(amount);
   if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
     return res.status(400).json({
@@ -173,6 +173,7 @@ export const createDriverWithdrawalHandler = async (req: CustomAuthRequest, res:
       amount: parsedAmount,
       remarks: remarks ? String(remarks).trim() : undefined,
       pin: String(pin ?? "").trim(),
+      idempotencyKey: idempotencyKey ? String(idempotencyKey).trim() : undefined,
     });
     const failed = result.status === "FAILED";
     return res.status(failed ? 200 : 201).json({
@@ -199,6 +200,7 @@ export const createDriverWithdrawalHandler = async (req: CustomAuthRequest, res:
         INVALID_PIN: [400, "Incorrect PIN"],
         TOO_MANY_ATTEMPTS: [429, "Too many failed PIN attempts. Try again in 15 minutes."],
         WALLET_NOT_FOUND: [404, "Driver wallet not found"],
+        IDEMPOTENCY_CONFLICT: [409, "Another withdrawal request is already processing. Please wait."],
         ...DRIVER_NOT_FOUND,
       },
       "driver.withdraw_controller_error"

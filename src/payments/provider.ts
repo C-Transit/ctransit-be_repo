@@ -342,9 +342,10 @@ export class KoraProvider implements IPaymentGateway {
     };
 
     // Optional: per-transaction webhook URL (overrides dashboard default).
-    if (this.payoutWebhookUrl) {
-      requestPayload.notification_url = this.payoutWebhookUrl;
-    }
+    // KoraPay's disburse endpoint does not accept `notification_url` in the
+    // request body, so omit it. Webhook delivery is configured on the Kora
+    // dashboard (or via the payout proxy) instead.
+    void this.payoutWebhookUrl;
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
