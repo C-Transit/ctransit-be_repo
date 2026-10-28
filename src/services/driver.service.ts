@@ -506,6 +506,7 @@ export interface CreateWithdrawalParams {
   amount: number;
   remarks?: string;
   pin: string;
+  idempotencyKey?: string;
 }
 
 const CTRANSIT_PAYOUT_FEE_RATIO = 0.04; // the driver bears a 4% payout fee
@@ -586,36 +587,114 @@ async function createDriverWithdrawal(userId: string, params: CreateWithdrawalPa
     throw new Error("BANK_NOT_VERIFIED");
   }
 
+  // Idempotency: a retried/double-submitted withdrawal with the same client key
+  // returns the original withdrawal instead of creating a second KoraPay payout.
+  const idempotencyKey = params.idempotencyKey?.trim();
+  const idempotencyRedisKey = idempotencyKey
+    ? `idempotency:withdrawal:${driver.id}:${idempotencyKey}`
+    : null;
+  let idempotencyLockClaimed = false;
+
+  if (idempotencyRedisKey) {
+    try {
+      const redis = getRedisClient();
+      const existingId = await redis.get(idempotencyRedisKey);
+      if (existingId && existingId !== "pending") {
+        const existing = await prisma.driverWithdrawal.findUnique({
+          where: { id: existingId },
+        });
+        if (existing) {
+          const existingNet = (existing.net_amount ?? existing.amount).toNumber();
+          return {
+            id: existing.id,
+            amount: num(existing.amount),
+            fee: num(existing.fee),
+            netAmount: existingNet,
+            status: existing.status,
+            reference: existing.reference,
+            koraReference: existing.kora_reference ?? undefined,
+            failureReason: existing.failure_reason ?? undefined,
+          };
+        }
+      }
+
+      const claimed = await redis.set(idempotencyRedisKey, "pending", "EX", 300, "NX");
+      idempotencyLockClaimed = claimed === "OK";
+      if (!idempotencyLockClaimed) {
+        // Concurrent duplicate request: wait briefly, then return the in-flight withdrawal.
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        const inFlightId = await redis.get(idempotencyRedisKey);
+        if (inFlightId && inFlightId !== "pending") {
+          const existing = await prisma.driverWithdrawal.findUnique({
+            where: { id: inFlightId },
+          });
+          if (existing) {
+            const existingNet = (existing.net_amount ?? existing.amount).toNumber();
+            return {
+              id: existing.id,
+              amount: num(existing.amount),
+              fee: num(existing.fee),
+              netAmount: existingNet,
+              status: existing.status,
+              reference: existing.reference,
+              koraReference: existing.kora_reference ?? undefined,
+              failureReason: existing.failure_reason ?? undefined,
+            };
+          }
+        }
+        throw new Error("IDEMPOTENCY_CONFLICT");
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message === "IDEMPOTENCY_CONFLICT") throw err;
+      // Fail open if Redis is unavailable; the DB transaction still protects the wallet.
+      idempotencyLockClaimed = false;
+    }
+  }
+
   const reference = `WDR-${crypto.randomUUID()}`;
 
   // Reserve the gross amount and record the withdrawal in one transaction.
-  const withdrawal = await prisma.$transaction(async (tx) => {
-    const debited = await tx.driverWallet.updateMany({
-      where: { driver_uid: driver.matricNumber, balance: { gte: gross } },
-      data: { balance: { decrement: gross } },
-    });
-    if (debited.count === 0) {
-      const wallet = await tx.driverWallet.findUnique({
-        where: { driver_uid: driver.matricNumber },
-        select: { driver_uid: true },
+  let withdrawal: any;
+  try {
+    withdrawal = await prisma.$transaction(async (tx) => {
+      const debited = await tx.driverWallet.updateMany({
+        where: { driver_uid: driver.matricNumber, balance: { gte: gross } },
+        data: { balance: { decrement: gross } },
       });
-      throw new Error(wallet ? "INSUFFICIENT_BALANCE" : "WALLET_NOT_FOUND");
-    }
-    return tx.driverWithdrawal.create({
-      data: {
-        driver_uid: driver.matricNumber,
-        amount: gross,
-        fee,
-        net_amount: net,
-        bank_name: driver.bankName ?? "Verified Bank",
-        account_number: driver.accountNumber!.trim(),
-        account_name: driver.accountName!.trim(), // always the provider-resolved name
-        remarks: params.remarks?.trim() || null,
-        reference,
-        status: "PENDING",
-      },
+      if (debited.count === 0) {
+        const wallet = await tx.driverWallet.findUnique({
+          where: { driver_uid: driver.matricNumber },
+          select: { driver_uid: true },
+        });
+        throw new Error(wallet ? "INSUFFICIENT_BALANCE" : "WALLET_NOT_FOUND");
+      }
+      return tx.driverWithdrawal.create({
+        data: {
+          driver_uid: driver.matricNumber,
+          amount: gross,
+          fee,
+          net_amount: net,
+          bank_name: driver.bankName ?? "Verified Bank",
+          account_number: driver.accountNumber!.trim(),
+          account_name: driver.accountName!.trim(), // always the provider-resolved name
+          remarks: params.remarks?.trim() || null,
+          reference,
+          status: "PENDING",
+        },
+      });
     });
-  });
+
+    if (idempotencyRedisKey && idempotencyLockClaimed) {
+      await getRedisClient()
+        .set(idempotencyRedisKey, withdrawal.id, "EX", 600)
+        .catch(() => {});
+    }
+  } catch (err) {
+    if (idempotencyRedisKey && idempotencyLockClaimed) {
+      await getRedisClient().del(idempotencyRedisKey).catch(() => {});
+    }
+    throw err;
+  }
 
   logger.info({ driverUid: driver.matricNumber, gross, fee, net, reference }, "driver.withdrawal_requested");
 
