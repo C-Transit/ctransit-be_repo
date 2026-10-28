@@ -849,6 +849,7 @@ async function getDriverWithdrawals(userId: string, page = 1, limit = 20) {
     createdAt: w.created_at,
     reference: w.reference,
     remarks: w.remarks ?? "",
+    failureReason: w.failure_reason ?? undefined,
     koraReference: w.kora_reference ?? undefined,
   }));
 

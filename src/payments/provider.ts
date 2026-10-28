@@ -18,18 +18,38 @@ function maskAccountNumber(accountNumber: string): string {
     : "****";
 }
 
+export interface KoraProviderOptions {
+  /** Per-transaction webhook URL sent to Kora on payout requests. */
+  payoutWebhookUrl?: string;
+  /** Base URL of the static-egress payout proxy, e.g. https://payout.example.com */
+  payoutProxyUrl?: string;
+  /** Shared secret used to authenticate this backend to the payout proxy. */
+  payoutProxySecret?: string;
+}
+
 export class KoraProvider implements IPaymentGateway {
   private secretKey: string;
   private publicKey: string;
   private baseUrl: string;
+  private payoutWebhookUrl?: string;
+  private payoutProxyUrl?: string;
+  private payoutProxySecret?: string;
 
-  constructor(secretKey: string, publicKey?: string, baseUrl?: string) {
+  constructor(
+    secretKey: string,
+    publicKey?: string,
+    baseUrl?: string,
+    options: KoraProviderOptions = {}
+  ) {
     this.secretKey = secretKey;
     this.publicKey = publicKey;
     this.baseUrl =
       baseUrl ||
       process.env.KORA_BASE_URL ||
       "https://api.korapay.com/merchant";
+    this.payoutWebhookUrl = options.payoutWebhookUrl;
+    this.payoutProxyUrl = options.payoutProxyUrl?.replace(/\/+$/, "");
+    this.payoutProxySecret = options.payoutProxySecret;
   }
 
   async initializeCheckout(
@@ -294,9 +314,14 @@ export class KoraProvider implements IPaymentGateway {
   }
 
   async initiatePayout(params: PayoutParams): Promise<PayoutResponse> {
-    const endpoint = `${this.baseUrl}/api/v1/transactions/disburse`;
+    const proxyBase = this.payoutProxyUrl;
+    const endpoint = proxyBase
+      ? `${proxyBase}/disburse`
+      : `${this.baseUrl}/api/v1/transactions/disburse`;
 
-    const requestPayload = {
+    // Per KoraPay API spec, `customer` goes INSIDE `destination`, not at root level.
+    // `notification_url` tells KoraPay where to send webhook callbacks for this payout.
+    const requestPayload: Record<string, unknown> = {
       reference: params.reference,
       destination: {
         type: "bank_account",
@@ -309,27 +334,42 @@ export class KoraProvider implements IPaymentGateway {
           bank: params.destination.bank_account.bank,
           account: params.destination.bank_account.account,
         },
-      },
-      customer: {
-        name: params.customer.name,
-        email: params.customer.email,
+        customer: {
+          name: params.customer.name,
+          email: params.customer.email,
+        },
       },
     };
 
+    // Optional: per-transaction webhook URL (overrides dashboard default).
+    if (this.payoutWebhookUrl) {
+      requestPayload.notification_url = this.payoutWebhookUrl;
+    }
+
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (proxyBase) {
+      headers["x-payout-proxy-secret"] = this.payoutProxySecret || "";
+    } else {
+      headers.Authorization = `Bearer ${this.secretKey}`;
+    }
+
     logger.info(
-      { reference: params.reference, amount: params.amount },
+      {
+        reference: params.reference,
+        amount: params.amount,
+        viaStaticProxy: Boolean(proxyBase),
+      },
       "kora.payout_initiating"
     );
 
     try {
       const response = await fetch(endpoint, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.secretKey}`,
-          "Content-Type": "application/json",
-        },
+        headers,
         body: JSON.stringify(requestPayload),
-        signal: AbortSignal.timeout(10000),
+        signal: AbortSignal.timeout(proxyBase ? 35000 : 10000),
       });
 
       // Unexpected 5xx server error from Kora -> verify first before failing!
@@ -414,17 +454,23 @@ export class KoraProvider implements IPaymentGateway {
   }
 
   async verifyPayout(reference: string): Promise<PayoutStatusQuery> {
-    const endpoint = `${this.baseUrl}/api/v1/transactions/${encodeURIComponent(
-      reference
-    )}`;
+    const proxyBase = this.payoutProxyUrl;
+    const endpoint = proxyBase
+      ? `${proxyBase}/verify/${encodeURIComponent(reference)}`
+      : `${this.baseUrl}/api/v1/transactions/${encodeURIComponent(reference)}`;
+
+    const headers: Record<string, string> = {};
+    if (proxyBase) {
+      headers["x-payout-proxy-secret"] = this.payoutProxySecret || "";
+    } else {
+      headers.Authorization = `Bearer ${this.secretKey}`;
+    }
 
     try {
       const response = await fetch(endpoint, {
         method: "GET",
-        headers: {
-          Authorization: `Bearer ${this.secretKey}`,
-        },
-        signal: AbortSignal.timeout(8000),
+        headers,
+        signal: AbortSignal.timeout(proxyBase ? 15000 : 8000),
       });
 
       if (response.status === 404) {
