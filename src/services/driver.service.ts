@@ -629,6 +629,7 @@ async function createDriverWithdrawal(userId: string, params: CreateWithdrawalPa
     status: result.status,
     reference,
     koraReference: result.koraReference,
+    failureReason: result.failureReason,
   };
 }
 

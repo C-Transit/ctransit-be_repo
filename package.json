@@ -8,11 +8,11 @@
   },
   "scripts": {
     "postinstall": "prisma generate",
-    "build": "node api.js && tsc",
+    "build": "tsc",
     "migrate": "prisma migrate deploy",
     "lint": "eslint src",
-    "start": "node api.js && node dist/server.js",
-    "dev": "node api.js && tsx watch server.ts"
+    "start": "node dist/server.js",
+    "dev": "tsx watch server.ts"
   },
   "dependencies": {
     "@prisma/client": "^6.19.2",
