@@ -27,7 +27,21 @@ Generate the shared secret with:
 openssl rand -hex 32
 ```
 
-## Deploy on a static-IP VPS
+## Fastest path: one-command Ubuntu deploy
+
+On a fresh Ubuntu 22.04/24.04 VPS with a static IPv4:
+
+```bash
+sudo bash deploy.sh
+```
+
+The script prompts for the domain and secrets, installs Docker and Caddy, starts
+the proxy, configures HTTPS, and prints the IPv4 to whitelist in Kora.
+
+If you do not have a domain yet, leave the domain prompt blank and the script
+will use `payout.<public-ip>.nip.io`.
+
+## Manual deploy on a static-IP VPS
 
 1. Create a VPS with a static IPv4 (DigitalOcean, Hetzner, Contabo, etc.).
 2. Copy this folder to the server, or build the Docker image:
