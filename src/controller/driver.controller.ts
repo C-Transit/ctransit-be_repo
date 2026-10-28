@@ -174,9 +174,12 @@ export const createDriverWithdrawalHandler = async (req: CustomAuthRequest, res:
       remarks: remarks ? String(remarks).trim() : undefined,
       pin: String(pin ?? "").trim(),
     });
-    return res.status(201).json({
-      success: true,
-      message: "Withdrawal request submitted successfully",
+    const failed = result.status === "FAILED";
+    return res.status(failed ? 200 : 201).json({
+      success: !failed,
+      message: failed
+        ? "The payout could not be completed. Your money has been returned to your wallet."
+        : "Withdrawal request submitted successfully",
       data: result,
       withdrawal: result,
     });

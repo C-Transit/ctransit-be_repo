@@ -10,6 +10,12 @@ if (env.payment.provider !== "KORA") {
 
 export const paymentContainer: IPaymentGateway = new KoraProvider(
   env.payment.secretKey,
-  env.payment.publicKey
+  env.payment.publicKey,
+  undefined,
+  {
+    payoutWebhookUrl: env.payment.payoutWebhookUrl,
+    payoutProxyUrl: env.payment.payoutProxyUrl,
+    payoutProxySecret: env.payment.payoutProxySecret,
+  }
 );
 logger.info("payment.provider_loaded — KORA");

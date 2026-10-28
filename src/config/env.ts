@@ -75,6 +75,10 @@ const env = {
     provider: req("PAYMENT_PROVIDER").toUpperCase(),
     publicKey: req("KORA_PUBLIC_KEY"),
     secretKey: req("PAYMENT_SECRET_KEY"),
+    payoutWebhookUrl: process.env.PAYOUT_WEBHOOK_URL?.trim() || undefined,
+    payoutProxyUrl:
+      process.env.KORA_PAYOUT_PROXY_URL?.trim().replace(/\/+$/, "") || undefined,
+    payoutProxySecret: process.env.PAYOUT_PROXY_SECRET?.trim() || undefined,
   },
   mqtt: {
     internalUrl: req("MQTT_INTERNAL_URL"),
@@ -94,5 +98,23 @@ const env = {
     notifications: limit(30),
   },
 };
+
+if (Boolean(env.payment.payoutProxyUrl) !== Boolean(env.payment.payoutProxySecret)) {
+  throw new Error(
+    "FATAL: KORA_PAYOUT_PROXY_URL and PAYOUT_PROXY_SECRET must be set together"
+  );
+}
+
+if (env.payment.payoutProxySecret && env.payment.payoutProxySecret.length < 32) {
+  throw new Error("FATAL: PAYOUT_PROXY_SECRET must be at least 32 characters");
+}
+
+if (
+  env.isLive &&
+  env.payment.payoutProxyUrl &&
+  !env.payment.payoutProxyUrl.startsWith("https://")
+) {
+  throw new Error("FATAL: KORA_PAYOUT_PROXY_URL must use https:// in production");
+}
 
 export default env;
