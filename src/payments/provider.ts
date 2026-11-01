@@ -11,6 +11,8 @@ import {
   BankInfo,
 } from "./payment.interface.js";
 import logger from "../config/logger.js";
+import { createPayoutHttpClient } from "../lib/payoutHttp.js";
+import type { AxiosInstance } from "axios";
 
 function maskAccountNumber(accountNumber: string): string {
   return accountNumber.length > 4
@@ -18,13 +20,32 @@ function maskAccountNumber(accountNumber: string): string {
     : "****";
 }
 
+function getConfirmedPreSendProxyFailure(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const details = error as { code?: unknown; message?: unknown };
+  const code = details.code;
+  const message = typeof details.message === "string" ? details.message : "";
+
+  if (code === "ECONNREFUSED") {
+    return "Payout proxy connection refused before request was sent";
+  }
+  if (
+    code === "ERR_TUNNEL_CONNECTION_FAILED" &&
+    /statusCode=407\b/.test(message)
+  ) {
+    return "Payout proxy authentication failed before request was sent";
+  }
+  if (/^Socks5 Authentication failed\b/i.test(message)) {
+    return "Payout proxy authentication failed before request was sent";
+  }
+  return undefined;
+}
+
 export interface KoraProviderOptions {
   /** Per-transaction webhook URL sent to Kora on payout requests. */
   payoutWebhookUrl?: string;
-  /** Base URL of the static-egress payout proxy, e.g. https://payout.example.com */
+  /** Static-egress proxy URL used only for payout requests. */
   payoutProxyUrl?: string;
-  /** Shared secret used to authenticate this backend to the payout proxy. */
-  payoutProxySecret?: string;
 }
 
 export class KoraProvider implements IPaymentGateway {
@@ -33,7 +54,7 @@ export class KoraProvider implements IPaymentGateway {
   private baseUrl: string;
   private payoutWebhookUrl?: string;
   private payoutProxyUrl?: string;
-  private payoutProxySecret?: string;
+  private payoutHttpClient?: AxiosInstance;
 
   constructor(
     secretKey: string,
@@ -49,7 +70,13 @@ export class KoraProvider implements IPaymentGateway {
       "https://api.korapay.com/merchant";
     this.payoutWebhookUrl = options.payoutWebhookUrl;
     this.payoutProxyUrl = options.payoutProxyUrl?.replace(/\/+$/, "");
-    this.payoutProxySecret = options.payoutProxySecret;
+  }
+
+  private getPayoutHttpClient(): AxiosInstance {
+    this.payoutHttpClient ??= createPayoutHttpClient(this.payoutProxyUrl, (host) => {
+      logger.info({ host }, "payout.proxy_used");
+    });
+    return this.payoutHttpClient;
   }
 
   async initializeCheckout(
@@ -314,10 +341,7 @@ export class KoraProvider implements IPaymentGateway {
   }
 
   async initiatePayout(params: PayoutParams): Promise<PayoutResponse> {
-    const proxyBase = this.payoutProxyUrl;
-    const endpoint = proxyBase
-      ? `${proxyBase}/disburse`
-      : `${this.baseUrl}/api/v1/transactions/disburse`;
+    const endpoint = `${this.baseUrl}/api/v1/transactions/disburse`;
 
     // Per KoraPay API spec, `customer` goes INSIDE `destination`, not at root level.
     // `notification_url` tells KoraPay where to send webhook callbacks for this payout.
@@ -348,29 +372,22 @@ export class KoraProvider implements IPaymentGateway {
     void this.payoutWebhookUrl;
 
     const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.secretKey}`,
       "Content-Type": "application/json",
     };
-    if (proxyBase) {
-      headers["x-payout-proxy-secret"] = this.payoutProxySecret || "";
-    } else {
-      headers.Authorization = `Bearer ${this.secretKey}`;
-    }
 
     logger.info(
       {
         reference: params.reference,
         amount: params.amount,
-        viaStaticProxy: Boolean(proxyBase),
       },
       "kora.payout_initiating"
     );
 
+    const client = this.getPayoutHttpClient();
     try {
-      const response = await fetch(endpoint, {
-        method: "POST",
+      const response = await client.post(endpoint, requestPayload, {
         headers,
-        body: JSON.stringify(requestPayload),
-        signal: AbortSignal.timeout(proxyBase ? 35000 : 10000),
       });
 
       // Unexpected 5xx server error from Kora -> verify first before failing!
@@ -382,15 +399,15 @@ export class KoraProvider implements IPaymentGateway {
         return await this.verifyAndResolvePayout(params.reference);
       }
 
-      const responseBody = await response.json().catch(() => null);
+      const responseBody = response.data;
 
-      if (!response.ok || !responseBody || responseBody.status === false) {
+      if (response.status >= 400 || !responseBody || responseBody.status === false) {
         // 4xx or business error from Kora
         const failureMsg =
           responseBody?.message ||
           `Kora payout rejected (HTTP ${response.status})`;
         logger.warn(
-          { reference: params.reference, error: failureMsg },
+          { reference: params.reference, statusCode: response.status },
           "kora.payout_rejected"
         );
         return {
@@ -434,6 +451,20 @@ export class KoraProvider implements IPaymentGateway {
         rawResponse: responseBody,
       };
     } catch (err) {
+      const preSendFailure = getConfirmedPreSendProxyFailure(err);
+      if (preSendFailure) {
+        logger.warn(
+          { reference: params.reference },
+          "kora.payout_proxy_pre_send_failure"
+        );
+        return {
+          success: false,
+          status: "failed",
+          reference: params.reference,
+          message: preSendFailure,
+        };
+      }
+
       // Network timeout or connection drop -> verify first!
       const isTimeout =
         err instanceof Error &&
@@ -445,7 +476,7 @@ export class KoraProvider implements IPaymentGateway {
         {
           reference: params.reference,
           isTimeout,
-          err: err instanceof Error ? err.message : String(err),
+          errorName: err instanceof Error ? err.name : "UnknownError",
         },
         "kora.payout_request_error — verifying payout status"
       );
@@ -455,23 +486,17 @@ export class KoraProvider implements IPaymentGateway {
   }
 
   async verifyPayout(reference: string): Promise<PayoutStatusQuery> {
-    const proxyBase = this.payoutProxyUrl;
-    const endpoint = proxyBase
-      ? `${proxyBase}/verify/${encodeURIComponent(reference)}`
-      : `${this.baseUrl}/api/v1/transactions/${encodeURIComponent(reference)}`;
+    const endpoint = `${this.baseUrl}/api/v1/transactions/${encodeURIComponent(
+      reference
+    )}`;
 
     const headers: Record<string, string> = {};
-    if (proxyBase) {
-      headers["x-payout-proxy-secret"] = this.payoutProxySecret || "";
-    } else {
-      headers.Authorization = `Bearer ${this.secretKey}`;
-    }
+    headers.Authorization = `Bearer ${this.secretKey}`;
 
+    const client = this.getPayoutHttpClient();
     try {
-      const response = await fetch(endpoint, {
-        method: "GET",
+      const response = await client.get(endpoint, {
         headers,
-        signal: AbortSignal.timeout(proxyBase ? 15000 : 8000),
       });
 
       if (response.status === 404) {
@@ -482,7 +507,7 @@ export class KoraProvider implements IPaymentGateway {
         };
       }
 
-      if (!response.ok) {
+      if (response.status >= 400) {
         return {
           status: "unknown",
           reference,
@@ -490,7 +515,7 @@ export class KoraProvider implements IPaymentGateway {
         };
       }
 
-      const body = await response.json().catch(() => null);
+      const body = response.data;
       if (!body || body.status === false || !body.data) {
         return {
           status: "unknown",
@@ -527,14 +552,13 @@ export class KoraProvider implements IPaymentGateway {
       };
     } catch (err) {
       logger.warn(
-        { reference, err: err instanceof Error ? err.message : String(err) },
+        { reference, errorName: err instanceof Error ? err.name : "UnknownError" },
         "kora.verify_payout_failed"
       );
       return {
         status: "unknown",
         reference,
-        message:
-          err instanceof Error ? err.message : "Verification request failed",
+        message: "Verification request failed",
       };
     }
   }

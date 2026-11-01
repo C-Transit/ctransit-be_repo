@@ -15,7 +15,6 @@ export const paymentContainer: IPaymentGateway = new KoraProvider(
   {
     payoutWebhookUrl: env.payment.payoutWebhookUrl,
     payoutProxyUrl: env.payment.payoutProxyUrl,
-    payoutProxySecret: env.payment.payoutProxySecret,
   }
 );
 logger.info("payment.provider_loaded — KORA");
