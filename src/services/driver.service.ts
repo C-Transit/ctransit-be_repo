@@ -8,6 +8,7 @@ import { sendNotification } from "./notification.service.js";
 import { terminalProvisioningService } from "./terminal-provisioning.service.js";
 import { paymentContainer } from "../payments/payment.container.js";
 import type { PayoutParams, BankInfo } from "../payments/payment.interface.js";
+import { parsePayoutProxyUrl } from "../lib/payoutHttp.js";
 
 // ─────────────────────────────────────────────
 // Helpers
@@ -510,6 +511,7 @@ export interface CreateWithdrawalParams {
 }
 
 const CTRANSIT_PAYOUT_FEE_RATIO = 0.04; // the driver bears a 4% payout fee
+const PAYOUT_NOT_FOUND_GRACE_MS = 30 * 60_000;
 
 // PENDING/PROCESSING -> SUCCESS. Returns false if it was already finalized.
 async function markWithdrawalSuccess(id: string, koraReference?: string, fee?: number): Promise<boolean> {
@@ -521,7 +523,19 @@ async function markWithdrawalSuccess(id: string, koraReference?: string, fee?: n
       ...(fee !== undefined ? { kora_fee: fee } : {}),
     },
   });
-  return r.count > 0;
+  if (r.count > 0) return true;
+
+  const withdrawal = await prisma.driverWithdrawal.findUnique({
+    where: { id },
+    select: { reference: true, status: true },
+  });
+  if (withdrawal?.status === "FAILED") {
+    logger.error(
+      { reference: withdrawal.reference },
+      "payout.success_after_refund"
+    );
+  }
+  return false;
 }
 
 // PENDING/PROCESSING -> FAILED and refund the reserved gross amount, exactly once.
@@ -585,6 +599,9 @@ async function createDriverWithdrawal(userId: string, params: CreateWithdrawalPa
 
   if (!driver.bankVerified || !driver.bankCode || !driver.accountNumber || !driver.accountName) {
     throw new Error("BANK_NOT_VERIFIED");
+  }
+  if (!parsePayoutProxyUrl(process.env.KORA_PAYOUT_PROXY_URL)) {
+    throw new Error("PAYOUT_PROXY_NOT_CONFIGURED");
   }
 
   // Idempotency: a retried/double-submitted withdrawal with the same client key
@@ -654,7 +671,7 @@ async function createDriverWithdrawal(userId: string, params: CreateWithdrawalPa
   const reference = `WDR-${crypto.randomUUID()}`;
 
   // Reserve the gross amount and record the withdrawal in one transaction.
-  let withdrawal: any;
+  let withdrawal: Awaited<ReturnType<typeof prisma.driverWithdrawal.create>>;
   try {
     withdrawal = await prisma.$transaction(async (tx) => {
       const debited = await tx.driverWallet.updateMany({
@@ -833,6 +850,14 @@ async function handleDriverPayoutWebhook(
   const failed = event === "transfer.failed";
   const id = withdrawal.id;
 
+  if (withdrawal.status === "FAILED" && succeeded) {
+    logger.error(
+      { reference: withdrawal.reference },
+      "payout.success_after_refund"
+    );
+    return { success: true, message: "Withdrawal already marked FAILED", withdrawalId: id };
+  }
+
   if (withdrawal.status === "SUCCESS" || withdrawal.status === "FAILED") {
     if ((withdrawal.status === "FAILED" && succeeded) || (withdrawal.status === "SUCCESS" && failed)) {
       logger.error(
@@ -878,7 +903,7 @@ async function reconcileStuckWithdrawals(olderThanMinutes = 15) {
       status: { in: ["PENDING", "PROCESSING"] },
       updated_at: { lt: new Date(Date.now() - olderThanMinutes * 60_000) },
     },
-    select: { id: true, reference: true, status: true },
+    select: { id: true, reference: true, status: true, created_at: true },
     take: 50,
   });
 
@@ -889,10 +914,23 @@ async function reconcileStuckWithdrawals(olderThanMinutes = 15) {
 
     if (q.status === "success") {
       if (await markWithdrawalSuccess(w.id, q.koraReference, q.fee)) summary.success++;
-    } else if (q.status === "failed" || (q.status === "not_found" && w.status === "PENDING")) {
-      // not_found on a PENDING row means the request never reached the provider.
-      const reason = q.status === "failed" ? q.message || "Payout failed (reconciled)" : "Payout never reached provider";
+    } else if (q.status === "failed") {
+      const reason = q.message || "Payout failed (reconciled)";
       if (await failWithdrawalAndRefund(w.id, { reason, koraReference: q.koraReference, fee: q.fee })) summary.failed++;
+    } else if (
+      q.status === "not_found" &&
+      w.status === "PENDING" &&
+      Date.now() - w.created_at.getTime() >= PAYOUT_NOT_FOUND_GRACE_MS
+    ) {
+      if (
+        await failWithdrawalAndRefund(w.id, {
+          reason: "Payout not found after 30-minute grace period",
+          koraReference: q.koraReference,
+          fee: q.fee,
+        })
+      ) {
+        summary.failed++;
+      }
     } else {
       summary.unresolved++;
       logger.warn({ reference: w.reference, status: q.status }, "driver.reconcile_unresolved");

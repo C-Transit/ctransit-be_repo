@@ -189,6 +189,14 @@ export const createDriverWithdrawalHandler = async (req: CustomAuthRequest, res:
       res,
       error,
       {
+        PAYOUT_PROXY_NOT_CONFIGURED: [
+          503,
+          "Payout service is unavailable. Please contact support.",
+        ],
+        INVALID_PAYOUT_PROXY_URL: [
+          503,
+          "Payout service is unavailable. Please contact support.",
+        ],
         BANK_NOT_VERIFIED: [
           400,
           "Bank account must be verified before initiating withdrawals. Please verify your bank account first.",

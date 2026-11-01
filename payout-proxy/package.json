@@ -7,6 +7,6 @@
     "node": ">=20"
   },
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node init && node server.mjs"
   }
 }

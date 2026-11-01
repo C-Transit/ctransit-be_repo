@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { parsePayoutProxyUrl } from "../lib/payoutHttp.js";
 
 const REQUIRED = [
   "DATABASE_URL",
@@ -31,6 +32,21 @@ if (missing.length > 0) {
 
 const nodeEnv = process.env.NODE_ENV || "development";
 const isLive = nodeEnv === "production" || nodeEnv === "staging";
+const payoutProxyUrlValue = process.env.KORA_PAYOUT_PROXY_URL?.trim() || undefined;
+
+if (payoutProxyUrlValue) {
+  try {
+    parsePayoutProxyUrl(payoutProxyUrlValue);
+  } catch {
+    throw new Error(
+      "FATAL: KORA_PAYOUT_PROXY_URL must be a valid http, https, or socks5 URL"
+    );
+  }
+}
+
+if (nodeEnv === "production" && !payoutProxyUrlValue) {
+  throw new Error("FATAL: KORA_PAYOUT_PROXY_URL is required in production");
+}
 
 const req = (key: (typeof REQUIRED)[number]): string =>
   process.env[key] as string;
@@ -76,9 +92,7 @@ const env = {
     publicKey: req("KORA_PUBLIC_KEY"),
     secretKey: req("PAYMENT_SECRET_KEY"),
     payoutWebhookUrl: process.env.PAYOUT_WEBHOOK_URL?.trim() || undefined,
-    payoutProxyUrl:
-      process.env.KORA_PAYOUT_PROXY_URL?.trim().replace(/\/+$/, "") || undefined,
-    payoutProxySecret: process.env.PAYOUT_PROXY_SECRET?.trim() || undefined,
+    payoutProxyUrl: payoutProxyUrlValue,
   },
   mqtt: {
     internalUrl: req("MQTT_INTERNAL_URL"),
@@ -98,23 +112,5 @@ const env = {
     notifications: limit(30),
   },
 };
-
-if (Boolean(env.payment.payoutProxyUrl) !== Boolean(env.payment.payoutProxySecret)) {
-  throw new Error(
-    "FATAL: KORA_PAYOUT_PROXY_URL and PAYOUT_PROXY_SECRET must be set together"
-  );
-}
-
-if (env.payment.payoutProxySecret && env.payment.payoutProxySecret.length < 32) {
-  throw new Error("FATAL: PAYOUT_PROXY_SECRET must be at least 32 characters");
-}
-
-if (
-  env.isLive &&
-  env.payment.payoutProxyUrl &&
-  !env.payment.payoutProxyUrl.startsWith("https://")
-) {
-  throw new Error("FATAL: KORA_PAYOUT_PROXY_URL must use https:// in production");
-}
 
 export default env;
